@@ -1,0 +1,1 @@
+"""Response notice rendering."""

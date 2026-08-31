@@ -1,0 +1,14 @@
+changelog:
+  exclude:
+    labels:
+      - "release: none"
+  categories:
+    - title: Release Notes
+      labels:
+        - "release: notes"
+    - title: Platform Changes
+      labels:
+        - "release: platform"
+    - title: Client Changes
+      labels:
+        - "release: client"

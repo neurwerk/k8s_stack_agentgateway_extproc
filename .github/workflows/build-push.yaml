@@ -1,0 +1,211 @@
+name: Quality, Build, and Push
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12.12"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+        with:
+          version: "0.11.21"
+          enable-cache: true
+      - name: Verify release tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: python scripts/verify_release_tag.py "${GITHUB_REF_NAME}"
+      - name: Run quality gates
+        run: make check
+
+  build:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: quality
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.resolve.outputs.digest }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Inspect versioned image
+        id: image
+        env:
+          IMAGE_REPOSITORY: ghcr.io/neurwerk/k8s-stack-agentgateway-extproc
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          version="${RELEASE_TAG#v}"
+          image_ref="$IMAGE_REPOSITORY:$version"
+          manifest_file="$RUNNER_TEMP/version-manifest.json"
+          image_file="$RUNNER_TEMP/version-image.json"
+          error_file="$RUNNER_TEMP/version-inspect.err"
+          printf 'ref=%s\n' "$image_ref" >> "$GITHUB_OUTPUT"
+
+          if ! docker buildx imagetools inspect "$image_ref" \
+            --format '{{json .Manifest}}' > "$manifest_file" 2> "$error_file"; then
+            if grep -Eiq 'manifest unknown|name unknown|not found' "$error_file"; then
+              printf 'exists=false\n' >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            cat "$error_file" >&2
+            exit 1
+          fi
+
+          digest="$(jq -er '.digest | select(type == "string" and test("^sha256:[0-9a-f]{64}$"))' "$manifest_file")"
+          if jq -e '.manifests? | type == "array"' "$manifest_file" >/dev/null; then
+            platform_count="$(jq -r '[.manifests[] | select(.platform.os == "linux" and .platform.architecture == "amd64")] | length' "$manifest_file")"
+            if [[ "$platform_count" != "1" ]]; then
+              printf '%s\n' "versioned image does not contain exactly one linux/amd64 manifest" >&2
+              exit 1
+            fi
+            docker buildx imagetools inspect "$image_ref" \
+              --format '{{json .Image}}' > "$image_file"
+          else
+            docker buildx imagetools inspect "$image_ref" \
+              --format '{{json .Image}}' > "$image_file"
+          fi
+          if ! jq -e '.os == "linux" and .architecture == "amd64"' "$image_file" >/dev/null; then
+            printf '%s\n' "versioned image config is not linux/amd64" >&2
+            exit 1
+          fi
+          revision="$(jq -er '.config.Labels["org.opencontainers.image.revision"] | select(type == "string")' "$image_file")"
+          if [[ "$revision" != "$GITHUB_SHA" ]]; then
+            printf '%s\n' "versioned image revision $revision does not match $GITHUB_SHA" >&2
+            exit 1
+          fi
+          printf 'exists=true\ndigest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+      - name: Extract image metadata
+        id: meta
+        if: steps.image.outputs.exists == 'false'
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        with:
+          images: ghcr.io/neurwerk/k8s-stack-agentgateway-extproc
+          flavor: latest=false
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+      - name: Build and push image
+        id: build
+        if: steps.image.outputs.exists == 'false'
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Resolve versioned image digest
+        id: resolve
+        env:
+          BUILD_DIGEST: ${{ steps.build.outputs.digest }}
+          EXISTING_DIGEST: ${{ steps.image.outputs.digest }}
+          IMAGE_EXISTS: ${{ steps.image.outputs.exists }}
+          IMAGE_REF: ${{ steps.image.outputs.ref }}
+        run: |
+          if [[ "$IMAGE_EXISTS" == "true" ]]; then
+            digest="$EXISTING_DIGEST"
+          else
+            manifest_file="$RUNNER_TEMP/published-manifest.json"
+            image_file="$RUNNER_TEMP/published-image.json"
+            docker buildx imagetools inspect "$IMAGE_REF" \
+              --format '{{json .Manifest}}' > "$manifest_file"
+            digest="$(jq -er '.digest | select(type == "string" and test("^sha256:[0-9a-f]{64}$"))' "$manifest_file")"
+            if [[ ! "$BUILD_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || [[ "$digest" != "$BUILD_DIGEST" ]]; then
+              printf '%s\n' "published image digest does not match the build result" >&2
+              exit 1
+            fi
+            if jq -e '.manifests? | type == "array"' "$manifest_file" >/dev/null; then
+              platform_count="$(jq -r '[.manifests[] | select(.platform.os == "linux" and .platform.architecture == "amd64")] | length' "$manifest_file")"
+              if [[ "$platform_count" != "1" ]]; then
+                printf '%s\n' "published image does not contain exactly one linux/amd64 manifest" >&2
+                exit 1
+              fi
+              docker buildx imagetools inspect "$IMAGE_REF" \
+                --format '{{json .Image}}' > "$image_file"
+            else
+              docker buildx imagetools inspect "$IMAGE_REF" \
+                --format '{{json .Image}}' > "$image_file"
+            fi
+            if ! jq -e '.os == "linux" and .architecture == "amd64"' "$image_file" >/dev/null; then
+              printf '%s\n' "published image config is not linux/amd64" >&2
+              exit 1
+            fi
+            revision="$(jq -er '.config.Labels["org.opencontainers.image.revision"] | select(type == "string")' "$image_file")"
+            if [[ "$revision" != "$GITHUB_SHA" ]]; then
+              printf '%s\n' "published image revision $revision does not match $GITHUB_SHA" >&2
+              exit 1
+            fi
+          fi
+          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            printf '%s\n' "versioned image did not resolve to a valid digest" >&2
+            exit 1
+          fi
+          printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE_DIGEST: ${{ needs.build.outputs.digest }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if [[ ! "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            printf '%s\n' "image publication did not return a valid digest" >&2
+            exit 1
+          fi
+          version="${RELEASE_TAG#v}"
+          gh api --method POST \
+            "repos/$GITHUB_REPOSITORY/releases/generate-notes" \
+            -f tag_name="$RELEASE_TAG" --jq .body > "$RUNNER_TEMP/generated-notes.md"
+          {
+            printf '## Published Image\n\n'
+            printf -- '- `ghcr.io/neurwerk/k8s-stack-agentgateway-extproc:%s@%s`\n\n' \
+              "$version" "$IMAGE_DIGEST"
+            cat "$RUNNER_TEMP/generated-notes.md"
+          } > "$RUNNER_TEMP/release-notes.md"
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "AgentGateway extProc $RELEASE_TAG" \
+              --notes-file "$RUNNER_TEMP/release-notes.md"
+            exit 0
+          fi
+          gh release create "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "AgentGateway extProc $RELEASE_TAG" \
+            --notes-file "$RUNNER_TEMP/release-notes.md"

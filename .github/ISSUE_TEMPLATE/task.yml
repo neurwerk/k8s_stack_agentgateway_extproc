@@ -1,0 +1,70 @@
+name: Task
+description: Track a bounded engineering or maintenance task
+title: "[Task]: "
+labels:
+  - "type: task"
+body:
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority
+      options:
+        - "priority: p0"
+        - "priority: p1"
+        - "priority: p2"
+        - "priority: p3"
+        - "priority: p4"
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - "area: docs"
+        - "area: platform"
+        - "area: client"
+        - "area: service"
+        - "area: operations"
+        - "area: security"
+    validations:
+      required: true
+  - type: dropdown
+    id: release
+    attributes:
+      label: Release classification
+      options:
+        - "release: none"
+        - "release: notes"
+        - "release: platform"
+        - "release: client"
+    validations:
+      required: true
+  - type: textarea
+    id: objective
+    attributes:
+      label: Objective
+      description: State the outcome this task must deliver.
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope
+      description: Describe what is included and any explicit exclusions.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: List the checks or observable outcomes required for completion.
+    validations:
+      required: true
+  - type: textarea
+    id: contracts
+    attributes:
+      label: Affected contracts
+      description: List affected repositories, APIs, configuration, or deployment contracts, or state None.
+    validations:
+      required: true

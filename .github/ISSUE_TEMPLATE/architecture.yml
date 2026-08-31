@@ -1,0 +1,77 @@
+name: Architecture proposal
+description: Propose a service or cross-repository contract decision
+title: "[Architecture]: "
+labels:
+  - "type: architecture"
+body:
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority
+      options:
+        - "priority: p0"
+        - "priority: p1"
+        - "priority: p2"
+        - "priority: p3"
+        - "priority: p4"
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - "area: docs"
+        - "area: platform"
+        - "area: client"
+        - "area: service"
+        - "area: operations"
+        - "area: security"
+    validations:
+      required: true
+  - type: dropdown
+    id: release
+    attributes:
+      label: Release classification
+      options:
+        - "release: none"
+        - "release: notes"
+        - "release: platform"
+        - "release: client"
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Context and problem
+      description: Describe the current contract, constraint, and reason a decision is needed.
+    validations:
+      required: true
+  - type: textarea
+    id: decision
+    attributes:
+      label: Proposed decision
+      description: State ownership, boundaries, data flow, and the intended end state.
+    validations:
+      required: true
+  - type: textarea
+    id: contracts
+    attributes:
+      label: Affected repositories and contracts
+      description: Identify the parent issue owner and every repository that needs a sub-issue.
+    validations:
+      required: true
+  - type: textarea
+    id: consequences
+    attributes:
+      label: Alternatives and consequences
+      description: Cover alternatives, security, compatibility, operations, and rollout consequences.
+    validations:
+      required: true
+  - type: textarea
+    id: validation
+    attributes:
+      label: Validation and adoption plan
+      description: Define acceptance evidence, documentation updates, and rollout steps.
+    validations:
+      required: true

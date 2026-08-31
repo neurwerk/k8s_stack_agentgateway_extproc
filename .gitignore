@@ -1,0 +1,54 @@
+/.git_backup*/
+
+# Python bytecode and build output
+__pycache__/
+*.py[cod]
+*$py.class
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Environments and local configuration
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Test, coverage, and tool caches
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.pytest_cache/
+.ruff_cache/
+.ty_cache/
+.mypy_cache/
+.hypothesis/
+.tox/
+.nox/
+
+# IDE and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# Local TLS identity material. Public certificate fixtures remain trackable.
+.certs/
+.tls/
+certs/local/
+tls/local/
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.csr
+*-key.pem
+*_key.pem
+*.private.pem

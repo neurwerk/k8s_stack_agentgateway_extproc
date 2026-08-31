@@ -1,0 +1,72 @@
+name: Bug report
+description: Report reproducible incorrect behavior
+title: "[Bug]: "
+labels:
+  - "type: bug"
+body:
+  - type: markdown
+    attributes:
+      value: Do not include credentials, tokens, API keys, or sensitive payloads.
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority
+      options:
+        - "priority: p0"
+        - "priority: p1"
+        - "priority: p2"
+        - "priority: p3"
+        - "priority: p4"
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - "area: docs"
+        - "area: platform"
+        - "area: client"
+        - "area: service"
+        - "area: operations"
+        - "area: security"
+    validations:
+      required: true
+  - type: dropdown
+    id: release
+    attributes:
+      label: Release classification
+      options:
+        - "release: none"
+        - "release: notes"
+        - "release: platform"
+        - "release: client"
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What happened, and what did you expect instead?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Provide the smallest reliable sequence that reproduces the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include the release version, relevant configuration, and runtime details.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized logs
+      description: Add relevant logs or traces after removing secrets and sensitive data.
+      render: shell

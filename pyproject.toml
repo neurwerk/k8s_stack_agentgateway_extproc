@@ -1,0 +1,94 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agentgateway-extproc"
+version = "0.6.3"
+description = "Envoy ext_proc adapter for the neurwerk PII engine"
+readme = "README.md"
+license = "MIT AND Apache-2.0"
+license-files = ["LICENSE", "LICENSES/Apache-2.0.txt", "THIRD_PARTY_NOTICES.md"]
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "fastapi>=0.115",
+    "grpcio>=1.68",
+    "httpx>=0.27",
+    "prometheus-client>=0.21",
+    "protobuf>=5.0",
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "uvicorn[standard]>=0.30",
+]
+
+[project.optional-dependencies]
+dev = [
+    "grpcio-tools>=1.68",
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=6",
+    "ruff>=0.11",
+    "ty>=0.0.66",
+]
+
+[project.scripts]
+agentgateway-extproc = "agentgateway_extproc.main:main"
+
+[project.urls]
+Homepage = "https://github.com/neurwerk/k8s_stack_agentgateway_extproc"
+Repository = "https://github.com/neurwerk/k8s_stack_agentgateway_extproc"
+Issues = "https://github.com/neurwerk/k8s_stack_agentgateway_extproc/issues"
+Security = "https://github.com/neurwerk/k8s_stack_agentgateway_extproc/security/policy"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agentgateway_extproc"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.format]
+exclude = ["src/agentgateway_extproc/gen/**"]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "C90", "BLE", "G", "S", "ANN", "D", "RUF", "FA", "SIM", "RET", "PTH", "C4", "TRY", "T20"]
+ignore = ["D203", "D212", "S104"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["D100", "D101", "D102", "D103", "D104", "ANN", "S", "T20", "TRY003"]
+"src/agentgateway_extproc/gen/**" = ["ALL"]
+"**/__init__.py" = ["D104"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["agentgateway_extproc"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ty.rules]
+all = "error"
+
+[tool.ty.src]
+exclude = ["src/agentgateway_extproc/gen"]
+
+[tool.ty.analysis]
+strict-literal-narrowing = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+addopts = "-v --tb=short"
+
+[tool.coverage.run]
+source = ["src"]
+omit = ["tests/*", "src/agentgateway_extproc/gen/*"]
+
+[tool.coverage.report]
+fail_under = 80
+show_missing = true
