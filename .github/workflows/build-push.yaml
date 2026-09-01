@@ -209,3 +209,25 @@ jobs:
             --verify-tag \
             --title "AgentGateway extProc $RELEASE_TAG" \
             --notes-file "$RUNNER_TEMP/release-notes.md"
+
+  required_ci:
+    name: Required CI
+    needs: [quality, build, release]
+    if: ${{ always() && (github.event_name == 'pull_request' || github.ref == 'refs/heads/main') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report required CI result
+        env:
+          QUALITY_RESULT: ${{ needs.quality.result }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          RELEASE_RESULT: ${{ needs.release.result }}
+        run: |
+          if [[ "$QUALITY_RESULT" != "success" ]]; then
+            printf 'Quality job result was %s, expected success.\n' "$QUALITY_RESULT" >&2
+            exit 1
+          fi
+          if [[ "$BUILD_RESULT" != "skipped" || "$RELEASE_RESULT" != "skipped" ]]; then
+            printf 'Build and release must be skipped during normal validation; got build=%s release=%s.\n' \
+              "$BUILD_RESULT" "$RELEASE_RESULT" >&2
+            exit 1
+          fi
