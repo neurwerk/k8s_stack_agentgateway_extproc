@@ -207,6 +207,9 @@ async def process_request(
         transformed.model_dump(mode="json", by_alias=True, exclude_none=True),
     )
     if isinstance(request, EngineChatRequest):
+        for message in _dict_list(serialized.get("messages")):
+            if message.get("tool_calls") == []:
+                del message["tool_calls"]
         _restore_opaque_chat_reasoning(serialized, opaque_reasoning)
     mutated = json.dumps(
         serialized,
