@@ -50,7 +50,6 @@ async def test_request_mutation_and_stream_reversal(engine_client) -> None:
     assert forwarded["messages"][0] == {
         "role": "system",
         "content": GUARD_INSTRUCTION,
-        "tool_calls": [],
     }
     assert forwarded["messages"][1]["content"] == REVERSIBLE_TOKEN
     assert "Request protected" not in json.dumps(forwarded)
@@ -90,6 +89,53 @@ async def test_request_mutation_and_stream_reversal(engine_client) -> None:
     assert "Jane Doe" in payload["choices"][0]["message"]["content"]
     assert GUARD_INSTRUCTION not in payload["choices"][0]["message"]["content"]
     assert "PII Engine Notice" in payload["choices"][0]["message"]["content"]
+
+
+async def test_provider_request_omits_empty_tool_calls_from_chat_history(
+    engine_client, engine_reply
+) -> None:
+    """Strict providers never receive empty tool-call arrays after analysis."""
+    original = {
+        "model": "test",
+        "messages": [
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "reply"},
+            {"role": "user", "content": "next"},
+        ],
+    }
+    engine_reply.update(
+        {
+            "decision": "pass",
+            "entities": [],
+            "entity_counts": {},
+            "applied_actions": [],
+            "request": {
+                "model": "test",
+                "messages": [
+                    {"role": "user", "content": "first", "tool_calls": []},
+                    {"role": "assistant", "content": "reply", "tool_calls": []},
+                    {"role": "user", "content": "next", "tool_calls": []},
+                ],
+            },
+            "notices": {"request": [], "response": []},
+            "report": {"rows": []},
+            "reversal": {},
+        }
+    )
+    handler = StreamHandler(engine_client)
+    await handler.handle(header_request())
+
+    response = await handler.handle(body_request(json.dumps(original).encode()))
+
+    assert response is not None and not response.HasField("immediate_response")
+    forwarded = json.loads(response.request_body.response.body_mutation.body)
+    assert [message["role"] for message in forwarded["messages"]] == [
+        "system",
+        "user",
+        "assistant",
+        "user",
+    ]
+    assert all("tool_calls" not in message for message in forwarded["messages"])
 
 
 async def test_headerless_identical_requests_use_distinct_engine_sessions(engine_client) -> None:
@@ -655,6 +701,7 @@ async def test_tool_only_model_request_receives_the_fixed_guard(
     forwarded = json.loads(response.request_body.response.body_mutation.body)
     assert forwarded["messages"][0]["content"] == GUARD_INSTRUCTION
     assert "content" not in forwarded["messages"][1]
+    assert forwarded["messages"][1]["tool_calls"][0]["function"]["name"] == "lookup"
     assert "Request protected" not in json.dumps(forwarded)
 
 
