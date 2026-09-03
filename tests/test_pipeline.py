@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import gzip
 import json
+from typing import cast
 from unittest.mock import patch
 
 import httpx
 import pytest
+from pydantic import ValidationError
 
 from agentgateway_extproc.config.settings import EngineSettings, Settings
 from agentgateway_extproc.lib.engine.client import EngineClient
 from agentgateway_extproc.lib.pipeline.guard import GUARD_INSTRUCTION
+from agentgateway_extproc.lib.pipeline.request import _log_model_validation_failure
 from agentgateway_extproc.lib.pipeline.stream_handler import StreamHandler
 from agentgateway_extproc.models.exceptions import InvalidEngineReplyError, InvalidReversalError
 
@@ -177,6 +180,26 @@ async def test_chat_stream_options_survives_engine_and_provider_dispatch(
     assert forwarded["messages"][0]["content"] == GUARD_INSTRUCTION
 
 
+@pytest.mark.parametrize("stream", [None, False], ids=["omitted", "disabled"])
+async def test_chat_stream_options_are_rejected_before_engine_dispatch(
+    engine_client, stream: bool | None
+) -> None:
+    payload = {
+        "model": "test",
+        "messages": [{"role": "user", "content": "hello"}],
+        "stream_options": {"include_usage": True},
+    }
+    if stream is not None:
+        payload["stream"] = stream
+    handler = StreamHandler(engine_client)
+    await handler.handle(header_request())
+
+    response = await handler.handle(body_request(json.dumps(payload).encode()))
+
+    assert response is not None and response.immediate_response.status.code == 400
+    assert handler._dispatch_outcomes == {"protocol_failure"}
+
+
 async def test_model_validation_log_contains_only_bounded_safe_metadata(
     engine_client, caplog
 ) -> None:
@@ -189,7 +212,7 @@ async def test_model_validation_log_contains_only_bounded_safe_metadata(
         "user": request_identifier,
     }
     cases = [
-        ({**base, rejected_name: rejected_value}, "top_level", 1),
+        ({**base, rejected_name: rejected_value}, "extra_forbidden", "top_level", 1),
         (
             {
                 **base,
@@ -198,6 +221,7 @@ async def test_model_validation_log_contains_only_bounded_safe_metadata(
                     rejected_name: rejected_value,
                 },
             },
+            "extra_forbidden",
             "stream_options",
             1,
         ),
@@ -211,12 +235,13 @@ async def test_model_validation_log_contains_only_bounded_safe_metadata(
                     }
                 ],
             },
-            "messages",
+            "other",
+            "other",
             100,
         ),
     ]
 
-    for payload, scope, count in cases:
+    for payload, reason, scope, count in cases:
         caplog.clear()
         handler = StreamHandler(engine_client)
         await handler.handle(header_request())
@@ -226,7 +251,7 @@ async def test_model_validation_log_contains_only_bounded_safe_metadata(
         assert response is not None and response.immediate_response.status.code == 400
         assert "protocol_failure" in handler._dispatch_outcomes
         assert caplog.messages == [
-            "model request validation failed family=chat reason=extra_forbidden "
+            f"model request validation failed family=chat reason={reason} "
             f"scope={scope} count={count}"
         ]
         for private_value in (
@@ -236,6 +261,24 @@ async def test_model_validation_log_contains_only_bounded_safe_metadata(
             "private prompt payload",
         ):
             assert private_value not in caplog.text
+
+
+def test_model_validation_log_does_not_materialize_errors_above_the_cap(caplog) -> None:
+    class ExcessiveValidationErrors:
+        def error_count(self) -> int:
+            return 101
+
+        def errors(self, **_kwargs: object) -> list[object]:
+            raise AssertionError("detailed errors must not be materialized")
+
+    _log_model_validation_failure(
+        {"model": "test", "messages": []},
+        cast(ValidationError, ExcessiveValidationErrors()),
+    )
+
+    assert caplog.messages == [
+        "model request validation failed family=chat reason=other scope=other count=100"
+    ]
 
 
 async def test_headerless_identical_requests_use_distinct_engine_sessions(engine_client) -> None:

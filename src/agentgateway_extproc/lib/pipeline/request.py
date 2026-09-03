@@ -8,6 +8,7 @@ import json
 import logging
 import re
 import secrets
+from collections.abc import Mapping
 from dataclasses import replace
 from typing import TYPE_CHECKING, cast
 
@@ -250,6 +251,16 @@ async def process_request(
 def _log_model_validation_failure(payload: object, exc: ValidationError) -> None:
     """Log only allowlisted aggregate facts about an invalid model request."""
     family = _model_request_family(payload)
+    error_count = exc.error_count()
+    if error_count > _MAX_VALIDATION_ERROR_COUNT:
+        _logger.warning(
+            "model request validation failed family=%s reason=%s scope=%s count=%d",
+            family,
+            "other",
+            "other",
+            _MAX_VALIDATION_ERROR_COUNT,
+        )
+        return
     family_model = {
         "chat": "EngineChatRequest",
         "responses": "EngineResponsesRequest",
@@ -257,9 +268,7 @@ def _log_model_validation_failure(payload: object, exc: ValidationError) -> None
     errors = exc.errors(include_url=False, include_context=False, include_input=False)
     if family_model is not None:
         selected = [
-            error
-            for error in errors
-            if (location := error.get("loc")) and location[0] == family_model
+            error for error in errors if _validation_error_matches_model(error, family_model)
         ]
         if selected:
             errors = selected
@@ -272,7 +281,24 @@ def _log_model_validation_failure(payload: object, exc: ValidationError) -> None
         family,
         reason,
         scope,
-        min(len(errors), _MAX_VALIDATION_ERROR_COUNT),
+        len(errors),
+    )
+
+
+def _validation_error_matches_model(error: Mapping[str, object], marker: str) -> bool:
+    """Recognize a union branch, including Pydantic's model-validator wrapper."""
+    location = error.get("loc")
+    if not isinstance(location, tuple) or not location:
+        return False
+    return _validation_model_branch(location[0], marker)
+
+
+def _validation_model_branch(branch: object, marker: str) -> bool:
+    """Return whether a location part identifies the expected model branch."""
+    return branch == marker or (
+        isinstance(branch, str)
+        and branch.startswith("function-after[")
+        and branch.endswith(f", {marker}]")
     )
 
 
@@ -316,11 +342,14 @@ def _validation_scope(location: object) -> str:
     if not isinstance(location, tuple):
         return "other"
     schema_location = location
-    if location and location[0] in {
-        "EngineChatRequest",
-        "EngineResponsesRequest",
-        "EngineMcpRequest",
-    }:
+    if location and any(
+        _validation_model_branch(location[0], marker)
+        for marker in (
+            "EngineChatRequest",
+            "EngineResponsesRequest",
+            "EngineMcpRequest",
+        )
+    ):
         schema_location = location[1:]
     if "stream_options" in schema_location:
         return "stream_options"

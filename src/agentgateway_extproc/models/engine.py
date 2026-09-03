@@ -165,6 +165,13 @@ class EngineChatRequest(EngineModel):
     response_format: dict[str, JsonValue] | None = None
     user: str | None = Field(default=None, max_length=256)
 
+    @model_validator(mode="after")
+    def validate_stream_options(self) -> EngineChatRequest:
+        """Allow stream options only for streamed Chat Completions requests."""
+        if self.stream_options is not None and not self.stream:
+            raise ValueError("stream_options require stream to be enabled")  # noqa: TRY003
+        return self
+
 
 class EngineResponseTextPart(EngineModel):
     """Represent one Responses API text content part."""
