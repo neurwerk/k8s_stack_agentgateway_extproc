@@ -142,6 +142,12 @@ class EngineMessage(EngineModel):
         return self
 
 
+class EngineChatStreamOptions(EngineModel):
+    """Represent strict streamed Chat completion controls."""
+
+    include_usage: Annotated[bool, Field(strict=True)]
+
+
 class EngineChatRequest(EngineModel):
     """Represent a bounded OpenAI Chat Completions request."""
 
@@ -151,6 +157,7 @@ class EngineChatRequest(EngineModel):
     top_p: float | None = Field(default=None, ge=0, le=1)
     max_tokens: int | None = Field(default=None, ge=1, le=1_000_000)
     stream: bool = False
+    stream_options: EngineChatStreamOptions | None = None
     n: int | None = Field(default=None, ge=1, le=16)
     stop: str | list[str] | None = None
     tools: list[EngineToolDefinition] = Field(default_factory=list, max_length=128)
