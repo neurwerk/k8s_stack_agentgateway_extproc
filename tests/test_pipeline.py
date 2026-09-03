@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import gzip
 import json
+from typing import cast
 from unittest.mock import patch
 
+import httpx
 import pytest
+from pydantic import ValidationError
 
-from agentgateway_extproc.config.settings import Settings
+from agentgateway_extproc.config.settings import EngineSettings, Settings
+from agentgateway_extproc.lib.engine.client import EngineClient
 from agentgateway_extproc.lib.pipeline.guard import GUARD_INSTRUCTION
+from agentgateway_extproc.lib.pipeline.request import _log_model_validation_failure
 from agentgateway_extproc.lib.pipeline.stream_handler import StreamHandler
 from agentgateway_extproc.models.exceptions import InvalidEngineReplyError, InvalidReversalError
 
@@ -136,6 +141,144 @@ async def test_provider_request_omits_empty_tool_calls_from_chat_history(
         "user",
     ]
     assert all("tool_calls" not in message for message in forwarded["messages"])
+
+
+@pytest.mark.parametrize("include_usage", [True, False])
+async def test_chat_stream_options_survives_engine_and_provider_dispatch(
+    engine_reply, include_usage: bool
+) -> None:
+    original = {
+        "model": "test",
+        "messages": [{"role": "user", "content": "Jane Doe"}],
+        "stream": True,
+        "stream_options": {"include_usage": include_usage},
+    }
+    engine_reply["request"].update(
+        {"stream": True, "stream_options": {"include_usage": include_usage}}
+    )
+    captured: dict[str, object] = {}
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content))
+        return httpx.Response(200, json=engine_reply, request=request)
+
+    client = EngineClient(
+        EngineSettings(base_url="https://pii-engine.test"),
+        httpx.AsyncClient(
+            transport=httpx.MockTransport(transport), base_url="https://pii-engine.test"
+        ),
+    )
+    handler = StreamHandler(client)
+    await handler.handle(header_request())
+
+    response = await handler.handle(body_request(json.dumps(original).encode()))
+
+    assert captured["stream_options"] == {"include_usage": include_usage}
+    assert response is not None and not response.HasField("immediate_response")
+    forwarded = json.loads(response.request_body.response.body_mutation.body)
+    assert forwarded["stream_options"] == {"include_usage": include_usage}
+    assert forwarded["messages"][0]["content"] == GUARD_INSTRUCTION
+
+
+@pytest.mark.parametrize("stream", [None, False], ids=["omitted", "disabled"])
+async def test_chat_stream_options_are_rejected_before_engine_dispatch(
+    engine_client, stream: bool | None
+) -> None:
+    payload = {
+        "model": "test",
+        "messages": [{"role": "user", "content": "hello"}],
+        "stream_options": {"include_usage": True},
+    }
+    if stream is not None:
+        payload["stream"] = stream
+    handler = StreamHandler(engine_client)
+    await handler.handle(header_request())
+
+    response = await handler.handle(body_request(json.dumps(payload).encode()))
+
+    assert response is not None and response.immediate_response.status.code == 400
+    assert handler._dispatch_outcomes == {"protocol_failure"}
+
+
+async def test_model_validation_log_contains_only_bounded_safe_metadata(
+    engine_client, caplog
+) -> None:
+    rejected_name = "unknown_private_identifier_"
+    rejected_value = "secret-payload-value"
+    request_identifier = "request-sensitive-123"
+    base = {
+        "model": "test",
+        "messages": [{"role": "user", "content": "private prompt payload"}],
+        "user": request_identifier,
+    }
+    cases = [
+        ({**base, rejected_name: rejected_value}, "extra_forbidden", "top_level", 1),
+        (
+            {
+                **base,
+                "stream_options": {
+                    "include_usage": True,
+                    rejected_name: rejected_value,
+                },
+            },
+            "extra_forbidden",
+            "stream_options",
+            1,
+        ),
+        (
+            {
+                **base,
+                "messages": [
+                    {
+                        **base["messages"][0],
+                        **{f"{rejected_name}{index}": rejected_value for index in range(110)},
+                    }
+                ],
+            },
+            "other",
+            "other",
+            100,
+        ),
+    ]
+
+    for payload, reason, scope, count in cases:
+        caplog.clear()
+        handler = StreamHandler(engine_client)
+        await handler.handle(header_request())
+
+        response = await handler.handle(body_request(json.dumps(payload).encode()))
+
+        assert response is not None and response.immediate_response.status.code == 400
+        assert "protocol_failure" in handler._dispatch_outcomes
+        assert caplog.messages == [
+            f"model request validation failed family=chat reason={reason} "
+            f"scope={scope} count={count}"
+        ]
+        for private_value in (
+            rejected_name,
+            rejected_value,
+            request_identifier,
+            "private prompt payload",
+        ):
+            assert private_value not in caplog.text
+
+
+def test_model_validation_log_does_not_materialize_errors_above_the_cap(caplog) -> None:
+    class ExcessiveValidationErrors:
+        def error_count(self) -> int:
+            return 101
+
+        def errors(self, **_kwargs: object) -> list[object]:
+            raise AssertionError("detailed errors must not be materialized")
+
+    _log_model_validation_failure(
+        {"model": "test", "messages": []},
+        cast(ValidationError, ExcessiveValidationErrors()),
+    )
+
+    assert caplog.messages == [
+        "model request validation failed family=chat reason=other scope=other count=100"
+    ]
 
 
 async def test_headerless_identical_requests_use_distinct_engine_sessions(engine_client) -> None:
@@ -1235,14 +1378,21 @@ async def test_responses_sse_is_buffered_and_rewritten_as_responses_events(
     assert GUARD_INSTRUCTION not in output
 
 
-async def test_chat_finish_usage_done_shape_survives_chunk_boundaries(engine_client) -> None:
-    """Choice completion does not terminate Chat before usage and the global marker."""
+@pytest.mark.parametrize("separate_usage_tail", [True, False], ids=["separate", "coalesced"])
+async def test_chat_finish_usage_done_shapes_survive_chunk_boundaries(
+    engine_client, separate_usage_tail: bool
+) -> None:
+    """Both usage placements survive through the global completion marker."""
     handler = StreamHandler(engine_client)
     handler.notice_messages = []
     await handler.handle(response_headers("text/event-stream"))
     finish = {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
     usage = {"choices": [], "usage": {"prompt_tokens": 1, "completion_tokens": 2}}
-    stream = f"data: {json.dumps(finish)}\n\ndata: {json.dumps(usage)}\n\ndata: [DONE]\n\n"
+    events = [finish, usage]
+    if not separate_usage_tail:
+        events = [{**finish, "usage": usage["usage"]}]
+    stream = "".join(f"data: {json.dumps(event)}\n\n" for event in events)
+    stream += "data: [DONE]\n\n"
     split = stream.index("usage") + 3
     first = await handler.handle(response_body(stream[:split].encode(), end_of_stream=False))
     final = await handler.handle(response_body(stream[split:].encode()))
@@ -1250,8 +1400,7 @@ async def test_chat_finish_usage_done_shape_survives_chunk_boundaries(engine_cli
     assert final is not None
     output = _stream_text(first, final)
     assert [_sse_data(line) for line in output.splitlines() if line.startswith("data: ")] == [
-        finish,
-        usage,
+        *events,
         "[DONE]",
     ]
 

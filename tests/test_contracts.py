@@ -70,6 +70,78 @@ def test_all_supported_request_families_validate_strictly() -> None:
         )
 
 
+@pytest.mark.parametrize("include_usage", [True, False])
+def test_chat_stream_options_accepts_only_an_explicit_strict_boolean(include_usage: bool) -> None:
+    request = ENGINE_REQUEST_ADAPTER.validate_python(
+        {
+            "model": "test",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": True,
+            "stream_options": {"include_usage": include_usage},
+        },
+        strict=True,
+    )
+
+    assert isinstance(request, EngineChatRequest)
+    assert request.stream_options is not None
+    assert request.stream_options.include_usage is include_usage
+
+
+@pytest.mark.parametrize(
+    "update",
+    [
+        {"unknown": "rejected"},
+        {"stream_options": {"include_usage": True, "unknown": "rejected"}},
+        {"stream_options": {}},
+        {"stream_options": {"include_usage": 1}},
+        {"stream_options": {"include_usage": "true"}},
+    ],
+    ids=["top-level-extra", "nested-extra", "missing-boolean", "integer", "string"],
+)
+def test_chat_stream_options_rejects_fields_outside_the_strict_contract(
+    update: dict[str, object],
+) -> None:
+    payload = {
+        "model": "test",
+        "messages": [{"role": "user", "content": "hello"}],
+        **({"stream": True} if "stream_options" in update else {}),
+        **update,
+    }
+
+    with pytest.raises(ValidationError):
+        ENGINE_REQUEST_ADAPTER.validate_python(payload, strict=True)
+
+
+@pytest.mark.parametrize("stream", [None, False], ids=["omitted", "disabled"])
+def test_chat_stream_options_require_streaming(stream: bool | None) -> None:
+    payload = {
+        "model": "test",
+        "messages": [{"role": "user", "content": "hello"}],
+        "stream_options": {"include_usage": True},
+    }
+    if stream is not None:
+        payload["stream"] = stream
+
+    with pytest.raises(ValidationError, match="stream_options require stream"):
+        ENGINE_REQUEST_ADAPTER.validate_python(payload, strict=True)
+
+
+@pytest.mark.parametrize("stream", [None, False], ids=["omitted", "disabled"])
+def test_chat_nonstream_request_remains_valid_without_stream_options(stream: bool | None) -> None:
+    payload = {
+        "model": "test",
+        "messages": [{"role": "user", "content": "hello"}],
+    }
+    if stream is not None:
+        payload["stream"] = stream
+
+    request = ENGINE_REQUEST_ADAPTER.validate_python(payload, strict=True)
+
+    assert isinstance(request, EngineChatRequest)
+    assert request.stream is False
+    assert request.stream_options is None
+
+
 def test_responses_text_format_is_strict_and_bounded() -> None:
     """Responses structured output accepts only the bounded supported format contract."""
     request = ENGINE_REQUEST_ADAPTER.validate_python(
