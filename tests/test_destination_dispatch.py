@@ -162,8 +162,21 @@ async def test_malformed_metadata_fails_closed(engine_client, policy) -> None:
     assert responses[-1].immediate_response.status.code == 503
 
 
-async def test_exact_disabled_model_bypasses_engine_with_noop_response_callbacks(
-    engine_client,
+@pytest.mark.parametrize(
+    ("content_type", "upstream_chunks"),
+    [
+        ("application/json", [b'{"value":"unchanged"}']),
+        (
+            "text/event-stream",
+            [
+                b'data: {"choices":[{"delta":{"content":"answer"}}]}\n\n',
+                b"data: [DONE]\n\n",
+            ],
+        ),
+    ],
+)
+async def test_exact_disabled_model_bypasses_engine_and_preserves_response_chunks(
+    engine_client, content_type, upstream_chunks
 ) -> None:
     policy = {**MODEL_POLICY, "models": {"test": False, "other": True}}
     original = b'{ "model" : "test", "messages" : [ {"role":"user","content":"raw"} ] }'
@@ -181,8 +194,18 @@ async def test_exact_disabled_model_bypasses_engine_with_noop_response_callbacks
     assert not handler.notice_messages
     analyze.assert_not_awaited()
 
-    headers = await handler.handle(response_headers("application/json", policy=policy))
-    body = await handler.handle(response_body(b'{"value":"unchanged"}', policy=policy))
+    headers = await handler.handle(response_headers(content_type, policy=policy))
+    bodies = []
+    for index, chunk in enumerate(upstream_chunks):
+        body = await handler.handle(
+            response_body(
+                chunk,
+                end_of_stream=index == len(upstream_chunks) - 1,
+                policy=policy,
+            )
+        )
+        assert body is not None
+        bodies.append(body.response_body.response.body_mutation.streamed_response)
     trailers = await handler.handle(
         add_policy(
             ext_proc_pb2.ProcessingRequest(
@@ -194,7 +217,8 @@ async def test_exact_disabled_model_bypasses_engine_with_noop_response_callbacks
         )
     )
     assert headers is not None and headers.HasField("response_headers")
-    assert body is not None and not body.response_body.response.body_mutation.ByteSize()
+    assert [body.body for body in bodies] == upstream_chunks
+    assert [body.end_of_stream for body in bodies] == [False] * (len(upstream_chunks) - 1) + [True]
     assert trailers is not None
     assert not trailers.response_trailers.header_mutation.remove_headers
 

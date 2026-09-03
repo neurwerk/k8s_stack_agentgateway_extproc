@@ -473,7 +473,16 @@ class StreamHandler:
         if not self.response_processing_enabled:
             self.response_processed = request.response_body.end_of_stream
             return ext_proc_pb2.ProcessingResponse(
-                response_body=ext_proc_pb2.BodyResponse(response=ext_proc_pb2.CommonResponse())
+                response_body=ext_proc_pb2.BodyResponse(
+                    response=ext_proc_pb2.CommonResponse(
+                        body_mutation={
+                            "streamed_response": {
+                                "body": request.response_body.body,
+                                "end_of_stream": request.response_body.end_of_stream,
+                            }
+                        }
+                    )
+                )
             )
         return self._process_response_bytes(
             request.response_body.body, request.response_body.end_of_stream
