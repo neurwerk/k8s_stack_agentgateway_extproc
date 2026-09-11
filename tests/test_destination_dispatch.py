@@ -827,8 +827,9 @@ async def test_mcp_engine_reroute_reply_is_invalid(engine_client, engine_reply) 
         await handler.handle(body_request(json.dumps(original).encode(), policy=policy))
 
 
+@pytest.mark.parametrize("outcome", ["success", "tool-error", "rpc-error"])
 async def test_mcp_response_reverses_only_authorized_result_locations(
-    engine_client, engine_reply
+    engine_client, engine_reply, outcome: str
 ) -> None:
     handler, policy = await _analyzed_mcp_handler(engine_client, engine_reply)
     await handler.handle(response_headers("application/json", policy=policy))
@@ -848,11 +849,19 @@ async def test_mcp_response_reverses_only_authorized_result_locations(
                 },
             ],
             "structuredContent": {"nested": [REVERSIBLE_TOKEN]},
+            "isError": outcome == "tool-error",
         },
     }
+    if outcome == "rpc-error":
+        payload.pop("result")
+        payload["error"] = {"code": -32602, "message": "Invalid arguments"}
     response = await handler.handle(response_body(json.dumps(payload).encode(), policy=policy))
     assert response is not None
     transformed = json.loads(response.response_body.response.body_mutation.streamed_response.body)
+    if outcome == "rpc-error":
+        assert transformed == payload
+        return
+    assert transformed["result"]["isError"] is (outcome == "tool-error")
     assert transformed["result"]["content"][0]["text"] == "Jane Doe"
     assert transformed["result"]["content"][1]["resource"]["text"] == "Jane Doe"
     assert transformed["result"]["structuredContent"]["nested"] == ["Jane Doe"]
@@ -1079,32 +1088,46 @@ async def test_mcp_notification_empty_json_202_is_acknowledged(engine_client) ->
     assert [response.WhichOneof("response") for response in responses][-1] == "response_headers"
 
 
-@pytest.mark.parametrize("status", [200, 202])
-async def test_mcp_delete_rejects_non_204_lifecycle_status(engine_client, status: int) -> None:
+@pytest.mark.parametrize("status", [200, 201])
+async def test_mcp_delete_rejects_invalid_lifecycle_status(engine_client, status: int) -> None:
     policy = mcp_policy()
     handler = StreamHandler(engine_client)
     await handler.handle(
         header_request(mcp_headers(method="DELETE"), end_of_stream=True, policy=policy)
     )
-    with pytest.raises(McpProtocolError, match="empty HTTP 204"):
+    with pytest.raises(McpProtocolError, match="empty HTTP 202 or 204"):
         await handler.handle(
             response_headers("application/json", status=status, policy=policy, end_of_stream=True)
         )
 
 
-async def test_mcp_delete_empty_204_is_acknowledged(engine_client) -> None:
+@pytest.mark.parametrize("status", [202, 204])
+@pytest.mark.parametrize("header_eos", [False, True])
+@pytest.mark.parametrize("callback", [False, True])
+async def test_mcp_delete_empty_response_is_acknowledged(
+    engine_client, status: int, header_eos: bool, callback: bool
+) -> None:
     policy = mcp_policy()
     servicer = ExtProcServicer(engine_client)
 
     async def requests():
         yield header_request(mcp_headers(method="DELETE"), end_of_stream=True, policy=policy)
-        yield response_headers("application/json", status=204, policy=policy, end_of_stream=True)
+        yield response_headers("", status=status, policy=policy, end_of_stream=header_eos)
+        if callback:
+            yield response_body(b"", policy=None)
 
     responses = [response async for response in servicer.Process(requests(), object())]
-    assert [response.WhichOneof("response") for response in responses] == [
+    expected = [
         "request_headers",
         "response_headers",
     ]
+    if callback or not header_eos:
+        expected.append("response_body")
+    assert [response.WhichOneof("response") for response in responses] == expected
+    assert all(
+        not response.response_body.response.body_mutation.streamed_response.body
+        for response in responses
+    )
 
 
 @pytest.mark.parametrize(
@@ -1112,12 +1135,14 @@ async def test_mcp_delete_empty_204_is_acknowledged(engine_client) -> None:
     [
         ({"content-length": "1"}, True),
         ({"transfer-encoding": "chunked"}, True),
-        ({}, False),
+        ({"content-length": "1"}, False),
+        ({"content-length": "invalid"}, False),
     ],
-    ids=["content-length", "chunked", "body-callback-promised"],
+    ids=["content-length", "chunked", "body-callback-promised", "invalid-length"],
 )
+@pytest.mark.parametrize("status", [202, 204])
 async def test_mcp_delete_204_rejects_promised_body(
-    engine_client, extra_headers: dict[str, str], end_of_stream: bool
+    engine_client, extra_headers: dict[str, str], end_of_stream: bool, status: int
 ) -> None:
     policy = mcp_policy()
     handler = StreamHandler(engine_client)
@@ -1128,7 +1153,7 @@ async def test_mcp_delete_204_rejects_promised_body(
         await handler.handle(
             response_headers(
                 "application/json",
-                status=204,
+                status=status,
                 extra_headers=extra_headers,
                 policy=policy,
                 end_of_stream=end_of_stream,
@@ -1136,18 +1161,26 @@ async def test_mcp_delete_204_rejects_promised_body(
         )
 
 
-async def test_mcp_delete_204_rejects_body_after_header_only_ack(engine_client) -> None:
+@pytest.mark.parametrize("status", [202, 204])
+@pytest.mark.parametrize("header_eos", [False, True])
+@pytest.mark.parametrize("body", [b"unexpected", b" "])
+async def test_mcp_delete_204_rejects_body_after_header_only_ack(
+    engine_client, status: int, header_eos: bool, body: bytes
+) -> None:
     policy = mcp_policy()
     handler = StreamHandler(engine_client)
     await handler.handle(
         header_request(mcp_headers(method="DELETE"), end_of_stream=True, policy=policy)
     )
     acknowledgement = await handler.handle(
-        response_headers("application/json", status=204, policy=policy, end_of_stream=True)
+        response_headers("application/json", status=status, policy=policy, end_of_stream=header_eos)
     )
-    assert acknowledgement is not None and acknowledgement.HasField("response_headers")
+    if header_eos:
+        assert acknowledgement is not None and acknowledgement.HasField("response_headers")
+    else:
+        assert acknowledgement is None
     with pytest.raises(McpProtocolError, match="cannot contain a body"):
-        await handler.handle(response_body(b"unexpected", policy=policy))
+        await handler.handle(response_body(body, policy=policy))
 
 
 @pytest.mark.parametrize(
@@ -1202,8 +1235,12 @@ async def test_mcp_notification_202_rejects_promised_body(engine_client) -> None
     handler = StreamHandler(engine_client)
     await handler.handle(header_request(mcp_headers(), policy=policy))
     await handler.handle(body_request(json.dumps(notification).encode(), policy=policy))
-    with pytest.raises(McpProtocolError, match="cannot contain a body"):
+    assert (
         await handler.handle(response_headers("application/json", status=202, policy=policy))
+        is None
+    )
+    with pytest.raises(McpProtocolError, match="cannot contain a body"):
+        await handler.handle(response_body(b"{}", policy=policy))
 
 
 @pytest.mark.parametrize(
@@ -1239,13 +1276,19 @@ async def test_mcp_client_response_202_rejects_promised_body(engine_client) -> N
     handler = StreamHandler(engine_client)
     await handler.handle(header_request(mcp_headers(), policy=policy))
     await handler.handle(body_request(json.dumps(response).encode(), policy=policy))
-    with pytest.raises(McpProtocolError, match="cannot contain a body"):
+    assert (
         await handler.handle(response_headers("application/json", status=202, policy=policy))
+        is None
+    )
+    with pytest.raises(McpProtocolError, match="cannot contain a body"):
+        await handler.handle(response_body(b"{}", policy=policy))
 
 
 @pytest.mark.parametrize("pii_enabled", [True, False])
+@pytest.mark.parametrize("outcome", ["wrong-version", "success", "error", "wrong-id", "bad-error"])
+@pytest.mark.parametrize("sse", [False, True])
 async def test_mcp_initialization_requires_exact_backend_protocol(
-    engine_client, pii_enabled: bool
+    engine_client, pii_enabled: bool, outcome: str, sse: bool
 ) -> None:
     policy = mcp_policy(pii_enabled=pii_enabled)
     initialize = {
@@ -1262,14 +1305,102 @@ async def test_mcp_initialization_requires_exact_backend_protocol(
     await handler.handle(header_request(mcp_headers(), policy=policy))
     request = await handler.handle(body_request(json.dumps(initialize).encode(), policy=policy))
     assert request is not None and not request.request_body.response.body_mutation.ByteSize()
-    await handler.handle(response_headers("application/json", policy=policy))
+    await handler.handle(
+        response_headers("text/event-stream" if sse else "application/json", policy=policy)
+    )
     response = {
         "jsonrpc": "2.0",
         "id": "init-1",
         "result": {"protocolVersion": "2025-03-26", "capabilities": {}},
     }
-    with pytest.raises(McpProtocolError, match="unsupported MCP version"):
-        await handler.handle(response_body(json.dumps(response).encode(), policy=policy))
+    if outcome == "success":
+        response["result"]["protocolVersion"] = MCP_PROTOCOL_VERSION
+    elif outcome in {"error", "wrong-id", "bad-error"}:
+        response.pop("result")
+        response["error"] = {"code": -32602, "message": "Unsupported initialization"}
+        if outcome == "wrong-id":
+            response["id"] = "other"
+        elif outcome == "bad-error":
+            response["error"]["code"] = True
+    encoded = json.dumps(response).encode()
+    wire = b"data: " + encoded + b"\n\n" if sse else encoded
+    if outcome in {"wrong-version", "wrong-id", "bad-error"}:
+        with pytest.raises(McpProtocolError):
+            await handler.handle(response_body(wire, policy=policy))
+    else:
+        result = await handler.handle(response_body(wire, policy=policy))
+        assert result is not None
+        assert result.response_body.response.body_mutation.streamed_response.body == wire
+
+
+@pytest.mark.parametrize(
+    ("method", "status"),
+    [
+        ("GET", 405),
+        ("DELETE", 405),
+        ("GET", 404),
+        ("DELETE", 404),
+        ("POST", 404),
+        ("POST", 400),
+        ("POST", 401),
+        ("POST", 403),
+        ("POST", 409),
+        ("POST", 413),
+        ("POST", 429),
+        ("POST", 500),
+        ("POST", 502),
+        ("POST", 503),
+        ("POST", 504),
+    ],
+)
+@pytest.mark.parametrize("header_eos", [False, True])
+@pytest.mark.parametrize("pii_enabled", [False, True])
+async def test_mcp_http_errors_preserve_only_safe_transport_classification(
+    engine_client, method: str, status: int, header_eos: bool, pii_enabled: bool
+) -> None:
+    """HTTP failures never expose backend content or become adapter/session failures."""
+    policy = mcp_policy(pii_enabled=pii_enabled)
+    servicer = ExtProcServicer(engine_client)
+
+    async def requests():
+        yield header_request(
+            mcp_headers(method=method, session_id="session-1"),
+            end_of_stream=method != "POST",
+            policy=policy,
+        )
+        if method == "POST":
+            yield body_request(b'{"jsonrpc":"2.0","id":1,"method":"ping"}', policy=policy)
+        yield response_headers(
+            "text/html",
+            status=status,
+            policy=policy,
+            end_of_stream=header_eos,
+            extra_headers={
+                "allow": "POST, DELETE" if header_eos else "POST, private-value",
+                "retry-after": "30" if header_eos else "999999999",
+                "www-authenticate": 'Bearer resource_metadata="https://untrusted.invalid"',
+                "location": "https://untrusted.invalid",
+                "set-cookie": "private-value",
+                "mcp-session-id": "untrusted-session",
+            },
+        )
+        yield response_body(b"private backend diagnostic", policy=policy)
+
+    with patch.object(engine_client, "analyze_request", new_callable=AsyncMock) as analyze:
+        responses = [response async for response in servicer.Process(requests(), object())]
+    analyze.assert_not_awaited()
+    assert not any(response.HasField("response_headers") for response in responses)
+    immediate = responses[-1].immediate_response
+    assert immediate.status.code == status
+    assert immediate.body == '{"error":"MCP HTTP request failed"}'
+    expected = {"content-type": "application/json"}
+    if header_eos and status == 405:
+        expected["allow"] = "POST, DELETE"
+    if header_eos and status in {429, 503}:
+        expected["retry-after"] = "30"
+    assert {
+        item.header.key: item.header.value for item in immediate.headers.set_headers
+    } == expected
 
 
 async def test_mcp_gzip_json_response_is_bounded_and_reversed(engine_client, engine_reply) -> None:

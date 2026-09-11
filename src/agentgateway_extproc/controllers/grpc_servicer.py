@@ -25,6 +25,7 @@ from agentgateway_extproc.models.exceptions import (
     EngineUnavailableError,
     InvalidEngineReplyError,
     InvalidReversalError,
+    McpHttpError,
     TrustedMetadataError,
 )
 
@@ -157,6 +158,13 @@ async def _handle_message(
 
 def _failure_response(phase: str, exc: Exception) -> ext_proc_pb2.ProcessingResponse:
     """Record only bounded response failure context and fail the stream closed."""
+    if isinstance(exc, McpHttpError):
+        response = immediate_response(exc.status_code, '{"error":"MCP HTTP request failed"}')
+        for key, value in exc.headers.items():
+            response.immediate_response.headers.set_headers.add(
+                header={"key": key, "value": value}, append_action=2
+            )
+        return response
     _record_failure(phase, exc)
     if isinstance(exc, EnginePolicyError):
         body = json.dumps(
@@ -227,6 +235,8 @@ def _failure_reason(exc: Exception) -> str:
 
 def _record_dispatch_failure(handler: StreamHandler, exc: Exception) -> None:
     """Classify failures without request-derived metric labels."""
+    if isinstance(exc, McpHttpError):
+        return
     if isinstance(exc, McpProtocolError):
         handler.record_dispatch("protocol_failure")
     elif (

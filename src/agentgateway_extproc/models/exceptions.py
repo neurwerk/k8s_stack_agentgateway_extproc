@@ -59,6 +59,37 @@ class InvalidReversalError(Exception):
     """Indicate that a response contains an untrusted or unknown placeholder."""
 
 
+class McpHttpError(Exception):
+    """Carry an HTTP rejection without trusting backend bodies or authentication headers."""
+
+    def __init__(self, status_code: int, headers: dict[str, str]) -> None:
+        """Keep only bounded transport hints with a closed value vocabulary."""
+        if not 400 <= status_code <= 599:
+            raise ValueError
+        super().__init__()
+        self.status_code = status_code
+        self.headers: dict[str, str] = {}
+        allow = headers.get("allow", "")
+        methods = [method.strip() for method in allow.split(",")]
+        if (
+            status_code == 405
+            and len(allow) <= 128
+            and all(
+                method
+                in {"GET", "HEAD", "POST", "PUT", "DELETE", "CONNECT", "OPTIONS", "TRACE", "PATCH"}
+                for method in methods
+            )
+        ):
+            self.headers["allow"] = ", ".join(dict.fromkeys(methods))
+        retry_after = headers.get("retry-after", "")
+        if (
+            status_code in {429, 503}
+            and 0 < len(retry_after) <= 5
+            and (retry_after.isascii() and retry_after.isdecimal() and int(retry_after) <= 86400)
+        ):
+            self.headers["retry-after"] = retry_after
+
+
 class TrustedMetadataError(Exception):
     """Indicate missing, malformed, or changing trusted destination metadata."""
 
