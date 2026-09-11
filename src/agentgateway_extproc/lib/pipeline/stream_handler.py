@@ -27,7 +27,7 @@ from agentgateway_extproc.models.destination import (
     ModelDestinationPolicy,
     destination_policy_from_request,
 )
-from agentgateway_extproc.models.exceptions import TrustedMetadataError
+from agentgateway_extproc.models.exceptions import McpHttpError, TrustedMetadataError
 from agentgateway_extproc.models.types import (
     PRESIDIO_RESPONSE_HEADER,
     REQUEST_HEADERS,
@@ -108,6 +108,7 @@ class StreamHandler:
         self.response_processed = False
         self.response_started = False
         self.response_headers_accepted = False
+        self.mcp_empty_eos_pending = False
         self.request_started = False
         self.request_trailers_expected = False
         self.response_decoder = _utf8_decoder()
@@ -145,6 +146,7 @@ class StreamHandler:
         self.request_nonce = None
         self.request_trailers_expected = False
         self.response_headers_accepted = False
+        self.mcp_empty_eos_pending = False
 
     def record_dispatch(self, outcome: str) -> None:
         """Record each bounded dispatcher outcome at most once per stream."""
@@ -202,7 +204,7 @@ class StreamHandler:
         return bool(
             self.destination_policy is not None
             and self.response_headers_accepted
-            and not self.response_processed
+            and (not self.response_processed or self.mcp_empty_eos_pending)
             and request.WhichOneof("request") == "response_body"
             and request.response_body.end_of_stream
             and not request.response_body.body
@@ -342,8 +344,6 @@ class StreamHandler:
         )
         self.response_decoder = _utf8_decoder()
         encoding = headers.get("content-encoding", "").strip().casefold()
-        if encoding not in {"", "identity", "gzip"}:
-            raise ValueError("unsupported response content encoding")
         self.response_is_gzip = encoding == "gzip"
         if self.response_api_kind == "mcp":
             self._validate_mcp_response_headers(
@@ -351,6 +351,8 @@ class StreamHandler:
                 headers,
                 end_of_stream=request.response_headers.end_of_stream,
             )
+        if encoding not in {"", "identity", "gzip"}:
+            raise ValueError("unsupported response content encoding")
         response_transport_total.labels(
             format=self.response_format if self.response_format in {"sse", "json"} else "other",
             encoding="gzip" if self.response_is_gzip else "identity",
@@ -407,15 +409,26 @@ class StreamHandler:
         context = self.mcp_context
         if context is None:
             raise McpProtocolError("MCP response has no request context")
+        if 400 <= self.response_status <= 599:
+            raise McpHttpError(self.response_status, headers)
         self._validate_mcp_response_status(context, media_type)
-        self._validate_mcp_bodyless_transport(headers, end_of_stream=end_of_stream)
-        if not end_of_stream and media_type not in {"application/json", "text/event-stream"}:
+        self._validate_mcp_bodyless_transport(headers)
+        bodyless = self.response_status in {202, 204}
+        if bodyless:
+            # Defer the header acknowledgement until an empty final callback proves no body.
+            self.response_format = "json"
+        if (
+            not bodyless
+            and not end_of_stream
+            and media_type not in {"application/json", "text/event-stream"}
+        ):
             raise McpProtocolError("unsupported MCP response media type")
         if end_of_stream:
             if self.response_is_gzip:
                 raise McpProtocolError("empty MCP response cannot be gzip encoded")
             validate_mcp_empty_response(self)
             self.response_processed = True
+            self.mcp_empty_eos_pending = bodyless
 
     def _validate_mcp_response_status(
         self,
@@ -429,8 +442,8 @@ class StreamHandler:
             if self.response_status != 200 or media_type != "text/event-stream":
                 raise McpProtocolError("invalid MCP GET response")
         elif context.method == "http/delete":
-            if self.response_status != 204:
-                raise McpProtocolError("MCP DELETE requires empty HTTP 204")
+            if self.response_status not in {202, 204}:
+                raise McpProtocolError("MCP DELETE requires empty HTTP 202 or 204")
         elif context.notification and self.response_status != 202:
             raise McpProtocolError("MCP notification requires empty HTTP 202")
         elif not context.notification and self.response_status != 200:
@@ -439,14 +452,12 @@ class StreamHandler:
     def _validate_mcp_bodyless_transport(
         self,
         headers: dict[str, str],
-        *,
-        end_of_stream: bool,
     ) -> None:
         if self.response_status not in {202, 204}:
             return
         content_length = headers.get("content-length")
-        if not end_of_stream:
-            raise McpProtocolError("MCP empty response status cannot contain a body")
+        if self.response_is_gzip:
+            raise McpProtocolError("empty MCP response cannot be gzip encoded")
         if content_length is not None:
             content_length = content_length.strip()
             if (
@@ -469,7 +480,18 @@ class StreamHandler:
     ) -> ext_proc_pb2.ProcessingResponse | None:
         """Decode gzip as needed and process arbitrary response chunks."""
         if self.response_api_kind == "mcp" and self.response_processed:
-            raise McpProtocolError("MCP empty response cannot contain a body")
+            if not (
+                self.mcp_empty_eos_pending
+                and request.response_body.end_of_stream
+                and not request.response_body.body
+            ):
+                raise McpProtocolError("MCP empty response cannot contain a body")
+            self.mcp_empty_eos_pending = False
+        if self.response_api_kind == "mcp" and self.response_status in {202, 204}:
+            if request.response_body.body:
+                raise McpProtocolError("MCP empty response status cannot contain a body")
+            if not request.response_body.end_of_stream:
+                return None
         if not self.response_processing_enabled:
             self.response_processed = request.response_body.end_of_stream
             return ext_proc_pb2.ProcessingResponse(
@@ -640,6 +662,8 @@ def _validate_response_header_cardinality(api_kind: str, names: list[str]) -> No
             "content-encoding",
             "content-length",
             "transfer-encoding",
+            "allow",
+            "retry-after",
         }
     ):
         raise McpProtocolError("ambiguous MCP response headers")

@@ -358,7 +358,7 @@ def _process_mcp_response_payload(handler: StreamHandler, payload: Any, text: st
         raise McpProtocolError("MCP response must be one JSON-RPC object")
     _validate_json_bounds(payload)
     _validate_response_envelope(payload, context.request_id)
-    if context.method == "initialize":
+    if context.method == "initialize" and "result" in payload:
         result = payload.get("result")
         if not isinstance(result, dict) or result.get("protocolVersion") != MCP_PROTOCOL_VERSION:
             raise McpProtocolError("backend selected an unsupported MCP version")
