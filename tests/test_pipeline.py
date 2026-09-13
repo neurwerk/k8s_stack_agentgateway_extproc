@@ -281,8 +281,15 @@ def test_model_validation_log_does_not_materialize_errors_above_the_cap(caplog) 
     ]
 
 
-async def test_headerless_identical_requests_use_distinct_engine_sessions(engine_client) -> None:
-    """Separate requests cannot become linkable through identical prompt content."""
+@pytest.mark.parametrize(
+    "headers",
+    [{}, {"Mcp-Session-Id": ""}, {"X-Session-ID": "conversation-1", "Mcp-Session-Id": "ignored"}],
+    ids=["headerless", "mcp-header-is-not-model-session", "model-conversation"],
+)
+async def test_identical_model_requests_use_only_model_conversation_headers(
+    engine_client, headers
+) -> None:
+    """Model conversations are unchanged by MCP transport-session rejection."""
     first = StreamHandler(engine_client)
     second = StreamHandler(engine_client)
     with patch.object(
@@ -290,14 +297,16 @@ async def test_headerless_identical_requests_use_distinct_engine_sessions(engine
         "analyze_request",
         wraps=engine_client.analyze_request,
     ) as analyze:
-        await first.handle(header_request())
+        first_headers = await first.handle(header_request(headers))
+        assert first_headers is not None and first_headers.HasField("request_headers")
         await first.handle(body_request(request_json()))
-        await second.handle(header_request())
+        second_headers = await second.handle(header_request(headers))
+        assert second_headers is not None and second_headers.HasField("request_headers")
         await second.handle(body_request(request_json()))
 
     session_keys = [call.args[1] for call in analyze.await_args_list]
     assert len(session_keys) == 2
-    assert session_keys[0] != session_keys[1]
+    assert (session_keys[0] == session_keys[1]) == ("X-Session-ID" in headers)
 
 
 async def test_chunked_json_is_withheld_until_it_can_be_rewritten(engine_client) -> None:

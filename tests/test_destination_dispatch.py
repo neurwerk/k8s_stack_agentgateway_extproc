@@ -309,14 +309,56 @@ async def test_mcp_protocol_violations_are_400_before_engine(engine_client, head
     analyze.assert_not_awaited()
 
 
-async def test_mcp_accepts_positive_quality_values(engine_client) -> None:
-    policy = mcp_policy()
-    headers = mcp_headers() | {
+@pytest.mark.parametrize("pii_enabled", [True, False])
+@pytest.mark.parametrize("method", ["POST", "GET", "DELETE"])
+@pytest.mark.parametrize(
+    "session_headers",
+    [
+        [],
+        [("mcp-session-id", "session-1")],
+        [("Mcp-Session-Id", "")],
+        [("mCp-SeSsIoN-iD", "session-1")],
+        [("mcp-session-id", "session-1"), ("mcp-session-id", "")],
+        [("Mcp-Session-Id", ""), ("mCP-session-ID", "session-2")],
+    ],
+    ids=["absent", "present", "empty", "mixed-case", "duplicate", "mixed-duplicate"],
+)
+async def test_mcp_header_session_rejection_and_positive_quality_values(
+    engine_client, pii_enabled: bool, method: str, session_headers
+) -> None:
+    policy = mcp_policy(pii_enabled=pii_enabled)
+    headers = mcp_headers(method=method) | {
         "accept": "application/json;profile=test;q=0.001, text/event-stream;q=1.000"
     }
-    handler = StreamHandler(engine_client)
-    response = await handler.handle(header_request(headers, policy=policy))
-    assert response is not None and not response.HasField("immediate_response")
+    request = header_request(headers, policy=policy, end_of_stream=method != "POST")
+    for key, value in session_headers:
+        request.request_headers.headers.headers.add(key=key, raw_value=value.encode())
+    if not session_headers:
+        response = await StreamHandler(engine_client).handle(request)
+        assert response is not None and response.HasField("request_headers")
+        return
+
+    async def requests():
+        yield request
+        pytest.fail("rejected headers must terminate processing before body or upstream dispatch")
+
+    with patch.object(engine_client, "analyze_request", new_callable=AsyncMock) as analyze:
+        responses = [
+            response
+            async for response in ExtProcServicer(engine_client).Process(requests(), object())
+        ]
+    analyze.assert_not_awaited()
+    assert len(responses) == 1
+    assert responses[0].WhichOneof("response") == "immediate_response"
+    immediate = responses[0].immediate_response
+    assert immediate.status.code == 404
+    assert immediate.body == (
+        '{"error":"Stateful MCP sessions are currently unsupported pending an '
+        'AgentGateway session-ownership fix. Reinitialize without Mcp-Session-Id."}'
+    )
+    assert {item.header.key: item.header.value for item in immediate.headers.set_headers} == {
+        "content-type": "application/json"
+    }
 
 
 @pytest.mark.parametrize(
@@ -506,6 +548,9 @@ async def test_mcp_lifecycle_and_no_text_calls_preserve_request_bytes(
 ) -> None:
     policy = mcp_policy(pii_enabled=pii_enabled)
     requests = [
+        b'{ "jsonrpc":"2.0", "id":0, "method":"initialize", '
+        b'"params":{"protocolVersion":"2025-11-25","capabilities":{},'
+        b'"clientInfo":{"name":"test","version":"1"}} }',
         b'{ "jsonrpc":"2.0", "id":1, "method":"resources/list", "params":{} }',
         b'{ "jsonrpc":"2.0", "id":2, "method":"tools/call", '
         b'"params":{"name":"lookup","arguments":{"limit":2,"active":true}} }',
@@ -524,7 +569,9 @@ async def test_mcp_pii_disabled_text_call_is_protocol_only(engine_client) -> Non
     policy = mcp_policy(pii_enabled=False)
     original = (
         b'{ "jsonrpc":"2.0", "id":"call-1", "method":"tools/call", '
-        b'"params":{"name":"search","arguments":{"query":"' + REVERSIBLE_TOKEN.encode() + b'"}} }'
+        b'"params":{"name":"search","arguments":{"session_id":"application-session","query":"'
+        + REVERSIBLE_TOKEN.encode()
+        + b'"}} }'
     )
     handler = StreamHandler(engine_client)
     with (
@@ -718,7 +765,7 @@ async def test_mcp_pii_disabled_gzip_is_not_forwarded_before_single_member_valid
     assert handler.response_emitted_bytes == 0
 
 
-async def test_mcp_text_call_sends_narrowed_engine_request_once(
+async def test_mcp_text_call_analyzes_once_per_request_with_distinct_session_keys(
     engine_client, engine_reply
 ) -> None:
     policy = mcp_policy()
@@ -744,27 +791,37 @@ async def test_mcp_text_call_sends_narrowed_engine_request_once(
         },
     }
     engine_reply["notices"] = {"request": [], "response": []}
-    handler = StreamHandler(engine_client)
     with patch.object(
         engine_client,
         "analyze_request",
         wraps=engine_client.analyze_request,
     ) as analyze:
-        await handler.handle(header_request(mcp_headers(session_id="session-1"), policy=policy))
-        response = await handler.handle(body_request(json.dumps(original).encode(), policy=policy))
-    assert response is not None
-    analyze.assert_awaited_once()
-    call = analyze.await_args
-    assert call is not None
-    sent = call.args[0]
-    assert isinstance(sent, EngineMcpRequest)
-    assert sent.model_dump(by_alias=True) == original
-    forwarded = json.loads(response.request_body.response.body_mutation.body)
-    assert forwarded["params"]["name"] == "search"
-    assert forwarded["params"]["_meta"] == {"progressToken": "safe"}
-    assert [
-        item.header.key for item in response.request_body.response.header_mutation.set_headers
-    ] == ["content-length"]
+        for expected_calls in (1, 2):
+            handler = StreamHandler(engine_client)
+            headers = await handler.handle(
+                header_request(
+                    mcp_headers() | {"X-Session-ID": "same-model-conversation"}, policy=policy
+                )
+            )
+            assert headers is not None and headers.HasField("request_headers")
+            response = await handler.handle(
+                body_request(json.dumps(original).encode(), policy=policy)
+            )
+            assert response is not None
+            assert analyze.await_count == expected_calls
+            call = analyze.await_args
+            assert call is not None
+            sent = call.args[0]
+            assert isinstance(sent, EngineMcpRequest)
+            assert sent.model_dump(by_alias=True) == original
+            forwarded = json.loads(response.request_body.response.body_mutation.body)
+            assert forwarded["params"]["name"] == "search"
+            assert forwarded["params"]["_meta"] == {"progressToken": "safe"}
+            assert [
+                item.header.key
+                for item in response.request_body.response.header_mutation.set_headers
+            ] == ["content-length"]
+    assert analyze.await_args_list[0].args[1] != analyze.await_args_list[1].args[1]
 
 
 async def test_mcp_block_is_exact_json_rpc_200(engine_client, engine_reply) -> None:
@@ -1364,7 +1421,7 @@ async def test_mcp_http_errors_preserve_only_safe_transport_classification(
 
     async def requests():
         yield header_request(
-            mcp_headers(method=method, session_id="session-1"),
+            mcp_headers(method=method),
             end_of_stream=method != "POST",
             policy=policy,
         )
