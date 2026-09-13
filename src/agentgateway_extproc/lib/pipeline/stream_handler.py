@@ -233,6 +233,13 @@ class StreamHandler:
         if policy is None:
             raise TrustedMetadataError
         if policy.destination_kind == "mcp":
+            if "mcp-session-id" in headers:
+                self.record_dispatch("protocol_failure")
+                return immediate_response(
+                    404,
+                    '{"error":"Stateful MCP sessions are currently unsupported pending an '
+                    'AgentGateway session-ownership fix. Reinitialize without Mcp-Session-Id."}',
+                )
             critical = {
                 ":method",
                 ":path",
@@ -240,7 +247,6 @@ class StreamHandler:
                 "content-type",
                 "content-encoding",
                 "mcp-protocol-version",
-                "mcp-session-id",
                 "last-event-id",
             }
             names = [item.key.lower() for item in header_items]

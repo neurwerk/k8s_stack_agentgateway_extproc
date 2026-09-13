@@ -23,6 +23,19 @@ and placeholder boundaries. `/health` checks the process; `/ready` verifies the
 PII Engine path; `/metrics` exposes bounded operational metrics. Deployment
 network policy and workload identity are outside this repository.
 
+All gateway MCP traffic is stateless. At the trusted request-header stage,
+any `Mcp-Session-Id` header (including empty or duplicate headers, regardless of
+case) is rejected with HTTP 404 and the fixed JSON error below, before upstream
+dispatch or PII Engine processing, even when PII is disabled:
+
+```json
+{"error":"Stateful MCP sessions are currently unsupported pending an AgentGateway session-ownership fix. Reinitialize without Mcp-Session-Id."}
+```
+
+There is no compatibility toggle. Activation of this binary requires a stateless
+AgentGateway configuration. Model conversation headers and JSON `session_id`
+fields are not transport-session headers and are unaffected by this rejection.
+
 ## Packages
 
 - Repository: `neurwerk/k8s_stack_agentgateway_extproc`
