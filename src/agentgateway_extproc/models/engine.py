@@ -110,7 +110,8 @@ class EngineToolFunction(EngineModel):
     """Describe a function tool offered to the model."""
 
     name: str = Field(min_length=1, max_length=256, pattern=r"^[A-Za-z0-9_.:-]+$")
-    description: str | None = Field(default=None, max_length=4_000)
+    # OpenCode tool descriptions can exceed 4,000 characters.
+    description: str | None = Field(default=None, max_length=20_000)
     parameters: dict[str, JsonValue] | None = None
 
 
