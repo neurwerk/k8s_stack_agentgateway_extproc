@@ -23,6 +23,29 @@ and placeholder boundaries. `/health` checks the process; `/ready` verifies the
 PII Engine path; `/metrics` exposes bounded operational metrics. Deployment
 network policy and workload identity are outside this repository.
 
+Typed attachment content parts in Chat Completions and Responses messages,
+including history, follow the selected model's trusted attachment mode:
+
+| Mode | Behavior |
+| --- | --- |
+| `block` (default) | Reject attachments with HTTP 403, independently of PII. |
+| `extract` | Reserved for Docling conversion: currently file parts fail closed with HTTP 503; other attachment types return 403. |
+| `passthrough` | Forward the original request and provider response unchanged; valid only when that model has PII disabled. |
+
+The trusted version-1 metadata retains its `models` map of model IDs to PII
+booleans and optionally adds an `attachment_modes` map using those same IDs.
+Omitted modes default to `block`. Unknown modes/model IDs and `passthrough` with
+PII enabled are invalid platform metadata and fail closed. Request bodies and
+caller headers cannot override this trusted policy. Upgrade the extProc consumer
+before configuring modes in the platform producer; older consumers reject the
+new metadata field.
+
+Passthrough is an explicit grant, never a fallback after extraction or PII fails.
+It does not imply the destination is local, disable tracing, fetch referenced
+files, or guarantee the provider supports the attachment. Existing request-size
+and protocol bounds still apply. This version does not extract documents.
+Ordinary text-only bypass, arbitrary tool JSON and MCP handling are unchanged.
+
 All gateway MCP traffic is stateless. At the trusted request-header stage,
 any `Mcp-Session-Id` header (including empty or duplicate headers, regardless of
 case) is rejected with HTTP 404 and the fixed JSON error below, before upstream

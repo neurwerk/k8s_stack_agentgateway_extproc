@@ -1,4 +1,4 @@
-"""Request transport pipeline delegating all policy decisions to the engine."""
+"""Validate request transport and attachments before optional engine policy."""
 
 # ruff: noqa: C901
 
@@ -26,10 +26,13 @@ from agentgateway_extproc.lib.pipeline.mcp import (
 from agentgateway_extproc.lib.session import make_session_key
 from agentgateway_extproc.models.engine import (
     ENGINE_REQUEST_ADAPTER,
+    EngineAttachmentPart,
     EngineChatRequest,
     EngineMcpRequest,
+    EngineMessage,
     EngineReply,
     EngineRequest,
+    EngineResponseMessage,
     EngineResponsesRequest,
 )
 from agentgateway_extproc.models.exceptions import InvalidEngineReplyError
@@ -139,6 +142,16 @@ async def process_request(
             return immediate_response(400, '{"error":"invalid model request"}')
         if request.model not in policy.models:
             return immediate_response(400, '{"error":"unknown model"}')
+        attachments = _model_attachments(request)
+        attachment_mode = policy.attachment_modes.get(request.model, "block")
+        if attachments and attachment_mode != "passthrough":
+            _clear_request(handler)
+            handler.record_dispatch("policy_block")
+            if attachment_mode == "extract" and all(
+                part.type in {"file", "input_file"} for part in attachments
+            ):
+                return immediate_response(503, '{"error":"document extraction is not available"}')
+            return immediate_response(403, '{"error":"attachments are not supported"}')
         if not policy.models[request.model]:
             _clear_request(handler)
             handler.response_processing_enabled = False
@@ -246,6 +259,23 @@ async def process_request(
         if reply.entities:
             headers["x-pii-entities"] = ",".join(reply.entities)
     return request_mutation(mutated, headers, mutated != body)
+
+
+def _model_attachments(
+    request: EngineChatRequest | EngineResponsesRequest,
+) -> list[EngineAttachmentPart]:
+    """Check typed content parts, including history, without interpreting tool JSON."""
+    messages = request.messages if isinstance(request, EngineChatRequest) else request.input
+    if isinstance(messages, str):
+        return []
+    return [
+        part
+        for message in messages
+        if isinstance(message, EngineMessage | EngineResponseMessage)
+        and isinstance(message.content, list)
+        for part in message.content
+        if isinstance(part, EngineAttachmentPart)
+    ]
 
 
 def _log_model_validation_failure(payload: object, exc: ValidationError) -> None:
