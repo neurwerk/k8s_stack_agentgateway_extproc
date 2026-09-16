@@ -1,4 +1,4 @@
-"""Request transport pipeline delegating all policy decisions to the engine."""
+"""Validate request transport and attachments before optional engine policy."""
 
 # ruff: noqa: C901
 
@@ -26,10 +26,13 @@ from agentgateway_extproc.lib.pipeline.mcp import (
 from agentgateway_extproc.lib.session import make_session_key
 from agentgateway_extproc.models.engine import (
     ENGINE_REQUEST_ADAPTER,
+    EngineAttachmentPart,
     EngineChatRequest,
     EngineMcpRequest,
+    EngineMessage,
     EngineReply,
     EngineRequest,
+    EngineResponseMessage,
     EngineResponsesRequest,
 )
 from agentgateway_extproc.models.exceptions import InvalidEngineReplyError
@@ -139,6 +142,10 @@ async def process_request(
             return immediate_response(400, '{"error":"invalid model request"}')
         if request.model not in policy.models:
             return immediate_response(400, '{"error":"unknown model"}')
+        if _has_model_attachments(request):
+            _clear_request(handler)
+            handler.record_dispatch("policy_block")
+            return immediate_response(403, '{"error":"attachments are not supported"}')
         if not policy.models[request.model]:
             _clear_request(handler)
             handler.response_processing_enabled = False
@@ -246,6 +253,20 @@ async def process_request(
         if reply.entities:
             headers["x-pii-entities"] = ",".join(reply.entities)
     return request_mutation(mutated, headers, mutated != body)
+
+
+def _has_model_attachments(request: EngineChatRequest | EngineResponsesRequest) -> bool:
+    """Check typed content parts, including history, without interpreting tool JSON."""
+    messages = request.messages if isinstance(request, EngineChatRequest) else request.input
+    if isinstance(messages, str):
+        return False
+    return any(
+        isinstance(part, EngineAttachmentPart)
+        for message in messages
+        if isinstance(message, EngineMessage | EngineResponseMessage)
+        and isinstance(message.content, list)
+        for part in message.content
+    )
 
 
 def _log_model_validation_failure(payload: object, exc: ValidationError) -> None:

@@ -175,11 +175,22 @@ async def test_malformed_metadata_fails_closed(engine_client, policy) -> None:
         ),
     ],
 )
+@pytest.mark.parametrize(
+    "original",
+    [
+        b'{ "model" : "test", "messages" : [ {"role":"user","content":"raw"} ] }',
+        b'{ "model" : "test", "input" : "raw" }',
+        b'{"model":"test","input":[{"role":"user",'
+        b'"content":[{"type":"input_text","text":"raw"}]},'
+        b'{"type":"function_call_output","call_id":"call-1",'
+        b'"output":{"type":"file","description":"ordinary tool JSON"}}]}',
+    ],
+    ids=["chat", "responses-string", "responses-messages-and-tool-json"],
+)
 async def test_exact_disabled_model_bypasses_engine_and_preserves_response_chunks(
-    engine_client, content_type, upstream_chunks
+    engine_client, content_type, upstream_chunks, original
 ) -> None:
     policy = {**MODEL_POLICY, "models": {"test": False, "other": True}}
-    original = b'{ "model" : "test", "messages" : [ {"role":"user","content":"raw"} ] }'
     handler = StreamHandler(engine_client)
     with patch.object(engine_client, "analyze_request", new_callable=AsyncMock) as analyze:
         await handler.handle(header_request(policy=policy))
@@ -221,6 +232,79 @@ async def test_exact_disabled_model_bypasses_engine_and_preserves_response_chunk
     assert [body.end_of_stream for body in bodies] == [False] * (len(upstream_chunks) - 1) + [True]
     assert trailers is not None
     assert not trailers.response_trailers.header_mutation.remove_headers
+
+
+@pytest.mark.parametrize("pii_enabled", [True, False])
+@pytest.mark.parametrize("api_kind", ["chat", "responses"])
+@pytest.mark.parametrize(
+    "attachment",
+    [
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,aW1hZ2U="}},
+        {"type": "input_audio", "input_audio": {"data": "YXVkaW8=", "format": "wav"}},
+        {"type": "file", "file": {"filename": "private.pdf", "file_data": "ZmlsZQ=="}},
+        {"type": "input_image", "image_url": "https://files.test/private.png"},
+        {"type": "input_file", "file_id": "file-private"},
+        {"type": "image", "data": "aW1hZ2U="},
+        {"type": "audio", "data": "YXVkaW8="},
+        {"type": "resource", "resource": {"uri": "file:///private.txt", "text": "raw"}},
+        {"type": "resource_link", "uri": "https://files.test/private.txt"},
+    ],
+    ids=lambda part: part["type"],
+)
+async def test_model_attachments_stop_before_engine_or_upstream(
+    engine_client, pii_enabled, api_kind, attachment
+) -> None:
+    policy = {**MODEL_POLICY, "models": {"test": pii_enabled}}
+    text_type = "text" if api_kind == "chat" else "input_text"
+    messages = [
+        {"role": "assistant", "content": [{"type": text_type, "text": "history"}, attachment]},
+        {"role": "user", "content": [{"type": text_type, "text": "follow-up"}]},
+    ]
+    field = "messages" if api_kind == "chat" else "input"
+    body = json.dumps({"model": "test", field: messages}).encode()
+
+    async def requests():
+        yield header_request(policy=policy)
+        yield body_request(body, policy=policy)
+        pytest.fail("blocked attachments must terminate processing before upstream dispatch")
+
+    with patch.object(engine_client, "analyze_request", new_callable=AsyncMock) as analyze:
+        responses = [
+            response
+            async for response in ExtProcServicer(engine_client).Process(requests(), object())
+        ]
+    analyze.assert_not_called()
+    assert [response.WhichOneof("response") for response in responses] == [
+        "request_headers",
+        "immediate_response",
+    ]
+    assert responses[-1].immediate_response.status.code == 403
+    assert responses[-1].immediate_response.body == '{"error":"attachments are not supported"}'
+
+
+@pytest.mark.parametrize("role", ["user", "tool"])
+async def test_attachment_block_precedes_mixed_catalog_pii_bypass(engine_client, role) -> None:
+    policy = {**MODEL_POLICY, "models": {"test": False, "other": True}}
+    message = {"role": role, "content": [{"type": "file", "file": {"file_id": "file-private"}}]}
+    if role == "tool":
+        message["tool_call_id"] = "call-1"
+    handler = StreamHandler(engine_client)
+    with patch.object(engine_client, "analyze_request", new_callable=AsyncMock) as analyze:
+        await handler.handle(header_request({"x-session-id": "private-session"}, policy=policy))
+        response = await handler.handle(
+            body_request(
+                json.dumps({"model": "test", "messages": [message]}).encode(), policy=policy
+            )
+        )
+    analyze.assert_not_called()
+    assert response is not None
+    assert response.WhichOneof("response") == "immediate_response"
+    assert response.immediate_response.status.code == 403
+    assert handler._dispatch_outcomes == {"policy_block"}
+    assert not handler.request_body_chunks
+    assert not handler.request_headers
+    assert handler.request_stats is None
+    assert not handler.reversal_map
 
 
 @pytest.mark.parametrize(

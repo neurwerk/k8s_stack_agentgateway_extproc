@@ -23,6 +23,13 @@ and placeholder boundaries. `/health` checks the process; `/ready` verifies the
 PII Engine path; `/metrics` exposes bounded operational metrics. Deployment
 network policy and workload identity are outside this repository.
 
+Typed attachment content parts in Chat Completions and Responses messages are
+rejected with HTTP 403 before optional PII processing, including attachments in
+conversation history. This check also applies when the selected model has PII
+disabled and never calls PII Engine. All raw files remain blocked until document
+conversion is implemented; this version does not extract documents. Ordinary
+text-only bypass, arbitrary tool JSON and MCP handling are unchanged.
+
 All gateway MCP traffic is stateless. At the trusted request-header stage,
 any `Mcp-Session-Id` header (including empty or duplicate headers, regardless of
 case) is rejected with HTTP 404 and the fixed JSON error below, before upstream
