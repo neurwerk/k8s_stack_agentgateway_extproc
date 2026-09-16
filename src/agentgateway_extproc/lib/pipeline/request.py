@@ -142,9 +142,15 @@ async def process_request(
             return immediate_response(400, '{"error":"invalid model request"}')
         if request.model not in policy.models:
             return immediate_response(400, '{"error":"unknown model"}')
-        if _has_model_attachments(request):
+        attachments = _model_attachments(request)
+        attachment_mode = policy.attachment_modes.get(request.model, "block")
+        if attachments and attachment_mode != "passthrough":
             _clear_request(handler)
             handler.record_dispatch("policy_block")
+            if attachment_mode == "extract" and all(
+                part.type in {"file", "input_file"} for part in attachments
+            ):
+                return immediate_response(503, '{"error":"document extraction is not available"}')
             return immediate_response(403, '{"error":"attachments are not supported"}')
         if not policy.models[request.model]:
             _clear_request(handler)
@@ -255,18 +261,21 @@ async def process_request(
     return request_mutation(mutated, headers, mutated != body)
 
 
-def _has_model_attachments(request: EngineChatRequest | EngineResponsesRequest) -> bool:
+def _model_attachments(
+    request: EngineChatRequest | EngineResponsesRequest,
+) -> list[EngineAttachmentPart]:
     """Check typed content parts, including history, without interpreting tool JSON."""
     messages = request.messages if isinstance(request, EngineChatRequest) else request.input
     if isinstance(messages, str):
-        return False
-    return any(
-        isinstance(part, EngineAttachmentPart)
+        return []
+    return [
+        part
         for message in messages
         if isinstance(message, EngineMessage | EngineResponseMessage)
         and isinstance(message.content, list)
         for part in message.content
-    )
+        if isinstance(part, EngineAttachmentPart)
+    ]
 
 
 def _log_model_validation_failure(payload: object, exc: ValidationError) -> None:

@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Annotated, Literal, cast
 
 from google.protobuf.json_format import MessageToDict
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator, model_validator
 
 from agentgateway_extproc.gen import ext_proc_pb2
 from agentgateway_extproc.models.exceptions import TrustedMetadataError
@@ -26,18 +26,33 @@ class DestinationModel(BaseModel):
 
 
 class ModelDestinationPolicy(DestinationModel):
-    """Select PII behavior from a bounded exact model catalog."""
+    """Select independent PII and attachment behavior from a trusted model catalog."""
 
     contract_version: Literal[1]
     destination_kind: Literal["model"]
     principal_id: str
     models: dict[ModelId, bool] = Field(min_length=1, max_length=256)
+    attachment_modes: dict[ModelId, Literal["block", "extract", "passthrough"]] = Field(
+        default_factory=dict, max_length=256
+    )
 
     @field_validator("principal_id")
     @classmethod
     def validate_principal(cls, value: str) -> str:
         """Require a bounded printable opaque principal."""
         return _validated_principal(value)
+
+    @model_validator(mode="after")
+    def validate_attachment_modes(self) -> ModelDestinationPolicy:
+        """Reject unknown destinations and raw forwarding through enabled PII."""
+        if self.attachment_modes.keys() - self.models.keys():
+            raise ValueError("attachment modes require known model IDs")  # noqa: TRY003
+        if any(
+            mode == "passthrough" and self.models[model]
+            for model, mode in self.attachment_modes.items()
+        ):
+            raise ValueError("attachment passthrough requires PII disabled")  # noqa: TRY003
+        return self
 
 
 class McpDestinationPolicy(DestinationModel):

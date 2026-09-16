@@ -150,6 +150,13 @@ async def test_metadata_eos_compat_rejects_callback_after_completed_response(
         {**mcp_policy(), "pii_enabled": "false"},
         {**mcp_policy(), "destination_id": "Bad_ID"},
         {**MODEL_POLICY, "content_tracing_enabled": True},
+        {**MODEL_POLICY, "attachment_modes": {"test": "passthrough"}},
+        {**MODEL_POLICY, "attachment_modes": {"unknown": "block"}},
+        {**MODEL_POLICY, "attachment_modes": {"test": "allow"}},
+        {**MODEL_POLICY, "attachment_modes": {"test": False}},
+        {**MODEL_POLICY, "attachment_modes": {"test": None}},
+        {**MODEL_POLICY, "attachment_modes": None},
+        {**MODEL_POLICY, "attachment_modes": []},
     ],
 )
 async def test_malformed_metadata_fails_closed(engine_client, policy) -> None:
@@ -176,21 +183,45 @@ async def test_malformed_metadata_fails_closed(engine_client, policy) -> None:
     ],
 )
 @pytest.mark.parametrize(
-    "original",
+    ("original", "attachment_modes"),
     [
-        b'{ "model" : "test", "messages" : [ {"role":"user","content":"raw"} ] }',
-        b'{ "model" : "test", "input" : "raw" }',
-        b'{"model":"test","input":[{"role":"user",'
-        b'"content":[{"type":"input_text","text":"raw"}]},'
-        b'{"type":"function_call_output","call_id":"call-1",'
-        b'"output":{"type":"file","description":"ordinary tool JSON"}}]}',
+        (b'{ "model" : "test", "messages" : [ {"role":"user","content":"raw"} ] }', {}),
+        (b'{ "model" : "test", "input" : "raw" }', {}),
+        (
+            b'{"model":"test","input":[{"role":"user",'
+            b'"content":[{"type":"input_text","text":"raw"}]},'
+            b'{"type":"function_call_output","call_id":"call-1",'
+            b'"output":{"type":"file","description":"ordinary tool JSON"}}]}',
+            {},
+        ),
+        (
+            b'{ "model":"test", "messages":[{"role":"user","content":['
+            b'{"type":"file","file":{"filename":"private.pdf","file_data":"ZmlsZQ=="}},'
+            b'{"type":"image_url","image_url":{"url":"https://files.test/private.png"}}]}]}',
+            {"test": "passthrough"},
+        ),
+        (
+            b'{ "model":"test", "input":[{"role":"user","content":['
+            b'{"type":"input_file","file_id":"file-private"}]}]}',
+            {"test": "passthrough"},
+        ),
     ],
-    ids=["chat", "responses-string", "responses-messages-and-tool-json"],
+    ids=[
+        "chat",
+        "responses-string",
+        "responses-tool-json",
+        "chat-passthrough",
+        "responses-passthrough",
+    ],
 )
 async def test_exact_disabled_model_bypasses_engine_and_preserves_response_chunks(
-    engine_client, content_type, upstream_chunks, original
+    engine_client, content_type, upstream_chunks, original, attachment_modes
 ) -> None:
-    policy = {**MODEL_POLICY, "models": {"test": False, "other": True}}
+    policy = {
+        **MODEL_POLICY,
+        "models": {"test": False, "other": True},
+        "attachment_modes": attachment_modes,
+    }
     handler = StreamHandler(engine_client)
     with patch.object(engine_client, "analyze_request", new_callable=AsyncMock) as analyze:
         await handler.handle(header_request(policy=policy))
@@ -284,7 +315,11 @@ async def test_model_attachments_stop_before_engine_or_upstream(
 
 @pytest.mark.parametrize("role", ["user", "tool"])
 async def test_attachment_block_precedes_mixed_catalog_pii_bypass(engine_client, role) -> None:
-    policy = {**MODEL_POLICY, "models": {"test": False, "other": True}}
+    policy = {
+        **MODEL_POLICY,
+        "models": {"test": False, "other": True, "raw": False},
+        "attachment_modes": {"raw": "passthrough"},
+    }
     message = {"role": role, "content": [{"type": "file", "file": {"file_id": "file-private"}}]}
     if role == "tool":
         message["tool_call_id"] = "call-1"
@@ -305,6 +340,36 @@ async def test_attachment_block_precedes_mixed_catalog_pii_bypass(engine_client,
     assert not handler.request_headers
     assert handler.request_stats is None
     assert not handler.reversal_map
+
+
+@pytest.mark.parametrize("pii_enabled", [True, False])
+@pytest.mark.parametrize("api_kind", ["chat", "responses"])
+@pytest.mark.parametrize(
+    ("mode", "attachment_type", "status"),
+    [("block", "file", 403), ("extract", "file", 503), ("extract", "image_url", 403)],
+)
+async def test_explicit_attachment_modes_fail_closed_until_extraction_exists(
+    engine_client, pii_enabled, api_kind, mode, attachment_type, status
+) -> None:
+    policy = {
+        **MODEL_POLICY,
+        "models": {"test": pii_enabled},
+        "attachment_modes": {"test": mode},
+    }
+    field = "messages" if api_kind == "chat" else "input"
+    payload = {"model": "test", field: [{"role": "user", "content": [{"type": attachment_type}]}]}
+    handler = StreamHandler(engine_client)
+    with patch.object(engine_client, "analyze_request", new_callable=AsyncMock) as analyze:
+        await handler.handle(header_request(policy=policy))
+        response = await handler.handle(body_request(json.dumps(payload).encode(), policy=policy))
+    analyze.assert_not_called()
+    assert response is not None
+    assert response.WhichOneof("response") == "immediate_response"
+    assert response.immediate_response.status.code == status
+    if status == 503:
+        assert (
+            response.immediate_response.body == '{"error":"document extraction is not available"}'
+        )
 
 
 @pytest.mark.parametrize(
