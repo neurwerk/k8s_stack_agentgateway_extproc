@@ -14,6 +14,7 @@ from agentgateway_extproc.config.settings import Settings, get_settings
 from agentgateway_extproc.controllers.grpc_servicer import ExtProcServicer
 from agentgateway_extproc.controllers.health import create_http_app
 from agentgateway_extproc.gen import ext_proc_pb2_grpc
+from agentgateway_extproc.lib.docling import DoclingClient
 from agentgateway_extproc.lib.engine.client import EngineClient
 
 
@@ -33,27 +34,32 @@ def main() -> None:
 async def _run(settings: Settings) -> None:
     """Create clients and serve gRPC plus HTTP endpoints."""
     client = EngineClient(settings.engine)
-    server = create_grpc_server(settings, client)
+    docling = DoclingClient(settings.docling)
+    server = create_grpc_server(settings, client, docling)
     server.add_insecure_port("[::]:9000")
     await server.start()
     http_server = uvicorn.Server(uvicorn.Config(create_http_app(client), host="0.0.0.0", port=8000))
     try:
-        await asyncio.gather(server.wait_for_termination(), http_server.serve())
+        await http_server.serve()
     finally:
-        await client.close()
         await server.stop(grace=1)
+        await docling.close()
+        await client.close()
 
 
-def create_grpc_server(settings: Settings, client: EngineClient) -> grpc.aio.Server:
+def create_grpc_server(
+    settings: Settings, client: EngineClient, docling: DoclingClient | None = None
+) -> grpc.aio.Server:
     """Create the extProc server with an explicit finite receive-message limit."""
     server = cast(
         grpc.aio.Server,
         grpc.aio.server(
-            options=[("grpc.max_receive_message_length", settings.grpc_max_receive_message_bytes)]
+            options=[("grpc.max_receive_message_length", settings.grpc_max_receive_message_bytes)],
+            maximum_concurrent_rpcs=settings.grpc_maximum_concurrent_rpcs,
         ),
     )
     ext_proc_pb2_grpc.add_ExternalProcessorServicer_to_server(
-        ExtProcServicer(client, settings), server
+        ExtProcServicer(client, settings, docling), server
     )
     return server
 

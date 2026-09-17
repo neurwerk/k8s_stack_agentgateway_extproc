@@ -348,7 +348,7 @@ async def test_attachment_block_precedes_mixed_catalog_pii_bypass(engine_client,
     ("mode", "attachment_type", "status"),
     [("block", "file", 403), ("extract", "file", 503), ("extract", "image_url", 403)],
 )
-async def test_explicit_attachment_modes_fail_closed_until_extraction_exists(
+async def test_explicit_attachment_modes_fail_closed_without_converter(
     engine_client, pii_enabled, api_kind, mode, attachment_type, status
 ) -> None:
     policy = {
@@ -367,9 +367,9 @@ async def test_explicit_attachment_modes_fail_closed_until_extraction_exists(
     assert response.WhichOneof("response") == "immediate_response"
     assert response.immediate_response.status.code == status
     if status == 503:
-        assert (
-            response.immediate_response.body == '{"error":"document extraction is not available"}'
-        )
+        assert json.loads(response.immediate_response.body) == {
+            "error": "document conversion unavailable"
+        }
 
 
 @pytest.mark.parametrize(
