@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Protocol
 
 from agentgateway_extproc.config.settings import Settings
 from agentgateway_extproc.gen import ext_proc_pb2
+from agentgateway_extproc.lib.docling import DoclingClient
 from agentgateway_extproc.lib.engine.client import EngineClient
 from agentgateway_extproc.lib.pipeline.mcp import (
     McpHeaderContext,
@@ -70,10 +71,12 @@ class StreamHandler:
         self,
         client: EngineClient,
         settings: Settings | None = None,
+        docling: DoclingClient | None = None,
     ) -> None:
         """Initialize state for one HTTP request/response stream."""
         limits = settings or Settings()
         self.client = client
+        self.docling = docling
         self.reversal_map: dict[str, str] = {}
         self.reversal_entity_prefixes: tuple[tuple[str, str], ...] = ()
         self.request_headers: dict[str, str] = {}

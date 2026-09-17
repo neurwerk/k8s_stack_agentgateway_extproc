@@ -15,6 +15,7 @@ import grpc
 
 from agentgateway_extproc.config.settings import Settings
 from agentgateway_extproc.gen import ext_proc_pb2, ext_proc_pb2_grpc
+from agentgateway_extproc.lib.docling import DoclingClient
 from agentgateway_extproc.lib.engine.client import EngineClient
 from agentgateway_extproc.lib.pipeline.mcp import McpProtocolError
 from agentgateway_extproc.lib.pipeline.request import immediate_response
@@ -58,10 +59,12 @@ class ExtProcServicer(ext_proc_pb2_grpc.ExternalProcessorServicer):
         self,
         client: EngineClient,
         settings: Settings | None = None,
+        docling: DoclingClient | None = None,
     ) -> None:
         """Store the shared engine client used by all streams."""
         self._client = client
         self._settings = settings or Settings()
+        self._docling = docling
 
     @override
     async def Process(
@@ -69,7 +72,7 @@ class ExtProcServicer(ext_proc_pb2_grpc.ExternalProcessorServicer):
     ) -> AsyncIterator[ext_proc_pb2.ProcessingResponse]:
         """Process one Envoy bidirectional stream."""
         active_streams.inc()
-        handler = StreamHandler(self._client, self._settings)
+        handler = StreamHandler(self._client, self._settings, self._docling)
         phase = StreamPhase()
         try:
             async for request in request_iterator:

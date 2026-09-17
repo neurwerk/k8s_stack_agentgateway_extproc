@@ -12,6 +12,7 @@ import time
 import httpx
 
 from agentgateway_extproc.config.settings import EngineSettings
+from agentgateway_extproc.lib.json_limits import bounded_json_text
 from agentgateway_extproc.metrics import engine_request_latency_seconds, engine_requests_total
 from agentgateway_extproc.models.engine import EngineErrorReply, EngineReply, EngineRequest
 from agentgateway_extproc.models.exceptions import (
@@ -69,23 +70,29 @@ class EngineClient:
             _logger.debug("PII engine readiness failed error=%s", type(exc).__name__)
             raise EngineUnavailableError from exc
 
-    async def analyze_request(self, request: EngineRequest, session_key: str) -> EngineReply:
+    async def analyze_request(
+        self, request: EngineRequest, session_key: str, *, document: bool = False
+    ) -> EngineReply:
         """Send a complete request to the engine and validate its complete reply."""
         started = time.monotonic()
         outcome = "error"
+        endpoint = "analyze-document-request" if document else "analyze-request"
         try:
-            async with self._client.stream(
-                "POST",
-                f"{self._settings.base_url.rstrip('/')}/v1/adapter/analyze-request",
-                json=request.model_dump(by_alias=True, exclude_none=True),
-                headers={"x-pii-session-key": session_key},
-            ) as response:
+            async with (
+                asyncio.timeout(self._settings.timeout),
+                self._client.stream(
+                    "POST",
+                    f"{self._settings.base_url.rstrip('/')}/v1/adapter/{endpoint}",
+                    json=request.model_dump(by_alias=True, exclude_none=True),
+                    headers={"x-pii-session-key": session_key},
+                ) as response,
+            ):
                 content = await _read_bounded(response, self._settings.max_response_bytes)
             if not response.is_success:
                 raise _parse_engine_error(response.status_code, content)
             try:
                 payload = json.loads(
-                    content,
+                    bounded_json_text(content),
                     object_pairs_hook=_unique_object,
                     parse_constant=_reject_constant,
                     parse_float=_finite_float,
@@ -104,7 +111,7 @@ class EngineClient:
         except InvalidEngineReplyError:
             outcome = "invalid_reply"
             raise
-        except (httpx.HTTPError, ValueError) as exc:
+        except (TimeoutError, httpx.HTTPError, ValueError) as exc:
             _logger.warning("PII engine request failed error=%s", type(exc).__name__)
             raise EngineUnavailableError from exc
         finally:
@@ -133,7 +140,7 @@ def _parse_engine_error(status_code: int, content: bytes) -> EnginePolicyError:
     """Validate a non-success envelope and bind its code to the HTTP status."""
     try:
         payload = json.loads(
-            content,
+            bounded_json_text(content),
             object_pairs_hook=_unique_object,
             parse_constant=_reject_constant,
             parse_float=_finite_float,

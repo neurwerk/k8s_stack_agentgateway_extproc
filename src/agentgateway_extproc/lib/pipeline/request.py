@@ -14,8 +14,11 @@ from typing import TYPE_CHECKING, cast
 
 from pydantic import ValidationError
 
+from agentgateway_extproc.config.settings import MAX_REQUEST_BYTES
 from agentgateway_extproc.gen import ext_proc_pb2
+from agentgateway_extproc.lib.documents import MAX_TEXT, DocumentError
 from agentgateway_extproc.lib.engine.client import EngineClient
+from agentgateway_extproc.lib.json_limits import JsonBudgetError
 from agentgateway_extproc.lib.masking.reversal import placeholder_entity_prefixes
 from agentgateway_extproc.lib.pipeline.guard import inject_guard_instruction
 from agentgateway_extproc.lib.pipeline.mcp import (
@@ -71,12 +74,16 @@ async def process_request(
         payload = strict_json_loads(body.decode("utf-8"))
     except UnicodeDecodeError:
         return immediate_response(400, '{"error":"invalid request encoding"}')
+    except JsonBudgetError:
+        _clear_request(handler)
+        return immediate_response(413, '{"error":"request structure too large"}')
     except (json.JSONDecodeError, TypeError, ValueError):
         return immediate_response(400, '{"error":"invalid request JSON"}')
     policy = handler.destination_policy
     if policy is None:
         raise ValueError("trusted destination policy is unavailable")  # noqa: TRY003
     opaque_reasoning: OpaqueReasoning = {}
+    converted = False
     if policy.destination_kind == "mcp":
         handler.response_api_kind = "mcp"
         if handler.mcp_headers is None:
@@ -145,21 +152,39 @@ async def process_request(
         attachments = _model_attachments(request)
         attachment_mode = policy.attachment_modes.get(request.model, "block")
         if attachments and attachment_mode != "passthrough":
-            _clear_request(handler)
-            handler.record_dispatch("policy_block")
-            if attachment_mode == "extract" and all(
-                part.type in {"file", "input_file"} for part in attachments
+            if attachment_mode != "extract" or any(
+                part.type not in {"file", "input_file"} for part in attachments
             ):
-                return immediate_response(503, '{"error":"document extraction is not available"}')
-            return immediate_response(403, '{"error":"attachments are not supported"}')
+                _clear_request(handler)
+                handler.record_dispatch("policy_block")
+                return immediate_response(403, '{"error":"attachments are not supported"}')
+            try:
+                if handler.docling is None:
+                    raise DocumentError  # noqa: TRY301
+                expected_type = "file" if isinstance(request, EngineChatRequest) else "input_file"
+                if any(part.type != expected_type for part in attachments):
+                    raise DocumentError(400)  # noqa: TRY301
+                texts = await handler.docling.convert(attachments)
+                request, body = _converted_request(payload, texts, opaque_reasoning)
+            except DocumentError as exc:
+                _clear_request(handler)
+                handler.record_dispatch("transport_failure")
+                return immediate_response(exc.status, json.dumps({"error": exc.message}))
+            converted = True
+            # Discard base64 and wire buffers before the potentially long PII call.
+            handler.request_body_chunks.clear()
+            attachments.clear()
+            payload = None
         if not policy.models[request.model]:
             _clear_request(handler)
             handler.response_processing_enabled = False
             handler.record_dispatch("model_bypass")
-            return request_mutation(body, {}, False)
+            return request_mutation(body, {}, converted)
         conversation_id = handler.request_headers.get(
             "x-session-id"
         ) or handler.request_headers.get("x-conversation-id")
+        if converted:
+            conversation_id = None
         if conversation_id is None:
             handler.request_nonce = secrets.token_bytes(32)
         session_key = make_session_key(
@@ -169,7 +194,11 @@ async def process_request(
             request_nonce=handler.request_nonce,
         )
         handler.record_dispatch("model_analyzed")
-    reply = await client.analyze_request(request, session_key)
+    if converted:
+        _clear_request(handler)
+        reply = await client.analyze_request(request, session_key, document=True)
+    else:
+        reply = await client.analyze_request(request, session_key)
     _validate_request_mutation(request, reply)
     _validate_reversal(request, reply)
     if isinstance(request, EngineMcpRequest) and (
@@ -241,7 +270,7 @@ async def process_request(
         for message in _dict_list(serialized.get("messages")):
             if message.get("tool_calls") == []:
                 del message["tool_calls"]
-        _restore_opaque_chat_reasoning(serialized, opaque_reasoning)
+        _restore_opaque_chat_reasoning(serialized, opaque_reasoning, offset=1)
     mutated = json.dumps(
         serialized,
         ensure_ascii=False,
@@ -258,7 +287,44 @@ async def process_request(
         }
         if reply.entities:
             headers["x-pii-entities"] = ",".join(reply.entities)
-    return request_mutation(mutated, headers, mutated != body)
+    return request_mutation(mutated, headers, converted or mutated != body)
+
+
+def _converted_request(
+    payload: object, texts: list[str], reasoning: OpaqueReasoning
+) -> tuple[EngineChatRequest | EngineResponsesRequest, bytes]:
+    """Replace only typed file parts, retaining the original protocol controls."""
+    data = cast(dict[str, object], payload)
+    chat = "messages" in data
+    remaining = iter(texts)
+    count = 0
+    for message in _dict_list(data.get("messages" if chat else "input")):
+        if not chat and message.get("type", "message") != "message":
+            continue
+        for part in _dict_list(message.get("content")):
+            if part.get("type") not in {"file", "input_file"}:
+                continue
+            value = next(remaining, None)
+            if value is None:
+                raise DocumentError
+            part.clear()
+            part.update(type="text" if chat else "input_text", text=value)
+            count += 1
+    if count != len(texts):
+        raise DocumentError
+    request = cast(
+        EngineChatRequest | EngineResponsesRequest,
+        ENGINE_REQUEST_ADAPTER.validate_python(data, strict=True),
+    )
+    if len(request.model_dump_json(by_alias=True, exclude_none=True).encode()) > MAX_REQUEST_BYTES:
+        raise DocumentError(413)
+    if sum(len(text) for text in _mutable_text_leaves(request).values()) > MAX_TEXT:
+        raise DocumentError(413)
+    _restore_opaque_chat_reasoning(data, reasoning, offset=0)
+    body = json.dumps(data, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode()
+    if len(body) > MAX_REQUEST_BYTES:
+        raise DocumentError(413)
+    return request, body
 
 
 def _model_attachments(
@@ -422,8 +488,10 @@ def _extract_opaque_chat_reasoning(payload: object) -> OpaqueReasoning:
     return extracted
 
 
-def _restore_opaque_chat_reasoning(payload: dict[str, object], reasoning: OpaqueReasoning) -> None:
-    """Reattach caller reasoning to its assistant messages after guard injection."""
+def _restore_opaque_chat_reasoning(
+    payload: dict[str, object], reasoning: OpaqueReasoning, *, offset: int
+) -> None:
+    """Reattach reasoning with an explicit guard offset, including PII bypass."""
     if not reasoning:
         return
     messages = payload.get("messages")
@@ -432,7 +500,7 @@ def _restore_opaque_chat_reasoning(payload: dict[str, object], reasoning: Opaque
             "transformed Chat request has no messages"
         )
     for original_index, fields in reasoning.items():
-        index = original_index + 1
+        index = original_index + offset
         if index >= len(messages):
             raise InvalidEngineReplyError(  # noqa: TRY003
                 "transformed Chat request changed reasoning message"

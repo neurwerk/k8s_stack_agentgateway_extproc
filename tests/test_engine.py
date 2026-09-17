@@ -30,16 +30,21 @@ MAX_ENGINE_RESPONSE_BYTES = 10_485_760
 class ChunkedResponseStream(httpx.AsyncByteStream):
     """Yield controlled decoded HTTP response chunks without Content-Length."""
 
-    def __init__(self, content: bytes, chunk_size: int = 1_048_576) -> None:
+    def __init__(self, content: bytes, chunk_size: int = 1_048_576, delay: float = 0) -> None:
         """Store response bytes and the deterministic transport chunk size."""
         self.content = content
         self.chunk_size = chunk_size
+        self.delay = delay
+        self.emitted_chunks = 0
 
     @override
     async def __aiter__(self) -> AsyncIterator[bytes]:
         """Yield each configured response chunk."""
         for offset in range(0, len(self.content), self.chunk_size):
+            self.emitted_chunks += 1
             yield self.content[offset : offset + self.chunk_size]
+            if self.delay:
+                await asyncio.sleep(self.delay)
 
 
 def _client_returning(status: int, content: bytes) -> EngineClient:
@@ -315,25 +320,46 @@ async def test_engine_client_rejects_error_contract_field_mismatch(
         )
 
 
-async def test_engine_readiness_has_a_separate_overall_deadline() -> None:
-    """A stalled readiness handshake cannot inherit the analysis timeout."""
+@pytest.mark.parametrize(
+    "operation", ["ready", "analysis-headers", "analysis-body", "document-body"]
+)
+async def test_engine_readiness_has_a_separate_overall_deadline(engine_reply, operation) -> None:
+    """Readiness stays independent; analysis deadlines also stop slow-drip bodies."""
+    stream = ChunkedResponseStream(json.dumps(engine_reply).encode(), chunk_size=8, delay=0.01)
+    response = httpx.Response(200, stream=stream)
 
     async def handler(request: httpx.Request) -> httpx.Response:
-        await asyncio.sleep(1)
-        return httpx.Response(200, request=request)
+        if not operation.endswith("body"):
+            await asyncio.sleep(1)
+        return response
 
-    client = EngineClient(
-        EngineSettings(
-            base_url="https://pii-engine.test",
-            timeout=45,
-            readiness_timeout=0.01,
-        ),
-        httpx.AsyncClient(
-            transport=httpx.MockTransport(handler), base_url="https://pii-engine.test"
-        ),
-    )
-    with pytest.raises(EngineUnavailableError):
-        await client.check_ready()
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://pii-engine.test", timeout=0.04
+    ) as http:
+        client = EngineClient(
+            EngineSettings(
+                base_url="https://pii-engine.test",
+                timeout=45 if operation == "ready" else 0.04,
+                readiness_timeout=0.01,
+            ),
+            http,
+        )
+        with pytest.raises(EngineUnavailableError) as raised:
+            if operation == "ready":
+                await client.check_ready()
+            else:
+                await client.analyze_request(
+                    EngineChatRequest(
+                        model="test", messages=[{"role": "user", "content": "hello"}]
+                    ),
+                    "a" * 64,
+                    document=operation == "document-body",
+                )
+        assert isinstance(raised.value.__cause__, TimeoutError)
+        assert raised.value.args == ()
+        if operation.endswith("body"):
+            assert 0 < stream.emitted_chunks < len(stream.content) // stream.chunk_size
+            assert response.is_closed
 
 
 async def test_engine_client_sends_only_opaque_session_key(engine_reply: dict[str, object]) -> None:

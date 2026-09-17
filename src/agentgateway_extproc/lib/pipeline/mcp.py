@@ -10,6 +10,7 @@ import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from agentgateway_extproc.lib.json_limits import bounded_json_text
 from agentgateway_extproc.lib.masking.reversal import reverse_placeholders
 from agentgateway_extproc.lib.pipeline.sse import SseDecoder
 from agentgateway_extproc.models.destination import McpDestinationPolicy
@@ -200,7 +201,7 @@ def strict_json_loads(value: str | bytes) -> Any:
         return parsed
 
     return json.loads(
-        value,
+        bounded_json_text(value),
         object_pairs_hook=unique_object,
         parse_constant=reject_constant,
         parse_float=finite_float,
