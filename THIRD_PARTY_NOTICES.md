@@ -1,5 +1,15 @@
 # Third-Party Notices
 
+## YuNet Face Detector
+
+The service bundles OpenCV Zoo's `face_detection_yunet_2023mar.onnx`, copyright
+2020 Shiqi Yu, under the MIT license. The model, complete license and immutable
+source/checksum record ship together in `agentgateway_extproc/assets/` in the
+wheel and runtime. See `src/agentgateway_extproc/assets/YUNET-SOURCE.txt` and
+`YUNET-LICENSE.txt`. No model is downloaded at runtime.
+
+## Envoy Protobuf
+
 This project includes Envoy-compatible protobuf definitions sourced from the
 AgentGateway project:
 

@@ -43,7 +43,9 @@ class DoclingSettings(BaseModel):
     base_url: str = "https://docling.docling.svc"
     ca_cert: str | None = None
     api_key: SecretStr | None = None
-    inference_mode: Literal["cpu", "remote"] = "cpu"
+    inference_mode: Literal["internal-standard", "private-vlm", "cpu", "remote"] = (
+        "internal-standard"
+    )
     timeout: float = Field(default=360, gt=0, le=3660)
     document_timeout: float = Field(default=300, gt=0, le=3600)
     file_bytes: int = Field(default=20 * MEBIBYTE, ge=1, le=40 * MEBIBYTE)

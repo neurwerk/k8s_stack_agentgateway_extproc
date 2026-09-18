@@ -28,13 +28,36 @@ class DestinationModel(BaseModel):
 class ModelDestinationPolicy(DestinationModel):
     """Select independent PII and attachment behavior from a trusted model catalog."""
 
-    contract_version: Literal[1]
+    contract_version: Literal[1, 2]
     destination_kind: Literal["model"]
     principal_id: str
     models: dict[ModelId, bool] = Field(min_length=1, max_length=256)
-    attachment_modes: dict[ModelId, Literal["block", "extract", "passthrough"]] = Field(
+    attachment_modes: dict[ModelId, Literal["block", "extract", "process", "passthrough"]] = Field(
         default_factory=dict, max_length=256
     )
+    image_forwarding: dict[ModelId, Literal["none", "if-no-pii-detected", "pii-unchecked"]] = Field(
+        default_factory=dict, max_length=256
+    )
+    face_protection: dict[ModelId, bool] = Field(default_factory=dict, max_length=256)
+    local_models: dict[ModelId, bool] = Field(default_factory=dict, max_length=256)
+
+    @model_validator(mode="before")
+    @classmethod
+    def validate_version_fields(cls, value: object) -> object:
+        """Keep version one strict, including explicitly empty new maps."""
+        if not isinstance(value, dict):
+            return value
+        modes = value.get("attachment_modes")
+        if value.get("contract_version") == 1 and (
+            {"image_forwarding", "face_protection", "local_models"} & value.keys()
+            or (isinstance(modes, dict) and "process" in modes.values())
+        ):
+            raise ValueError("image policy requires contract version two")  # noqa: TRY003
+        return value
+
+    def protects_faces(self, model: str) -> bool:
+        """Default processed attachments to protection, preserving legacy passthrough."""
+        return self.face_protection.get(model, self.attachment_modes.get(model) != "passthrough")
 
     @field_validator("principal_id")
     @classmethod
@@ -45,13 +68,28 @@ class ModelDestinationPolicy(DestinationModel):
     @model_validator(mode="after")
     def validate_attachment_modes(self) -> ModelDestinationPolicy:
         """Reject unknown destinations and raw forwarding through enabled PII."""
-        if self.attachment_modes.keys() - self.models.keys():
-            raise ValueError("attachment modes require known model IDs")  # noqa: TRY003
         if any(
-            mode == "passthrough" and self.models[model]
-            for model, mode in self.attachment_modes.items()
+            mapping.keys() - self.models.keys()
+            for mapping in (
+                self.attachment_modes,
+                self.image_forwarding,
+                self.face_protection,
+                self.local_models,
+            )
         ):
-            raise ValueError("attachment passthrough requires PII disabled")  # noqa: TRY003
+            raise ValueError("attachment modes require known model IDs")  # noqa: TRY003
+        for model, pii in self.models.items():
+            mode = self.attachment_modes.get(model, "block")
+            forwarding = self.image_forwarding.get(model, "none")
+            face = self.protects_faces(model)
+            if mode == "passthrough" and (pii or face or model in self.image_forwarding):
+                raise ValueError("passthrough requires protections and forwarding disabled")  # noqa: TRY003
+            if forwarding != "none" and mode not in {"process", "extract"}:
+                raise ValueError("image forwarding requires processing")  # noqa: TRY003
+            if forwarding == "pii-unchecked" and (face or not self.local_models.get(model, False)):
+                raise ValueError("unchecked images require an unprotected concrete local route")  # noqa: TRY003
+            if forwarding == "if-no-pii-detected" and not (pii and face):
+                raise ValueError("conditional images require PII and face protection")  # noqa: TRY003
         return self
 
 
@@ -93,8 +131,8 @@ def destination_policy_from_request(
         )
         version = payload.get("contract_version")
         # google.protobuf.Struct represents every JSON number as a double.
-        if type(version) is float and version == 1.0:
-            payload["contract_version"] = 1
+        if type(version) is float and version in {1.0, 2.0}:
+            payload["contract_version"] = int(version)
         return DESTINATION_POLICY_ADAPTER.validate_python(payload, strict=True)
     except TrustedMetadataError:
         raise
