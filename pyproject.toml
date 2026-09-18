@@ -20,6 +20,7 @@ dependencies = [
     "pydantic-settings>=2.0",
     "pypdf>=6.0,<7",
     "pillow==12.2.0",
+    "pi-heif==1.4.0",
     "opencv-python-headless==4.13.0.92",
     "uvicorn[standard]>=0.30",
 ]
@@ -27,6 +28,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "grpcio-tools>=1.68",
+    "pillow-heif==1.5.0",
     "pytest>=8",
     "pytest-asyncio>=0.24",
     "pytest-cov>=6",
@@ -45,6 +47,9 @@ Security = "https://github.com/neurwerk/k8s_stack_agentgateway_extproc/security/
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/agentgateway_extproc"]
+
+[tool.uv]
+no-build-package = ["pi-heif", "pillow-heif"]
 
 [tool.ruff]
 line-length = 100

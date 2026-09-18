@@ -8,7 +8,7 @@ from pydantic import ValidationError
 from agentgateway_extproc.lib.notice.analysis import render_analysis_notice
 from agentgateway_extproc.lib.notice.inject import render_notice
 from agentgateway_extproc.lib.notice.report import render_report
-from agentgateway_extproc.models.engine import AnalysisMetadata, PIIReport
+from agentgateway_extproc.models.engine import AnalysisMetadata, PIIReport, VisualFindings
 
 
 def _analysis(
@@ -146,6 +146,14 @@ def test_report_table_is_separated_from_generic_notice_text() -> None:
         {"unique_transformed_count": 3},
         {"action": "pass", "transformed_count": 1, "unique_transformed_count": 1},
         {"action": "block", "transformed_count": 1, "unique_transformed_count": 1},
+        {"action": "text-only", "transformed_count": 0, "unique_transformed_count": 0},
+        {"entity_type": "FACE", "action": "text-only"},
+        {
+            "entity_type": "FACE",
+            "action": "pass",
+            "transformed_count": 0,
+            "unique_transformed_count": 0,
+        },
         {"detected_count": 10_000_001},
         {"unexpected": True},
     ],
@@ -176,6 +184,39 @@ def test_report_requires_sorted_unique_bounded_rows_and_forbids_extra_fields() -
                 "unexpected": True,
             }
         )
+
+
+@pytest.mark.parametrize(
+    "status,count,valid",
+    [
+        ("complete", 0, True),
+        ("complete", 10_000_000, True),
+        ("not_scanned", None, True),
+        ("failed", None, True),
+        ("complete", None, False),
+        ("complete", -1, False),
+        ("complete", 10_000_001, False),
+        ("complete", True, False),
+        ("complete", 1.0, False),
+        ("not_scanned", 0, False),
+        ("failed", 0, False),
+    ],
+)
+def test_face_findings_never_confuse_failed_or_missing_scans_with_zero(status, count, valid):
+    data = {"faces": {"scan_status": status, "count": count}}
+    if valid:
+        assert VisualFindings.model_validate(data, strict=True).faces.count == count
+    else:
+        with pytest.raises(ValidationError):
+            VisualFindings.model_validate(data, strict=True)
+
+
+@pytest.mark.parametrize("entity", ["FACE", "PERSON"])
+def test_report_does_not_claim_reroute_forwarding_when_the_request_is_blocked(entity):
+    report = PIIReport.model_validate({"rows": [_row(entity, "reroute", 0, 0)]})
+    rendered = render_report(report, _analysis(), {}, decision="block", route_class="local")
+    assert "3 detected; not forwarded (request blocked)" in rendered
+    assert "forwarded without masking" not in rendered and "Effective route" not in rendered
 
 
 @pytest.mark.parametrize(

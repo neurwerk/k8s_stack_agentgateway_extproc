@@ -8,6 +8,18 @@ source/checksum record ship together in `agentgateway_extproc/assets/` in the
 wheel and runtime. See `src/agentgateway_extproc/assets/YUNET-SOURCE.txt` and
 `YUNET-LICENSE.txt`. No model is downloaded at runtime.
 
+## HEIF Decoder
+
+Runtime uses the wheel-only `pi-heif==1.4.0` decoder, whose Python bindings are
+BSD-3-Clause; its binary-wheel license is LGPLv3, not BSD alone. The Linux amd64
+wheel bundles LGPLv3 libheif `1.23.0` and libde265 `1.1.0`, without x265 or a
+HEVC/AV1 encoder. License notices remain in `pi_heif-1.4.0.dist-info/licenses/`.
+Sources: [bindings](https://github.com/bigcat88/pillow_heif/tree/v1.4.0),
+[libheif](https://github.com/strukturag/libheif/tree/v1.23.0), and
+[libde265](https://github.com/strukturag/libde265/tree/v1.1.0).
+`pillow-heif==1.5.0` and its GPLv2 binary-wheel encoder are used only by the `dev`
+extra to generate synthetic test images; they are not installed in the runtime.
+
 ## Envoy Protobuf
 
 This project includes Envoy-compatible protobuf definitions sourced from the

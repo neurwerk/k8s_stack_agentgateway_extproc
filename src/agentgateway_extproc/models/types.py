@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from agentgateway_extproc.models.engine import AnalysisMetadata, PIIReport
+    from agentgateway_extproc.models.engine import AnalysisMetadata, PIIReport, VisualFindings
 
 REVERSIBLE_TOKEN_RE = re.compile(
     r"<(REV|ENCRYPTED)_([A-Z][A-Z0-9_]*)_([0-9a-f]{16})_([0-9a-f]{16})>"
@@ -39,3 +39,4 @@ class RequestStats:
     analysis: AnalysisMetadata
     decision: str = "pass"
     route_class: str | None = None
+    visual_findings: VisualFindings | None = None

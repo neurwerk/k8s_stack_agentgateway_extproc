@@ -28,7 +28,7 @@ class DestinationModel(BaseModel):
 class ModelDestinationPolicy(DestinationModel):
     """Select independent PII and attachment behavior from a trusted model catalog."""
 
-    contract_version: Literal[1, 2]
+    contract_version: Literal[1, 2, 3]
     destination_kind: Literal["model"]
     principal_id: str
     models: dict[ModelId, bool] = Field(min_length=1, max_length=256)
@@ -40,13 +40,21 @@ class ModelDestinationPolicy(DestinationModel):
     )
     face_protection: dict[ModelId, bool] = Field(default_factory=dict, max_length=256)
     local_models: dict[ModelId, bool] = Field(default_factory=dict, max_length=256)
+    image_models: dict[ModelId, bool] = Field(default_factory=dict, max_length=256)
+    image_reroutes: dict[ModelId, Annotated[dict[ModelId, ModelId], Field(max_length=256)]] = Field(
+        default_factory=dict, max_length=256
+    )
 
     @model_validator(mode="before")
     @classmethod
     def validate_version_fields(cls, value: object) -> object:
-        """Keep version one strict, including explicitly empty new maps."""
+        """Keep older versions strict, including explicitly empty new maps."""
         if not isinstance(value, dict):
             return value
+        if value.get("contract_version") in {1, 2} and (
+            {"image_models", "image_reroutes"} & value.keys()
+        ):
+            raise ValueError("image capability bindings require contract version three")  # noqa: TRY003
         modes = value.get("attachment_modes")
         if value.get("contract_version") == 1 and (
             {"image_forwarding", "face_protection", "local_models"} & value.keys()
@@ -75,6 +83,8 @@ class ModelDestinationPolicy(DestinationModel):
                 self.image_forwarding,
                 self.face_protection,
                 self.local_models,
+                self.image_models,
+                self.image_reroutes,
             )
         ):
             raise ValueError("attachment modes require known model IDs")  # noqa: TRY003
@@ -88,6 +98,12 @@ class ModelDestinationPolicy(DestinationModel):
                 raise ValueError("image forwarding requires processing")  # noqa: TRY003
             if forwarding == "pii-unchecked" and (face or not self.local_models.get(model, False)):
                 raise ValueError("unchecked images require an unprotected concrete local route")  # noqa: TRY003
+            if (
+                self.contract_version == 3
+                and forwarding == "pii-unchecked"
+                and not self.image_models.get(model, False)
+            ):
+                raise ValueError("unchecked images require a proven local image model")  # noqa: TRY003
             if forwarding == "if-no-pii-detected" and not (pii and face):
                 raise ValueError("conditional images require PII and face protection")  # noqa: TRY003
         return self
@@ -131,7 +147,7 @@ def destination_policy_from_request(
         )
         version = payload.get("contract_version")
         # google.protobuf.Struct represents every JSON number as a double.
-        if type(version) is float and version in {1.0, 2.0}:
+        if type(version) is float and version in {1.0, 2.0, 3.0}:
             payload["contract_version"] = int(version)
         return DESTINATION_POLICY_ADAPTER.validate_python(payload, strict=True)
     except TrustedMetadataError:

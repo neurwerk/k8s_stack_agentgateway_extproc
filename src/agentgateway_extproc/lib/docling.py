@@ -111,7 +111,7 @@ class DoclingClient:
         # The retained task owns the thread and native job, not the caller timeout.
         output: list[str] = []
         pages = size = 0
-        for upload in uploads:
+        for index, upload in enumerate(uploads):
             if abandoned.is_set():
                 break
             if time.monotonic() >= deadline:
@@ -121,8 +121,16 @@ class DoclingClient:
             if abandoned.is_set():
                 break
             text, count = await asyncio.to_thread(
-                project_document, document, upload, self.settings.pages - pages
+                project_document,
+                document,
+                upload,
+                self.settings.pages - pages,
+                allow_empty_image=images is not None and images.policy_version == 3,
             )
+            if images is not None and upload.format == "img":
+                images.text_present[index] = bool(text)
+                if not text:
+                    text = "[Image: no text extracted]"
             document = None
             pages += count
             size += len(text)
@@ -207,7 +215,7 @@ class DoclingClient:
 
     def _options(self, source_format: str) -> dict[str, str]:
         options = {
-            "from_formats": source_format,
+            "from_formats": "image" if source_format == "img" else source_format,
             "target_type": "inbody",
             "to_formats": "json",
             "image_export_mode": "placeholder",
