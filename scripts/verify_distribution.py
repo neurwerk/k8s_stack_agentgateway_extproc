@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import sys
 import tarfile
 import zipfile
 from collections.abc import Iterable, Sequence
 from pathlib import Path
+
+from agentgateway_extproc.lib.image_probe import MODEL_SHA256
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 LICENSE_EXPRESSION = "MIT AND Apache-2.0"
@@ -15,6 +18,15 @@ LICENSE_FILES = (
     Path("LICENSES/Apache-2.0.txt"),
     Path("THIRD_PARTY_NOTICES.md"),
 )
+ASSET_ROOT = Path("agentgateway_extproc/assets")
+ASSET_FILES = ("face_detection_yunet_2023mar.onnx", "YUNET-LICENSE.txt", "YUNET-SOURCE.txt")
+
+
+def _verify_asset(name: str, data: bytes) -> None:
+    if data != (PROJECT_ROOT / "src" / ASSET_ROOT / name).read_bytes() or (
+        name.endswith(".onnx") and hashlib.sha256(data).hexdigest() != MODEL_SHA256
+    ):
+        raise DistributionVerificationError.different_license_file("asset", Path(name))
 
 
 class DistributionVerificationError(ValueError):
@@ -72,6 +84,8 @@ def verify_wheel(wheel_path: Path) -> None:
             "wheel METADATA file",
         ).as_posix()
         _verify_metadata(archive.read(metadata_name), metadata_name)
+        for name in ASSET_FILES:
+            _verify_asset(name, archive.read((ASSET_ROOT / name).as_posix()))
         license_root = metadata_name.removesuffix("METADATA") + "licenses/"
         for relative_path in LICENSE_FILES:
             archive_name = license_root + relative_path.as_posix()
@@ -91,6 +105,13 @@ def verify_sdist(sdist_path: Path) -> None:
         if metadata_file is None:
             raise DistributionVerificationError.irregular_metadata_file()
         _verify_metadata(metadata_file.read(), metadata_name)
+        for name in ASSET_FILES:
+            member = archive.extractfile(
+                metadata_name.removesuffix("PKG-INFO") + "src/" + str(ASSET_ROOT / name)
+            )
+            if member is None:
+                raise DistributionVerificationError.irregular_metadata_file()
+            _verify_asset(name, member.read())
         for relative_path in LICENSE_FILES:
             suffix = f"/{relative_path.as_posix()}"
             archive_name = _only(

@@ -144,7 +144,7 @@ async def test_metadata_eos_compat_rejects_callback_after_completed_response(
 @pytest.mark.parametrize(
     "policy",
     [
-        {**MODEL_POLICY, "contract_version": 2},
+        {**MODEL_POLICY, "contract_version": 3},
         {**MODEL_POLICY, "principal_id": ""},
         {**MODEL_POLICY, "models": {"test": "false"}},
         {**mcp_policy(), "pii_enabled": "false"},

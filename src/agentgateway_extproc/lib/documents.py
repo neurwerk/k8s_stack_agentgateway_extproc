@@ -11,13 +11,17 @@ import signal
 import stat
 import subprocess
 import sys
+import threading
+import time
 import unicodedata
 import zipfile
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from typing import cast
 from xml.parsers import expat
 
 from agentgateway_extproc.config.settings import MEBIBYTE, DoclingSettings
+from agentgateway_extproc.lib.image_probe import MAX_IMAGE_BYTES
 from agentgateway_extproc.models.engine import EngineAttachmentPart
 
 MAX_TEXT = 4_000_000
@@ -47,6 +51,7 @@ class DocumentError(Exception):
         self.status = status
         self.message = {
             400: "invalid document upload",
+            403: "image withheld by safety policy; retry with text only",
             413: "document limits exceeded",
             503: "document conversion unavailable",
             504: "document conversion deadline exceeded",
@@ -62,43 +67,157 @@ class Upload:
     format: str
     data: bytes
     pages: int = 0
+    source_bytes: int = 0
 
 
-def preflight(parts: list[EngineAttachmentPart], settings: DoclingSettings) -> list[Upload]:
+@dataclass
+class ImageBatch:
+    """Retain only normalized images under the existing batch admission slot."""
+
+    protect_faces: bool = True
+    images: dict[int, str] = dataclass_field(default_factory=dict)
+
+
+def preflight(
+    parts: list[EngineAttachmentPart],
+    settings: DoclingSettings,
+    images: ImageBatch | None = None,
+    abandoned: threading.Event | None = None,
+    deadline: float = float("inf"),
+) -> list[Upload]:
     """Validate every file before the first network call, under batch admission."""
     if len(parts) > settings.count:
         raise DocumentError(413)
     uploads: list[Upload] = []
     total = pages = 0
-    for part in parts:
-        upload = _decode_upload(part, settings.file_bytes)
-        total += len(upload.data)
+    for index, part in enumerate(parts):
+        _check_preflight(abandoned, deadline)
+        if part.type in {"image_url", "input_image"} and images is not None:
+            upload = _decode_image(part, settings, images, abandoned, deadline)
+            images.images[index] = "data:image/png;base64," + base64.b64encode(upload.data).decode()
+            if sum(len(value) for value in images.images.values()) > MAX_IMAGE_BYTES:
+                raise DocumentError(413)
+        else:
+            upload = _decode_upload(part, settings.file_bytes)
+        total += max(len(upload.data), upload.source_bytes)
         if total > settings.total_bytes:
             raise DocumentError(413)
         if upload.format == "pdf":
-            upload.pages = _pdf_pages(upload.data)
+            upload.pages = _pdf_pages(upload.data, abandoned, deadline)
         elif upload.format in _OFFICE_PARTS:
             _check_office(upload)
-        else:
-            text = upload.data.decode("utf-8")
-            if (
-                not text.strip()
-                or "\x00" in text
-                or upload.data.startswith((b"%PDF-", b"PK\x03\x04"))
-            ):
-                raise DocumentError(400)
-            if upload.format == "csv":
-                _check_csv(text)
+        elif upload.format != "img":
+            _check_text(upload)
         pages += upload.pages
         if pages > settings.pages:
             raise DocumentError(413)
         uploads.append(upload)
+    _check_preflight(abandoned, deadline)
     return uploads
 
 
-def _pdf_pages(data: bytes) -> int:
+def _check_preflight(abandoned: threading.Event | None, deadline: float) -> None:
+    if (abandoned is not None and abandoned.is_set()) or time.monotonic() >= deadline:
+        raise DocumentError(504)
+
+
+def _decode_image(
+    part: EngineAttachmentPart,
+    settings: DoclingSettings,
+    images: ImageBatch,
+    abandoned: threading.Event | None,
+    deadline: float,
+) -> Upload:
+    if settings.inference_mode not in {"private-vlm", "remote"}:
+        raise DocumentError(403)
+    limit = min(settings.file_bytes, MAX_IMAGE_BYTES)
+    mime, data = _image_data(part, limit)
+    _check_preflight(abandoned, deadline)
+    normalized = _normalize_image(data, mime, images.protect_faces)
+    if len(normalized) > limit:
+        raise DocumentError(413)
+    return Upload("image.png", "img", normalized, pages=1, source_bytes=len(data))
+
+
+def _image_data(part: EngineAttachmentPart, limit: int) -> tuple[str, bytes]:
+    value = part.model_dump()
+    if set(value) != {"type", "image_url"}:
+        raise DocumentError(400)
+    url = value["image_url"]
+    if part.type == "image_url":
+        if not isinstance(url, dict) or set(url) != {"url"}:
+            raise DocumentError(400)
+        url = url["url"]
+    if not isinstance(url, str):
+        raise DocumentError(400)
+    match = re.fullmatch(r"data:image/(jpeg|png);base64,([A-Za-z0-9+/]*={0,2})", url)
+    if match is None:
+        raise DocumentError(400)
+    mime, encoded = match.groups()
+    if len(encoded) > 4 * ((limit + 2) // 3):
+        raise DocumentError(413)
+    try:
+        data = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError):
+        raise DocumentError(400) from None
+    if not data or base64.b64encode(data).decode() != encoded:
+        raise DocumentError(400)
+    if len(data) > limit:
+        raise DocumentError(413)
+    return cast(str, mime), data
+
+
+def _normalize_image(data: bytes, mime: str, protect_faces: bool) -> bytes:
+    try:
+        result = subprocess.run(  # noqa: S603 - fixed executable/module and allowlisted arguments
+            [
+                sys.executable,
+                "-I",
+                "-B",
+                "-m",
+                "agentgateway_extproc.lib.image_probe",
+                "JPEG" if mime == "jpeg" else "PNG",
+                "detect" if protect_faces else "skip",
+            ],
+            input=data,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env={"OPENBLAS_NUM_THREADS": "1", "OMP_NUM_THREADS": "1"},
+            timeout=15,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        raise DocumentError(413) from None
+    except OSError:
+        raise DocumentError from None
+    if result.returncode in {2, -signal.SIGKILL, -signal.SIGXCPU}:
+        raise DocumentError(413)
+    if result.returncode == 3:
+        raise DocumentError
+    if result.returncode or result.stdout[:1] not in {b"\x00", b"\x01"}:
+        raise DocumentError(400)
+    if result.stdout[:1] == b"\x01":
+        raise DocumentError(403)
+    normalized = result.stdout[1:]
+    if not normalized.startswith(b"\x89PNG\r\n\x1a\n") or len(normalized) > MAX_IMAGE_BYTES:
+        raise DocumentError(413)
+    return normalized
+
+
+def _check_text(upload: Upload) -> None:
+    text = upload.data.decode("utf-8")
+    if not text.strip() or "\x00" in text or upload.data.startswith((b"%PDF-", b"PK\x03\x04")):
+        raise DocumentError(400)
+    if upload.format == "csv":
+        _check_csv(text)
+
+
+def _pdf_pages(
+    data: bytes, abandoned: threading.Event | None = None, deadline: float = float("inf")
+) -> int:
     if not data.startswith(b"%PDF-") or not data.rstrip().endswith(b"%%EOF"):
         raise DocumentError(400)
+    _check_preflight(abandoned, deadline)
     try:
         result = subprocess.run(
             [sys.executable, "-I", "-B", "-m", "agentgateway_extproc.lib.pdf_probe"],

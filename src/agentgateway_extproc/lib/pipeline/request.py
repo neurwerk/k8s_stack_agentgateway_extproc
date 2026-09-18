@@ -16,7 +16,7 @@ from pydantic import ValidationError
 
 from agentgateway_extproc.config.settings import MAX_REQUEST_BYTES
 from agentgateway_extproc.gen import ext_proc_pb2
-from agentgateway_extproc.lib.documents import MAX_TEXT, DocumentError
+from agentgateway_extproc.lib.documents import MAX_TEXT, DocumentError, ImageBatch
 from agentgateway_extproc.lib.engine.client import EngineClient
 from agentgateway_extproc.lib.json_limits import JsonBudgetError
 from agentgateway_extproc.lib.masking.reversal import placeholder_entity_prefixes
@@ -84,6 +84,8 @@ async def process_request(
         raise ValueError("trusted destination policy is unavailable")  # noqa: TRY003
     opaque_reasoning: OpaqueReasoning = {}
     converted = False
+    image_locations: dict[tuple[int, int], str] = {}
+    image_forwarding = "none"
     if policy.destination_kind == "mcp":
         handler.response_api_kind = "mcp"
         if handler.mcp_headers is None:
@@ -151,9 +153,13 @@ async def process_request(
             return immediate_response(400, '{"error":"unknown model"}')
         attachments = _model_attachments(request)
         attachment_mode = policy.attachment_modes.get(request.model, "block")
+        image_forwarding = policy.image_forwarding.get(request.model, "none")
         if attachments and attachment_mode != "passthrough":
-            if attachment_mode != "extract" or any(
-                part.type not in {"file", "input_file"} for part in attachments
+            allowed = {"file", "input_file"}
+            if policy.contract_version == 2:
+                allowed |= {"image_url", "input_image"}
+            if attachment_mode not in {"extract", "process"} or any(
+                part.type not in allowed for part in attachments
             ):
                 _clear_request(handler)
                 handler.record_dispatch("policy_block")
@@ -162,20 +168,45 @@ async def process_request(
                 if handler.docling is None:
                     raise DocumentError  # noqa: TRY301
                 expected_type = "file" if isinstance(request, EngineChatRequest) else "input_file"
-                if any(part.type != expected_type for part in attachments):
+                expected_image = (
+                    "image_url" if isinstance(request, EngineChatRequest) else "input_image"
+                )
+                if any(part.type not in {expected_type, expected_image} for part in attachments):
                     raise DocumentError(400)  # noqa: TRY301
-                texts = await handler.docling.convert(attachments)
+                if any(part.type == expected_image for part in attachments):
+                    images = ImageBatch(
+                        protect_faces=image_forwarding != "none"
+                        and policy.protects_faces(request.model)
+                    )
+                    texts = await handler.docling.convert(attachments, images=images)
+                    if image_forwarding != "none":
+                        image_locations = _image_locations(payload, images)
+                else:
+                    texts = await handler.docling.convert(attachments)
                 request, body = _converted_request(payload, texts, opaque_reasoning)
             except DocumentError as exc:
                 _clear_request(handler)
                 handler.record_dispatch("transport_failure")
-                return immediate_response(exc.status, json.dumps({"error": exc.message}))
+                message = exc.message
+                if any(part.type in {"image_url", "input_image"} for part in attachments):
+                    message = "image request rejected; retry with text only"
+                return immediate_response(exc.status, json.dumps({"error": message}))
             converted = True
             # Discard base64 and wire buffers before the potentially long PII call.
             handler.request_body_chunks.clear()
             attachments.clear()
             payload = None
         if not policy.models[request.model]:
+            if image_locations:
+                data = cast(dict[str, object], strict_json_loads(body.decode()))
+                try:
+                    _restore_images(data, image_locations, offset=0)
+                    body = json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode()
+                    if len(body) > handler.max_transformed_request_bytes:
+                        raise DocumentError(413)  # noqa: TRY301
+                except DocumentError as exc:
+                    _clear_request(handler)
+                    return immediate_response(exc.status, json.dumps({"error": exc.message}))
             _clear_request(handler)
             handler.response_processing_enabled = False
             handler.record_dispatch("model_bypass")
@@ -201,6 +232,23 @@ async def process_request(
         reply = await client.analyze_request(request, session_key)
     _validate_request_mutation(request, reply)
     _validate_reversal(request, reply)
+    if (
+        image_locations
+        and image_forwarding == "if-no-pii-detected"
+        and (
+            reply.decision != "pass"
+            or reply.entities
+            or reply.report.rows
+            or reply.analysis.source != "current_request"
+            or not reply.analysis.scan_performed
+            or reply.analysis.cached_decision_applied
+            or reply.analysis.text_leaf_count < 1
+            or reply.safety_rule is not None
+        )
+    ):
+        _clear_request(handler)
+        handler.record_dispatch("policy_block")
+        return immediate_response(403, json.dumps({"error": DocumentError(403).message}))
     if isinstance(request, EngineMcpRequest) and (
         reply.decision == "reroute" or reply.route_class is not None
     ):
@@ -255,7 +303,16 @@ async def process_request(
                 separators=(",", ":"),
             )
             return immediate_response(200, body)
-        return immediate_response(403, json.dumps({"error": "request blocked by policy"}))
+        return immediate_response(
+            403,
+            json.dumps(
+                {
+                    "error": DocumentError(403).message
+                    if image_locations
+                    else "request blocked by policy"
+                }
+            ),
+        )
     transformed = reply.request
     if isinstance(request, EngineChatRequest | EngineResponsesRequest):
         transformed = inject_guard_instruction(
@@ -271,6 +328,15 @@ async def process_request(
             if message.get("tool_calls") == []:
                 del message["tool_calls"]
         _restore_opaque_chat_reasoning(serialized, opaque_reasoning, offset=1)
+    if image_locations:
+        try:
+            _restore_images(
+                serialized,
+                image_locations,
+                offset=1 if isinstance(request, EngineChatRequest) else 0,
+            )
+        except DocumentError as exc:
+            return immediate_response(exc.status, json.dumps({"error": exc.message}))
     mutated = json.dumps(
         serialized,
         ensure_ascii=False,
@@ -302,7 +368,7 @@ def _converted_request(
         if not chat and message.get("type", "message") != "message":
             continue
         for part in _dict_list(message.get("content")):
-            if part.get("type") not in {"file", "input_file"}:
+            if part.get("type") not in {"file", "input_file", "image_url", "input_image"}:
                 continue
             value = next(remaining, None)
             if value is None:
@@ -325,6 +391,47 @@ def _converted_request(
     if len(body) > MAX_REQUEST_BYTES:
         raise DocumentError(413)
     return request, body
+
+
+def _image_locations(payload: object, images: ImageBatch) -> dict[tuple[int, int], str]:
+    """Bind normalized pixels to original content positions, never to reader output."""
+    data = cast(dict[str, object], payload)
+    locations: dict[tuple[int, int], str] = {}
+    attachment = 0
+    for mi, message in enumerate(
+        _dict_list(data.get("messages" if "messages" in data else "input"))
+    ):
+        for pi, part in enumerate(_dict_list(message.get("content"))):
+            if part.get("type") in {"file", "input_file", "image_url", "input_image"}:
+                if attachment in images.images:
+                    locations[mi, pi] = images.images[attachment]
+                attachment += 1
+    if len(locations) != len(images.images):
+        raise DocumentError
+    return locations
+
+
+def _restore_images(
+    data: dict[str, object],
+    locations: dict[tuple[int, int], str],
+    *,
+    offset: int,
+) -> None:
+    """Insert checked pixels after their scanned text, preserving history and ordering."""
+    chat = "messages" in data
+    messages = _dict_list(data.get("messages" if chat else "input"))
+    for (mi, pi), uri in sorted(locations.items(), reverse=True):
+        content = messages[mi + offset].get("content")
+        if not isinstance(content, list):
+            raise DocumentError
+        if len(content) >= 64:
+            raise DocumentError(413)
+        part = (
+            {"type": "image_url", "image_url": {"url": uri}}
+            if chat
+            else {"type": "input_image", "image_url": uri}
+        )
+        content.insert(pi + 1, part)
 
 
 def _model_attachments(

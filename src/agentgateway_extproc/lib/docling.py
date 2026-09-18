@@ -6,6 +6,8 @@ import asyncio
 import logging
 import re
 import ssl
+import threading
+import time
 
 import httpx
 
@@ -14,6 +16,7 @@ from agentgateway_extproc.lib.documents import (
     _MIMES,
     MAX_TEXT,
     DocumentError,
+    ImageBatch,
     Upload,
     preflight,
     project_document,
@@ -44,22 +47,27 @@ class DoclingClient:
                 limits=httpx.Limits(max_connections=1, max_keepalive_connections=1),
             )
         self._task: asyncio.Task[list[str]] | None = None
-        self._abandoned = asyncio.Event()
+        self._abandoned = threading.Event()
         self._poisoned = False
         self._closed = False
 
-    async def convert(self, parts: list[EngineAttachmentPart]) -> list[str]:
+    async def convert(
+        self,
+        parts: list[EngineAttachmentPart],
+        *,
+        images: ImageBatch | None = None,
+    ) -> list[str]:
         """Fail busy immediately and shield admitted work from caller cancellation."""
         if not self.settings.enabled or self._closed or self._poisoned or self._task is not None:
             raise DocumentError
-        abandoned = asyncio.Event()
+        abandoned = threading.Event()
         self._abandoned = abandoned
-        deadline = asyncio.get_running_loop().time() + self.settings.timeout
-        task = asyncio.create_task(self._batch(parts, abandoned, deadline))
+        deadline = time.monotonic() + self.settings.timeout
+        task = asyncio.create_task(self._batch(parts, abandoned, deadline, images))
         self._task = task
         task.add_done_callback(self._finished)
         try:
-            async with asyncio.timeout_at(deadline):
+            async with asyncio.timeout(self.settings.timeout):
                 return await asyncio.shield(task)
         except TimeoutError:
             abandoned.set()
@@ -84,10 +92,16 @@ class DoclingClient:
             await self._client.aclose()
 
     async def _batch(
-        self, parts: list[EngineAttachmentPart], abandoned: asyncio.Event, deadline: float
+        self,
+        parts: list[EngineAttachmentPart],
+        abandoned: threading.Event,
+        deadline: float,
+        images: ImageBatch | None = None,
     ) -> list[str]:
         try:
-            uploads = await asyncio.to_thread(preflight, parts, self.settings)
+            uploads = await asyncio.to_thread(
+                preflight, parts, self.settings, images, abandoned, deadline
+            )
         except DocumentError:
             raise
         except Exception:  # noqa: BLE001
@@ -100,7 +114,7 @@ class DoclingClient:
         for upload in uploads:
             if abandoned.is_set():
                 break
-            if asyncio.get_running_loop().time() >= deadline:
+            if time.monotonic() >= deadline:
                 raise DocumentError(504)
             document = await self._convert_one(upload, abandoned)
             upload.data = b""
@@ -117,7 +131,7 @@ class DoclingClient:
             output.append(text)
         return output
 
-    async def _convert_one(self, upload: Upload, abandoned: asyncio.Event) -> object:
+    async def _convert_one(self, upload: Upload, abandoned: threading.Event) -> object:
         terminal = False
         try:
             value = await self._http("POST", "/v1/convert/file/async", limit=65_536, upload=upload)
@@ -161,7 +175,9 @@ class DoclingClient:
         options = None
         if upload is not None:
             source_format = "md" if upload.format == "txt" else upload.format
-            files = {"files": (f"upload.{source_format}", upload.data, _MIMES[source_format])}
+            extension = "png" if source_format == "img" else source_format
+            mime = "image/png" if source_format == "img" else _MIMES[source_format]
+            files = {"files": (f"upload.{extension}", upload.data, mime)}
             options = self._options(source_format)
         try:
             async with (
@@ -206,12 +222,15 @@ class DoclingClient:
             "do_picture_description": "false",
             "do_pdf_heading_hierarchy": "false",
         }
-        if self.settings.inference_mode == "cpu":
+        if self.settings.inference_mode in {"cpu", "internal-standard"}:
             options.update(
                 pipeline="standard", ocr_preset="rapidocr", do_ocr="true", do_table_structure="true"
             )
         else:
-            options.update(pipeline="vlm", vlm_pipeline_preset="default")
+            options.update(
+                pipeline="vlm",
+                vlm_pipeline_preset="images" if source_format == "img" else "default",
+            )
         return options
 
 

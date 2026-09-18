@@ -29,8 +29,8 @@ including history, follow the selected model's trusted attachment mode:
 | Mode | Behavior |
 | --- | --- |
 | `block` (default) | Reject attachments with HTTP 403, independently of PII. |
-| `extract` | Convert allowed inline documents to complete text parts through Docling, then apply PII when enabled; other attachment types return 403. |
-| `passthrough` | Forward the original request and provider response unchanged; valid only when that model has PII disabled. |
+| `extract` / `process` | Convert allowed inline documents and version-two images to complete text parts through Docling, then apply PII when enabled. Forwarding image pixels additionally requires an explicit image policy. `process` is a version-two alias, not an extra permission. |
+| `passthrough` | Preserve the original request bytes and protocol parts unchanged in both versions, without normalization, Docling or face detection. PII and face protection must be disabled, and no image-forwarding policy may be set. |
 
 The trusted version-1 metadata retains its `models` map of model IDs to PII
 booleans and optionally adds an `attachment_modes` map using those same IDs.
@@ -40,10 +40,17 @@ caller headers cannot override this trusted policy. Upgrade the extProc consumer
 before configuring modes in the platform producer; older consumers reject the
 new metadata field.
 
+Version two adds optional sparse `image_forwarding`, `face_protection` and
+`local_models` maps. All keys must exist in `models`; booleans are strict and
+unknown fields are rejected. Version one rejects these maps even when empty.
+Face protection defaults to true except for legacy passthrough; forwarding
+defaults to `none`. MCP metadata remains version one.
+
 Passthrough is an explicit grant, never a fallback after extraction or PII fails.
 It does not imply the destination is local, disable tracing, fetch referenced
 files, or guarantee the provider supports the attachment. Existing request-size
-and protocol bounds still apply.
+and protocol bounds still apply. Inline image bytes and URL references remain
+untouched; the passthrough backend owns URL handling.
 Ordinary text-only bypass, arbitrary tool JSON and MCP handling are unchanged.
 
 ### Document Conversion
@@ -73,8 +80,8 @@ The verified-HTTPS client targets native docling-serve `1.33.0` revision
 DoclingDocument schema `1.10.0`). It submits one multipart file to
 `/v1/convert/file/async`, polls `/v1/status/poll/{task_id}`, then reads
 `/v1/result/{task_id}`. It never retries submissions or forwards caller credentials.
-CPU uses standard/RapidOCR/table extraction; remote uses the administrator's
-`default` VLM preset. Enrichments and image exports are off. TXT uses the Markdown
+`internal-standard` uses standard/RapidOCR/table extraction; `private-vlm` uses the administrator's
+`default` VLM preset for PDFs and `images` for native images. Enrichments and image exports are off. TXT uses the Markdown
 backend. Caller options, URL sources and callbacks are never forwarded.
 
 Only successful, error-free, nonempty results are accepted. A bounded reference
@@ -114,6 +121,79 @@ worker resource limits. Remote inference sees unredacted pages before PII. Embed
 images and arbitrary picture/chart metadata are not forwarded. Keep Docling's content-bearing
 logs suppressed and backend resource fetching disabled, and enforce network and
 worker resource limits. PII-disabled extracted text is not PII-sanitized.
+
+### Private Images
+
+Version-two processed images accept only inline JPEG/PNG in
+`{"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}`
+(Chat) or `{"type":"input_image","image_url":"data:image/png;base64,..."}`
+(Responses). URLs, file IDs, extra fields, wrong MIME types, animation and
+multi-frame images are rejected. Image parts anywhere in history are processed
+in their original order, alongside ordinary documents and text.
+
+| Image forwarding | Requirements and result |
+| --- | --- |
+| `none` (default) | Accept supported images, privately extract their text, apply ordinary text PII when enabled, and forward only text. Never restore image pixels or run YuNet, even when face protection is enabled or the image contains faces. Documents retain their existing text-only path. |
+| `if-no-pii-detected` | Requires `process`/`extract`, PII enabled and face protection enabled. Forward only after a complete private-VLM extraction, successful YuNet check and one fresh document PII scan of the whole converted request. Any entity, including a policy `pass` or masked entity, face, cached/ambiguous result or non-pass decision withholds all images and rejects the request with a text-only retry message. |
+| `pii-unchecked` | Requires `process`/`extract`, face protection false and `local_models[selected] == true`. This is trusted producer proof of a concrete local route, never a model-name guess. Images still need private-VLM extraction. Ordinary text PII settings, policy blocks, errors and output limits still apply. |
+
+`private-vlm` must be an operator-qualified private reader compatible with the
+pinned Docling output contract; a mode label alone cannot prove model quality.
+Images cannot use the standard pipeline, and no automatic pipeline fallback exists.
+`cpu` and `remote` remain accepted aliases for `internal-standard` and `private-vlm`.
+The selected pipeline also applies to PDFs; Office formats keep their native parsers.
+Native image conversion sends `from_formats=img`, a constant `upload.png`, the
+administrator-owned `images` VLM preset and the same validated DoclingDocument
+projection used for documents. This named preset must set `VlmConvertOptions.scale`
+to `1` and `max_size` to `null`; both fields are supported by pinned Docling
+`2.127.0`. PDFs retain the `default` preset. The `remote` transition alias uses
+the same per-format preset selection. A missing `images` preset is an error,
+never a fallback to `default`. One complete image page and nonempty text are required.
+
+Before any conversion submission, a disposable helper checks dimensions and
+single-frame decoding, applies EXIF orientation, composites transparency on white,
+and rebuilds a clean RGB PNG. It strips metadata and trailing bytes. The private
+reader, detector (when required) and downstream (when allowed) receive identical
+decoded visible pixels at the normalized dimensions, not necessarily identical
+PNG bytes: Docling's internal VLM backend may re-encode as opaque RGBA without
+changing the visible pixels. The image preset must not resize them. The `none`
+path skips detection.
+PII Engine receives extracted text, not pixels. Forwarded pixels are inserted after
+their scanned text while preserving all existing text and history order. Original
+documents, embedded images and PDF page pixels are never forwarded.
+
+Image limits are 5 MiB encoded-file bytes (or the smaller configured file limit),
+4096 pixels per dimension and 12 million pixels for text-only or unchecked processing.
+Protected images additionally require **at most 2,000,000 pixels and 64 through 2048
+pixels per dimension**. The minimum avoids unreliable native detections for tiny
+or extremely thin inputs. Protected images outside these bounds return HTTP 413 before
+decoding/detection, never a detector-only resize. Real isolated-helper tests cover
+the 2-million-pixel landscape/portrait boundary and skinny images in both
+orientations under the unchanged resource cap. Python memory failures and OpenCV
+`StsNoMem` allocation errors also map to HTTP 413; other detector errors fail closed.
+Byte limits remain 5 MiB normalized PNG bytes per image
+and 5 MiB total normalized data URIs per request. Existing batch count, aggregate
+source/normalized byte and page limits also apply. The helper has 768 MiB address
+space, ten CPU seconds and a fifteen-second parent deadline; timeout kills and
+reaps it. Preflight checks a thread-safe cancellation event and monotonic batch
+deadline before each file and native helper. Cancellation/deadline stops later
+helpers; the active bounded helper finishes and is reaped before admission is
+released. Existing native asynchronous-job draining and poisoning rules are unchanged.
+Passthrough does not use this processing path or require a Docling client.
+Final base64 plus text must fit `MAX_TRANSFORMED_REQUEST_BYTES`; no limits are raised.
+
+The packaged MIT OpenCV YuNet `face_detection_yunet_2023mar.onnx` runs only on CPU,
+with score threshold 0.5. Its SHA256 is
+`8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4`.
+Immutable source and license are in `src/agentgateway_extproc/assets/`; distribution
+checks verify model and license contents, and the Dockerfile verifies the installed
+model and makes assets read-only. There are no runtime downloads, model mounts,
+face identities, embeddings, storage, blur or image/face redaction. Missing/corrupt
+models and detector failures fail protected image requests closed without affecting
+ordinary text readiness. Native diagnostics and content are never logged.
+Detection and OCR can miss content: these checks reduce risk, not prove that an
+image contains no personal information. A real-model blank-image smoke test proves
+load/inference only, not detection quality on every kind of photograph.
 
 All gateway MCP traffic is stateless. At the trusted request-header stage,
 any `Mcp-Session-Id` header (including empty or duplicate headers, regardless of
@@ -158,7 +238,7 @@ Document settings use `EXTPROC_DOCLING__` plus these names (byte units are bytes
 | `BASE_URL` | `https://docling.docling.svc` | HTTPS origin, no credentials/path/query |
 | `CA_CERT` | unset | CA file path; otherwise system trust |
 | `API_KEY` | unset | Required secret when enabled, sent only as `X-Api-Key` |
-| `INFERENCE_MODE` | `cpu` | `cpu` or `remote` |
+| `INFERENCE_MODE` | `internal-standard` | `internal-standard` or `private-vlm`; transition aliases `cpu` or `remote` |
 | `TIMEOUT` | `360` | Whole batch, >0 through 3660 seconds |
 | `DOCUMENT_TIMEOUT` | `300` | Native per-document budget, >0 through 3600 seconds |
 | `FILE_BYTES` | `20971520` | 1 through 41943040 |
