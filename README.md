@@ -55,7 +55,7 @@ Ordinary text-only bypass, arbitrary tool JSON and MCP handling are unchanged.
 
 ### Document Conversion
 
-Version `0.8.0` supports PDF, DOCX, XLSX, PPTX, UTF-8 TXT, Markdown and CSV.
+The current source supports PDF, DOCX, XLSX, PPTX, UTF-8 TXT, Markdown and CSV.
 Chat uploads use `{"type":"file","file":{"filename":"report.pdf","file_data":"data:application/pdf;base64,..."}}`;
 Responses use `{"type":"input_file","filename":"report.pdf","file_data":"data:application/pdf;base64,..."}`.
 Only exact MIME/extension-matched, strict base64 data URIs are accepted, not raw
@@ -123,6 +123,9 @@ logs suppressed and backend resource fetching disabled, and enforce network and
 worker resource limits. PII-disabled extracted text is not PII-sanitized.
 
 ### Private Images
+
+The `0.9.0` source adds version-two private image processing. Publishing the image,
+adopting a verified pin and activating version-two policy remain separate steps.
 
 Version-two processed images accept only inline JPEG/PNG in
 `{"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}`
