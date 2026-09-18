@@ -344,10 +344,40 @@ class Notices(EngineModel):
     response: list[Annotated[str, Field(max_length=4_000)]] = Field(max_length=16)
 
 
+class FaceFindings(EngineModel):
+    """Carry aggregate local detection facts, never pixels or identities."""
+
+    scan_status: Literal["complete", "not_scanned", "failed"]
+    count: Annotated[int, Field(strict=True, ge=0, le=10_000_000)] | None
+
+    @model_validator(mode="after")
+    def validate_scan(self) -> FaceFindings:
+        """Do not turn a missing or failed scan into a clean result."""
+        if (self.scan_status == "complete") != (self.count is not None):
+            raise ValueError("face count requires a complete scan")  # noqa: TRY003
+        return self
+
+
+class VisualFindings(EngineModel):
+    """Versioned document-envelope visual findings."""
+
+    faces: FaceFindings
+
+
+class EngineDocumentRequest(EngineModel):
+    """Add trusted controls to a converted text-only Chat or Responses request."""
+
+    api_version: Literal["v1"]
+    request: EngineChatRequest | EngineResponsesRequest
+    text_pii_enabled: Annotated[bool, Field(strict=True)]
+    visual_findings: VisualFindings
+
+
 type PIIAction = Literal[
     "pass",
     "block",
     "reroute",
+    "text-only",
     "mask",
     "replace",
     "redact",
@@ -369,6 +399,11 @@ class PIIReportRow(EngineModel):
     @model_validator(mode="after")
     def validate_counts(self) -> PIIReportRow:
         """Require transformed and unique counts to describe detected values."""
+        if self.entity_type == "FACE":
+            if self.action not in {"block", "text-only", "reroute"} or self.transformed_count:
+                raise ValueError("FACE rows require a visual action without transformations")  # noqa: TRY003
+        elif self.action == "text-only":
+            raise ValueError("text-only is a FACE action")  # noqa: TRY003
         if self.transformed_count > self.detected_count:
             raise ValueError("transformed_count cannot exceed detected_count")  # noqa: TRY003
         if self.unique_transformed_count > self.transformed_count:
@@ -412,6 +447,7 @@ class EngineReply(EngineModel):
     analysis: AnalysisMetadata
     notices: Notices
     report: PIIReport
+    visual_findings: VisualFindings | None = None
     safety_rule: str | None = Field(default=None, max_length=128)
     reversal: dict[
         Annotated[
@@ -424,6 +460,34 @@ class EngineReply(EngineModel):
         ],
         Annotated[str, Field(min_length=1, max_length=4_000_000)],
     ] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_visual_findings(self) -> EngineReply:
+        """Bind FACE counts and report rows to fresh local visual findings."""
+        if self.visual_findings is None:
+            if "FACE" in self.entities:
+                raise ValueError("FACE requires visual findings")  # noqa: TRY003
+            return self
+        if (
+            self.analysis.source != "current_request"
+            or self.analysis.cached_decision_applied
+            or isinstance(self.request, EngineMcpRequest)
+        ):
+            raise ValueError("visual findings require fresh document analysis")  # noqa: TRY003
+        faces = self.visual_findings.faces
+        count = faces.count or 0
+        if self.entity_counts.get("FACE", 0) != count:
+            raise ValueError("FACE counts must match visual findings")  # noqa: TRY003
+        if self.decision != "block" and any(
+            row.entity_type == "FACE" and row.action not in self.applied_actions
+            for row in self.report.rows
+        ):
+            raise ValueError("FACE report action must be applied")  # noqa: TRY003
+        if faces.scan_status == "failed" and self.decision != "block":
+            raise ValueError("failed visual scans must block")  # noqa: TRY003
+        if not self.analysis.scan_performed and (set(self.entities) - {"FACE"} or self.reversal):
+            raise ValueError("unscanned text cannot report text findings or reversal")  # noqa: TRY003
+        return self
 
     @model_validator(mode="after")
     def validate_decision_shape(self) -> EngineReply:  # noqa: C901
@@ -453,7 +517,7 @@ class EngineReply(EngineModel):
             and not self.analysis.scan_performed
             and self.decision != "block"
         )
-        if unscanned_current_success:
+        if unscanned_current_success and self.visual_findings is None:
             if not _is_no_text_mcp_request(self.request):
                 raise ValueError(  # noqa: TRY003
                     "unscanned current success requires a no-text MCP request"
@@ -488,7 +552,8 @@ class EngineReply(EngineModel):
         if self.decision == "pass" and row_actions - {"pass"}:
             raise ValueError("pass decisions require pass report rows")  # noqa: TRY003
         if self.decision == "apply_actions" and (
-            not transformed or row_actions & {"block", "reroute"}
+            (not transformed and "text-only" not in row_actions)
+            or row_actions & {"block", "reroute"}
         ):
             raise ValueError(  # noqa: TRY003
                 "action decisions require transformed non-terminal report rows"

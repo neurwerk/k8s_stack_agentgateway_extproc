@@ -14,7 +14,13 @@ import httpx
 from agentgateway_extproc.config.settings import EngineSettings
 from agentgateway_extproc.lib.json_limits import bounded_json_text
 from agentgateway_extproc.metrics import engine_request_latency_seconds, engine_requests_total
-from agentgateway_extproc.models.engine import EngineErrorReply, EngineReply, EngineRequest
+from agentgateway_extproc.models.engine import (
+    EngineDocumentRequest,
+    EngineErrorReply,
+    EngineReply,
+    EngineRequest,
+    VisualFindings,
+)
 from agentgateway_extproc.models.exceptions import (
     ENGINE_ERROR_CONTRACT,
     EnginePolicyError,
@@ -71,19 +77,44 @@ class EngineClient:
             raise EngineUnavailableError from exc
 
     async def analyze_request(
-        self, request: EngineRequest, session_key: str, *, document: bool = False
+        self,
+        request: EngineRequest,
+        session_key: str,
+        *,
+        document: bool = False,
+        text_pii_enabled: bool = True,
+        visual_findings: VisualFindings | None = None,
     ) -> EngineReply:
         """Send a complete request to the engine and validate its complete reply."""
         started = time.monotonic()
         outcome = "error"
         endpoint = "analyze-document-request" if document else "analyze-request"
+        wire = request.model_dump(by_alias=True, exclude_none=True)
+        if (visual_findings is not None and not document) or (
+            visual_findings is None and not text_pii_enabled
+        ):
+            raise ValueError("visual controls require the document envelope")  # noqa: TRY003
+        if visual_findings is not None:
+            envelope = EngineDocumentRequest.model_validate(
+                {
+                    "api_version": "v1",
+                    "request": request,
+                    "text_pii_enabled": text_pii_enabled,
+                    "visual_findings": visual_findings,
+                },
+                strict=True,
+            )
+            wire = {
+                **envelope.model_dump(by_alias=True),
+                "request": wire,
+            }
         try:
             async with (
                 asyncio.timeout(self._settings.timeout),
                 self._client.stream(
                     "POST",
                     f"{self._settings.base_url.rstrip('/')}/v1/adapter/{endpoint}",
-                    json=request.model_dump(by_alias=True, exclude_none=True),
+                    json=wire,
                     headers={"x-pii-session-key": session_key},
                 ) as response,
             ):
@@ -98,6 +129,7 @@ class EngineClient:
                     parse_float=_finite_float,
                 )
                 reply = EngineReply.model_validate(payload, strict=True)
+                _validate_visual_reply(reply, request, visual_findings, text_pii_enabled)
             except InvalidEngineReplyError:
                 raise
             except (TypeError, ValueError) as exc:
@@ -119,6 +151,34 @@ class EngineClient:
             engine_request_latency_seconds.labels(outcome=outcome).observe(
                 time.monotonic() - started
             )
+
+
+def _validate_visual_reply(
+    reply: EngineReply,
+    request: EngineRequest,
+    findings: VisualFindings | None,
+    text_pii_enabled: bool,
+) -> None:
+    """Require an exact findings echo and respect the trusted text-analysis switch."""
+    if findings is None:
+        if "visual_findings" in reply.model_fields_set:
+            raise InvalidEngineReplyError
+        return
+    if reply.visual_findings != findings:
+        raise InvalidEngineReplyError
+    if text_pii_enabled:
+        if reply.decision != "block" and (
+            not reply.analysis.scan_performed or reply.analysis.text_leaf_count < 1
+        ):
+            raise InvalidEngineReplyError
+    elif (
+        reply.analysis.scan_performed
+        or set(reply.entities) - {"FACE"}
+        or reply.reversal
+        or (reply.request is not None and reply.request != request)
+        or set(reply.applied_actions) - {"pass", "block", "text-only", "reroute"}
+    ):
+        raise InvalidEngineReplyError
 
 
 async def _read_bounded(response: httpx.Response, limit: int) -> bytes:

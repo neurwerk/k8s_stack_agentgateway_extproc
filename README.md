@@ -29,8 +29,8 @@ including history, follow the selected model's trusted attachment mode:
 | Mode | Behavior |
 | --- | --- |
 | `block` (default) | Reject attachments with HTTP 403, independently of PII. |
-| `extract` / `process` | Convert allowed inline documents and version-two images to complete text parts through Docling, then apply PII when enabled. Forwarding image pixels additionally requires an explicit image policy. `process` is a version-two alias, not an extra permission. |
-| `passthrough` | Preserve the original request bytes and protocol parts unchanged in both versions, without normalization, Docling or face detection. PII and face protection must be disabled, and no image-forwarding policy may be set. |
+| `extract` / `process` | Convert allowed inline documents and version-two/three images to text parts through Docling, then apply PII when enabled. Forwarding image pixels additionally requires an explicit image policy. `process` requires version two or three, not an extra permission. |
+| `passthrough` | Preserve the original request bytes and protocol parts unchanged in all versions, without normalization, Docling or face detection. PII and face protection must be disabled, and no image-forwarding policy may be set. |
 
 The trusted version-1 metadata retains its `models` map of model IDs to PII
 booleans and optionally adds an `attachment_modes` map using those same IDs.
@@ -84,7 +84,8 @@ DoclingDocument schema `1.10.0`). It submits one multipart file to
 `default` VLM preset for PDFs and `images` for native images. Enrichments and image exports are off. TXT uses the Markdown
 backend. Caller options, URL sources and callbacks are never forwarded.
 
-Only successful, error-free, nonempty results are accepted. A bounded reference
+Only successful, error-free results are accepted; text must be nonempty except
+for the version-three no-text image marker described below. A bounded reference
 walk projects body/furniture text, table rows and picture captions, excluding
 images, `orig`, source URLs and metadata. Unsupported structures, broken references,
 cycles, incomplete PDF page sets and orphaned content fail closed. Limits include
@@ -101,8 +102,9 @@ duplicate-key/non-finite-number rejection still apply.
 
 PII-enabled converted chats call `POST /v1/adapter/analyze-document-request` once
 with the existing Chat/Responses request and `EngineReply` contracts, using a fresh
-session scope. Mutation/reversal checks use the converted request. PII-disabled
-destinations receive that converted body, without guard injection or PII state.
+session scope. Mutation/reversal checks use the converted request. Without v3
+face protection, PII-disabled destinations receive that converted body without
+guard injection or PII state; v3 face reporting uses the envelope described below.
 Opaque assistant reasoning and protocol controls are preserved in both paths.
 
 Each extProc process admits one conversion batch with no waiting queue. Cancellation
@@ -124,8 +126,12 @@ worker resource limits. PII-disabled extracted text is not PII-sanitized.
 
 ### Private Images
 
-The `0.9.0` source adds version-two private image processing. Publishing the image,
-adopting a verified pin and activating version-two policy remain separate steps.
+Published `0.9.0` supports version-two private image processing. Version three
+below is staged source work, not a release or activation: compatible extProc,
+PII Engine and Base must precede v3 metadata. Publication, verified image pinning
+and activation remain separate approvals; v1/v2 defaults and behavior are preserved.
+
+#### Version Two
 
 Version-two processed images accept only inline JPEG/PNG in
 `{"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}`
@@ -145,7 +151,7 @@ pinned Docling output contract; a mode label alone cannot prove model quality.
 Images cannot use the standard pipeline, and no automatic pipeline fallback exists.
 `cpu` and `remote` remain accepted aliases for `internal-standard` and `private-vlm`.
 The selected pipeline also applies to PDFs; Office formats keep their native parsers.
-Native image conversion sends `from_formats=img`, a constant `upload.png`, the
+Native image conversion sends `from_formats=image`, a constant `upload.png`, the
 administrator-owned `images` VLM preset and the same validated DoclingDocument
 projection used for documents. This named preset must set `VlmConvertOptions.scale`
 to `1` and `max_size` to `null`; both fields are supported by pinned Docling
@@ -197,6 +203,52 @@ ordinary text readiness. Native diagnostics and content are never logged.
 Detection and OCR can miss content: these checks reduce risk, not prove that an
 image contains no personal information. A real-model blank-image smoke test proves
 load/inference only, not detection quality on every kind of photograph.
+
+#### Version Three (Staged)
+
+V3 accepts inline still JPEG, PNG and iPhone HEIC/HEIF images. Docling may use
+`internal-standard` CPU OCR or the qualified `private-vlm` reader. CPU YuNet scans
+whenever face protection is enabled, including `image_forwarding: none`. One
+oriented, white-composited RGB PNG is shared by OCR, detection and allowed output:
+sources are bounded to 20 MiB (or the smaller file limit), 50 million pixels and
+10,000 pixels per dimension; the canonical image is at most 2 million pixels and
+2048 per dimension, with a 64-pixel minimum per dimension when protected. The
+5 MiB PNG and aggregate normalized-data-URI caps, helper limits and configured
+request/batch/output limits still apply; phone uploads may need an explicit
+transport-limit increase.
+
+Current source also corrects the native Docling format from `img` to `image`
+for both v2 and v3; published `0.9.0` still contains the incorrect format value.
+
+The existing document-analysis endpoint receives a v1 envelope containing the
+converted Chat/Responses `request`, trusted `text_pii_enabled` and aggregate
+`visual_findings.faces`, never pixels. Its exact fresh findings echo is required.
+Central FACE actions are `block`, `text-only` (withhold **all** request images) and
+`reroute` (only with forwarding enabled and an exact approved local binding).
+Text blocks win; real text PII findings still prohibit conditional remote pixels.
+Successful extraction with no text uses `[Image: no text extracted]`, not a clean
+PII claim: such images require an approved local reroute or unchecked local path;
+text-only handling blocks them. Failed extraction or detection remains fatal.
+
+V3 retains the old maps and adds `image_models` (explicit image support plus
+concrete locality proof) and `image_reroutes` (`source -> route_class -> local
+image destination`). Unchecked forwarding requires `image_models[source] == true`;
+a face reroute requires its exact binding, with no fallback. Bindings do not grant
+permissions: Gateway still authorizes each target. V1/v2 reject these new maps,
+and older consumers must not receive v3 metadata. MCP remains v1 and explicit
+passthrough is unchanged.
+
+The existing PII Engine Notice/table reports FACE counts without claiming masking.
+Face-only requests do not enable text scanning, guard injection or response
+reversal, and omit `x-presidio-code` rather than claim clean text with `P00`.
+Normal JSON/SSE notice placement and structured-output/MCP suppression remain.
+Blocks stay HTTP 403 with a short `error.message`, a table when suitable and a
+bounded `pii_report`; blocked FACE rows describe `block`, never forwarded pixels.
+The pinned LibreChat error display is plain text and may truncate this message,
+so it cannot reliably display the full Markdown table. This is not hidden by
+returning a fake HTTP 200, and a zero face count never proves text PII is absent.
+
+### Stateless MCP
 
 All gateway MCP traffic is stateless. At the trusted request-header stage,
 any `Mcp-Session-Id` header (including empty or duplicate headers, regardless of

@@ -121,6 +121,7 @@ class StreamHandler:
         self.mcp_context: McpMessageContext | None = None
         self.request_nonce: bytes | None = None
         self.response_processing_enabled = True
+        self.text_pii_enabled = True
         self._dispatch_outcomes: set[str] = set()
 
     def clear_sensitive_state(self) -> None:
@@ -284,8 +285,16 @@ class StreamHandler:
         if request.request_headers.end_of_stream:
             self.request_processed = True
             return immediate_response(400, '{"error":"request body required"}')
-        disable_response = isinstance(policy, ModelDestinationPolicy) and not any(
-            policy.models.values()
+        disable_response = isinstance(policy, ModelDestinationPolicy) and not (
+            any(policy.models.values())
+            or (
+                policy.contract_version == 3
+                and any(
+                    policy.attachment_modes.get(model) in {"extract", "process"}
+                    and policy.protects_faces(model)
+                    for model in policy.models
+                )
+            )
         )
         return _request_headers_response(removed, disable_response=disable_response)
 

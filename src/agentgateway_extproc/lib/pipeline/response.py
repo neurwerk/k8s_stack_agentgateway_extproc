@@ -120,6 +120,8 @@ def _reverse_complete(
     allow_invalid: bool = False,
 ) -> str:
     """Reverse placeholders in one complete semantic string."""
+    if not handler.text_pii_enabled:
+        return value
     rewriter = PlaceholderStreamRewriter(
         handler.reversal_map,
         mark_invalid=allow_invalid,
@@ -227,6 +229,8 @@ def _is_function_arguments_path(
 
 def _reverse_nested_json(handler: StreamHandler, value: str) -> str:
     """Reverse semantic values in a complete JSON-encoded protocol string."""
+    if not handler.text_pii_enabled:
+        return value
     guarded = strip_guard_instruction(value) if handler.guard_injected else value
     if guarded == value and not RESERVED_PLACEHOLDER_PREFIX_RE.search(value):
         return value
@@ -268,7 +272,8 @@ def process_json_response(handler: StreamHandler, text: str) -> str:
         )
     if not handler.response_structured_json:
         _reverse_human_json_text(handler, payload)
-    payload = _reverse_json_values(handler, payload)
+    if handler.text_pii_enabled:
+        payload = _reverse_json_values(handler, payload)
     notice = _render_handler_notice(handler)
     transformed_target = _json_notice_target(handler, payload)
     if notice and transformed_target is not None:
@@ -423,6 +428,8 @@ def _render_handler_notice(handler: StreamHandler) -> str:
             handler.restored_counts,
             decision=stats.decision,
             route_class=stats.route_class,
+            visual_findings=stats.visual_findings,
+            text_pii_enabled=handler.text_pii_enabled,
         )
     return render_notice(handler.notice_messages, report)
 
@@ -491,6 +498,8 @@ class SseResponseProcessor:
         return "".join(output)
 
     def _reject_event_metadata(self, event: SseEvent) -> None:
+        if not self._handler.text_pii_enabled:
+            return
         for name, value in event.lines:
             if name != "data" and (
                 RESERVED_PLACEHOLDER_PREFIX_RE.search(name)
@@ -506,7 +515,7 @@ class SseResponseProcessor:
         try:
             payload = strict_json_loads(event.data)
         except (ValueError, json.JSONDecodeError):
-            if RESERVED_PLACEHOLDER_PREFIX_RE.search(event.data):
+            if self._handler.text_pii_enabled and RESERVED_PLACEHOLDER_PREFIX_RE.search(event.data):
                 raise InvalidReversalError(
                     "SSE response has unstructured placeholder output"
                 ) from None
@@ -519,9 +528,10 @@ class SseResponseProcessor:
             self._transform_responses(payload)
         else:
             self._transform_chat(payload)
-        validated = _reverse_json_values(self._handler, payload)
-        payload.clear()
-        payload.update(validated)
+        if self._handler.text_pii_enabled:
+            validated = _reverse_json_values(self._handler, payload)
+            payload.clear()
+            payload.update(validated)
         _restore_opaque_chat_reasoning(payload, "delta", opaque_reasoning)
         event.replace_data(_json_dumps(payload))
 
@@ -617,9 +627,10 @@ class SseResponseProcessor:
             self._select_responses_snapshot_target(payload)
             if not self._handler.response_structured_json:
                 self._reverse_responses_event_text(payload)
-            transformed = _reverse_json_values(self._handler, payload)
-            payload.clear()
-            payload.update(transformed)
+            if self._handler.text_pii_enabled:
+                transformed = _reverse_json_values(self._handler, payload)
+                payload.clear()
+                payload.update(transformed)
 
     def _select_responses_snapshot_target(self, payload: dict[str, Any]) -> None:
         if self._responses_coordinates is not None:
@@ -679,6 +690,8 @@ class SseResponseProcessor:
         report_target: bool = False,
         allow_invalid: bool = False,
     ) -> None:
+        if not self._handler.text_pii_enabled:
+            return
         value = payload.get(field)
         if not isinstance(value, str):
             return
@@ -1036,6 +1049,8 @@ def process_response_chunk(
         transformed = handler.sse_processor.feed(chunk, final=end_of_stream)
     elif handler.response_format == "json":
         transformed = process_json_response(handler, chunk)
+    elif not handler.text_pii_enabled:
+        transformed = chunk + (_render_handler_notice(handler) if end_of_stream else "")
     else:
         guarded = chunk
         if handler.guard_injected:

@@ -21,7 +21,12 @@ from typing import cast
 from xml.parsers import expat
 
 from agentgateway_extproc.config.settings import MEBIBYTE, DoclingSettings
-from agentgateway_extproc.lib.image_probe import MAX_IMAGE_BYTES
+from agentgateway_extproc.lib.image_probe import (
+    COUNT_HEADER,
+    MAX_FACES,
+    MAX_IMAGE_BYTES,
+    MAX_SOURCE_BYTES,
+)
 from agentgateway_extproc.models.engine import EngineAttachmentPart
 
 MAX_TEXT = 4_000_000
@@ -76,9 +81,13 @@ class ImageBatch:
 
     protect_faces: bool = True
     images: dict[int, str] = dataclass_field(default_factory=dict)
+    policy_version: int = 2
+    face_count: int = 0
+    scan_status: str = "not_scanned"
+    text_present: dict[int, bool] = dataclass_field(default_factory=dict)
 
 
-def preflight(
+def preflight(  # noqa: C901 - publish scan provenance only after the complete batch passes
     parts: list[EngineAttachmentPart],
     settings: DoclingSettings,
     images: ImageBatch | None = None,
@@ -113,6 +122,8 @@ def preflight(
             raise DocumentError(413)
         uploads.append(upload)
     _check_preflight(abandoned, deadline)
+    if images is not None:
+        images.scan_status = "complete" if images.protect_faces and images.images else "not_scanned"
     return uploads
 
 
@@ -128,30 +139,43 @@ def _decode_image(
     abandoned: threading.Event | None,
     deadline: float,
 ) -> Upload:
-    if settings.inference_mode not in {"private-vlm", "remote"}:
+    modern = images.policy_version == 3
+    if not modern and settings.inference_mode not in {"private-vlm", "remote"}:
         raise DocumentError(403)
-    limit = min(settings.file_bytes, MAX_IMAGE_BYTES)
-    mime, data = _image_data(part, limit)
+    limit = min(settings.file_bytes, MAX_SOURCE_BYTES if modern else MAX_IMAGE_BYTES)
+    mime, data = _image_data(part, limit, policy_version=images.policy_version)
     _check_preflight(abandoned, deadline)
-    normalized = _normalize_image(data, mime, images.protect_faces)
-    if len(normalized) > limit:
+    normalized, count = _normalize_image(data, mime, images.protect_faces, images.policy_version)
+    if len(normalized) > min(settings.file_bytes, MAX_IMAGE_BYTES):
         raise DocumentError(413)
+    images.face_count += count
     return Upload("image.png", "img", normalized, pages=1, source_bytes=len(data))
 
 
-def _image_data(part: EngineAttachmentPart, limit: int) -> tuple[str, bytes]:
+def _image_data(
+    part: EngineAttachmentPart, limit: int, *, policy_version: int = 2
+) -> tuple[str, bytes]:
     value = part.model_dump()
-    if set(value) != {"type", "image_url"}:
-        raise DocumentError(400)
-    url = value["image_url"]
+    url_key = "image_url"
     if part.type == "image_url":
-        if not isinstance(url, dict) or set(url) != {"url"}:
+        if set(value) != {"type", "image_url"} or not isinstance(value["image_url"], dict):
             raise DocumentError(400)
-        url = url["url"]
-    if not isinstance(url, str):
+        value, url_key = value["image_url"], "url"
+    else:
+        value.pop("type")
+    # Caller detail is only a rendering hint, never a normalization/OCR setting.
+    if policy_version == 3 and value.pop("detail", "auto") not in ("auto", "low", "high"):
         raise DocumentError(400)
-    match = re.fullmatch(r"data:image/(jpeg|png);base64,([A-Za-z0-9+/]*={0,2})", url)
-    if match is None:
+    url = value.get(url_key)
+    if set(value) != {url_key} or not isinstance(url, str):
+        raise DocumentError(400)
+    match = re.fullmatch(r"data:image/([a-z-]+);base64,([A-Za-z0-9+/]*={0,2})", url)
+    allowed = (
+        {"jpeg", "png", "heic", "heif", "x-heic", "x-heif"}
+        if policy_version == 3
+        else {"jpeg", "png"}
+    )
+    if match is None or match[1] not in allowed:
         raise DocumentError(400)
     mime, encoded = match.groups()
     if len(encoded) > 4 * ((limit + 2) // 3):
@@ -167,7 +191,9 @@ def _image_data(part: EngineAttachmentPart, limit: int) -> tuple[str, bytes]:
     return cast(str, mime), data
 
 
-def _normalize_image(data: bytes, mime: str, protect_faces: bool) -> bytes:
+def _normalize_image(
+    data: bytes, mime: str, protect_faces: bool, policy_version: int = 2
+) -> tuple[bytes, int]:
     try:
         result = subprocess.run(  # noqa: S603 - fixed executable/module and allowlisted arguments
             [
@@ -176,8 +202,9 @@ def _normalize_image(data: bytes, mime: str, protect_faces: bool) -> bytes:
                 "-B",
                 "-m",
                 "agentgateway_extproc.lib.image_probe",
-                "JPEG" if mime == "jpeg" else "PNG",
+                "JPEG" if mime == "jpeg" else "PNG" if mime == "png" else "HEIF",
                 "detect" if protect_faces else "skip",
+                *(["3"] if policy_version == 3 else []),
             ],
             input=data,
             stdout=subprocess.PIPE,
@@ -194,14 +221,27 @@ def _normalize_image(data: bytes, mime: str, protect_faces: bool) -> bytes:
         raise DocumentError(413)
     if result.returncode == 3:
         raise DocumentError
-    if result.returncode or result.stdout[:1] not in {b"\x00", b"\x01"}:
+    if result.returncode:
         raise DocumentError(400)
-    if result.stdout[:1] == b"\x01":
+    if policy_version == 3:
+        count = int.from_bytes(result.stdout[4:6], "big")
+        valid = (
+            result.stdout.startswith(COUNT_HEADER)
+            and len(result.stdout) >= 6
+            and count <= MAX_FACES
+            and (protect_faces or count == 0)
+        )
+        normalized = result.stdout[6:]
+    else:
+        valid = result.stdout[:1] in {b"\x00", b"\x01"}
+        count, normalized = int.from_bytes(result.stdout[:1], "big"), result.stdout[1:]
+    if not valid:
+        raise DocumentError(503 if policy_version == 3 else 400)
+    if count and policy_version != 3:
         raise DocumentError(403)
-    normalized = result.stdout[1:]
     if not normalized.startswith(b"\x89PNG\r\n\x1a\n") or len(normalized) > MAX_IMAGE_BYTES:
         raise DocumentError(413)
-    return normalized
+    return normalized, count
 
 
 def _check_text(upload: Upload) -> None:
@@ -505,7 +545,9 @@ def _list(value: object) -> list[object]:
     return cast(list[object], value)
 
 
-def project_document(value: object, upload: Upload, page_limit: int) -> tuple[str, int]:
+def project_document(
+    value: object, upload: Upload, page_limit: int, *, allow_empty_image: bool = False
+) -> tuple[str, int]:
     """Project a complete supported tree, never source metadata or raw copies."""
     doc = _object(value)
     if doc.get("schema_name") != "DoclingDocument" or doc.get("version") != "1.10.0":
@@ -536,9 +578,10 @@ def project_document(value: object, upload: Upload, page_limit: int) -> tuple[st
         raise DocumentError(413)
     projection = _Projection(nodes)
     output = "\n".join(projection.walk({"$ref": f"#/{root}"}, 0) for root in ("body", "furniture"))
-    if projection.seen != set(nodes) or not output.strip():
+    empty_image = allow_empty_image and upload.format == "img" and not projection.has_text
+    if projection.seen != set(nodes) or (not output.strip() and not empty_image):
         raise DocumentError
-    output = f"Document: {upload.filename}\n{output}"
+    output = "" if empty_image else f"Document: {upload.filename}\n{output}"
     if len(output) > MAX_TEXT:
         raise DocumentError(413)
     return output, pages
@@ -568,12 +611,14 @@ class _Projection:
         self.seen: set[str] = set()
         self.active: set[str] = set()
         self.text_size = self.edges = self.cells = 0
+        self.has_text = False
 
     def text(self, value: object) -> str:
         """Count only canonical text, not metadata or original copies."""
         if not isinstance(value, str) or "\x00" in value:
             raise DocumentError
         self.text_size += len(value) + 1
+        self.has_text |= bool(value.strip())
         if self.text_size > MAX_TEXT:
             raise DocumentError(413)
         return value

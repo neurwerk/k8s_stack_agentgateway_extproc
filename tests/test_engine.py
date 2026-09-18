@@ -14,7 +14,7 @@ from pydantic import ValidationError
 
 from agentgateway_extproc.config.settings import EngineSettings
 from agentgateway_extproc.lib.engine.client import EngineClient
-from agentgateway_extproc.models.engine import EngineChatRequest
+from agentgateway_extproc.models.engine import EngineChatRequest, VisualFindings
 from agentgateway_extproc.models.exceptions import (
     ENGINE_ERROR_CONTRACT,
     MAX_ENGINE_ERROR_MESSAGE_LENGTH,
@@ -117,6 +117,89 @@ async def test_engine_client_posts_typed_request(engine_client: EngineClient) ->
         "a" * 64,
     )
     assert next(iter(result.reversal.values())) == "Jane Doe"
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "valid",
+        "missing-echo",
+        "wrong-count",
+        "fake-clean",
+        "row-count",
+        "face-mask",
+        "text-scan",
+        "text-mutation",
+        "unscanned-success",
+        "empty-text-scan",
+        "cached",
+        "legacy-echo",
+    ],
+)
+async def test_document_findings_require_exact_fresh_echo_and_honest_text_scan(engine_reply, case):
+    request = EngineChatRequest(model="test", messages=[{"role": "user", "content": "image text"}])
+    findings = VisualFindings.model_validate({"faces": {"scan_status": "complete", "count": 3}})
+    engine_reply.update(
+        request=request.model_dump(exclude_none=True),
+        decision="apply_actions",
+        entities=["FACE"],
+        entity_counts={"FACE": 3},
+        applied_actions=["text-only"],
+        reversal={},
+        notices={"request": [], "response": []},
+        visual_findings=findings.model_dump(),
+        report={
+            "rows": [
+                {
+                    "entity_type": "FACE",
+                    "action": "text-only",
+                    "detected_count": 3,
+                    "transformed_count": 0,
+                    "unique_transformed_count": 0,
+                }
+            ]
+        },
+    )
+    engine_reply["analysis"].update(scan_performed=False, duration_ms=None)
+    if case == "missing-echo":
+        del engine_reply["visual_findings"]
+    elif case == "wrong-count":
+        engine_reply["visual_findings"]["faces"]["count"] = 2
+    elif case == "fake-clean":
+        engine_reply.update(
+            decision="pass", entities=[], entity_counts={}, applied_actions=[], report={"rows": []}
+        )
+    elif case == "row-count":
+        engine_reply["report"]["rows"][0]["detected_count"] = 2
+    elif case == "face-mask":
+        engine_reply["report"]["rows"][0].update(
+            action="mask", transformed_count=1, unique_transformed_count=1
+        )
+    elif case in {"text-scan", "empty-text-scan"}:
+        engine_reply["analysis"].update(
+            scan_performed=True,
+            duration_ms=1,
+            text_leaf_count=0 if case == "empty-text-scan" else 1,
+        )
+    elif case == "text-mutation":
+        engine_reply["request"]["messages"][0]["content"] = "silently changed"
+    elif case == "cached":
+        engine_reply["analysis"]["cached_decision_applied"] = True
+    client = _client_returning(200, json.dumps(engine_reply).encode())
+    if case == "valid":
+        reply = await client.analyze_request(
+            request, "a" * 64, document=True, text_pii_enabled=False, visual_findings=findings
+        )
+        assert reply.report.rows[0].action == "text-only"
+        return
+    with pytest.raises(InvalidEngineReplyError):
+        await client.analyze_request(
+            request,
+            "a" * 64,
+            document=True,
+            text_pii_enabled=case in {"unscanned-success", "empty-text-scan", "legacy-echo"},
+            visual_findings=None if case == "legacy-echo" else findings,
+        )
 
 
 @pytest.mark.parametrize(("code", "status", "message", "retryable"), ERROR_CASES)

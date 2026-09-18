@@ -20,6 +20,8 @@ from agentgateway_extproc.lib.documents import MAX_TEXT, DocumentError, ImageBat
 from agentgateway_extproc.lib.engine.client import EngineClient
 from agentgateway_extproc.lib.json_limits import JsonBudgetError
 from agentgateway_extproc.lib.masking.reversal import placeholder_entity_prefixes
+from agentgateway_extproc.lib.notice.inject import render_notice
+from agentgateway_extproc.lib.notice.report import render_report
 from agentgateway_extproc.lib.pipeline.guard import inject_guard_instruction
 from agentgateway_extproc.lib.pipeline.mcp import (
     McpProtocolError,
@@ -27,6 +29,7 @@ from agentgateway_extproc.lib.pipeline.mcp import (
     strict_json_loads,
 )
 from agentgateway_extproc.lib.session import make_session_key
+from agentgateway_extproc.models.destination import ModelDestinationPolicy
 from agentgateway_extproc.models.engine import (
     ENGINE_REQUEST_ADAPTER,
     EngineAttachmentPart,
@@ -37,6 +40,7 @@ from agentgateway_extproc.models.engine import (
     EngineRequest,
     EngineResponseMessage,
     EngineResponsesRequest,
+    VisualFindings,
 )
 from agentgateway_extproc.models.exceptions import InvalidEngineReplyError
 from agentgateway_extproc.models.types import (
@@ -86,6 +90,8 @@ async def process_request(
     converted = False
     image_locations: dict[tuple[int, int], str] = {}
     image_forwarding = "none"
+    images: ImageBatch | None = None
+    visual_findings: VisualFindings | None = None
     if policy.destination_kind == "mcp":
         handler.response_api_kind = "mcp"
         if handler.mcp_headers is None:
@@ -151,12 +157,13 @@ async def process_request(
             return immediate_response(400, '{"error":"invalid model request"}')
         if request.model not in policy.models:
             return immediate_response(400, '{"error":"unknown model"}')
+        handler.text_pii_enabled = policy.models[request.model]
         attachments = _model_attachments(request)
         attachment_mode = policy.attachment_modes.get(request.model, "block")
         image_forwarding = policy.image_forwarding.get(request.model, "none")
         if attachments and attachment_mode != "passthrough":
             allowed = {"file", "input_file"}
-            if policy.contract_version == 2:
+            if policy.contract_version >= 2:
                 allowed |= {"image_url", "input_image"}
             if attachment_mode not in {"extract", "process"} or any(
                 part.type not in allowed for part in attachments
@@ -175,10 +182,13 @@ async def process_request(
                     raise DocumentError(400)  # noqa: TRY301
                 if any(part.type == expected_image for part in attachments):
                     images = ImageBatch(
-                        protect_faces=image_forwarding != "none"
-                        and policy.protects_faces(request.model)
+                        protect_faces=(policy.contract_version == 3 or image_forwarding != "none")
+                        and policy.protects_faces(request.model),
+                        policy_version=policy.contract_version,
                     )
                     texts = await handler.docling.convert(attachments, images=images)
+                    if policy.contract_version == 3:
+                        visual_findings = _visual_findings(attachments, images)
                     if image_forwarding != "none":
                         image_locations = _image_locations(payload, images)
                 else:
@@ -196,7 +206,12 @@ async def process_request(
             handler.request_body_chunks.clear()
             attachments.clear()
             payload = None
-        if not policy.models[request.model]:
+        if not handler.text_pii_enabled and not (images and images.protect_faces):
+            if images is not None and policy.contract_version == 3:
+                try:
+                    _v3_image_output(policy, request.model, images, None)
+                except DocumentError:
+                    return _image_policy_block(handler)
             if image_locations:
                 data = cast(dict[str, object], strict_json_loads(body.decode()))
                 try:
@@ -227,13 +242,24 @@ async def process_request(
         handler.record_dispatch("model_analyzed")
     if converted:
         _clear_request(handler)
-        reply = await client.analyze_request(request, session_key, document=True)
+        if visual_findings is not None:
+            reply = await client.analyze_request(
+                request,
+                session_key,
+                document=True,
+                text_pii_enabled=handler.text_pii_enabled,
+                visual_findings=visual_findings,
+            )
+        else:
+            reply = await client.analyze_request(request, session_key, document=True)
     else:
         reply = await client.analyze_request(request, session_key)
     _validate_request_mutation(request, reply)
-    _validate_reversal(request, reply)
+    if handler.text_pii_enabled:
+        _validate_reversal(request, reply)
     if (
         image_locations
+        and visual_findings is None
         and image_forwarding == "if-no-pii-detected"
         and (
             reply.decision != "pass"
@@ -272,14 +298,15 @@ async def process_request(
     handler.response_structured_json = structured_response
     handler.presidio_code = (
         _presidio_code(reply)
-        if isinstance(request, EngineChatRequest | EngineResponsesRequest)
+        if handler.text_pii_enabled
+        and isinstance(request, EngineChatRequest | EngineResponsesRequest)
         else None
     )
     handler.notice_messages = [] if is_mcp else reply.notices.response
     handler.reversal_map.update(reply.reversal)
     handler.reversal_entity_prefixes = placeholder_entity_prefixes(handler.reversal_map)
     handler.request_stats = RequestStats(
-        reply.report, reply.analysis, reply.decision, reply.route_class
+        reply.report, reply.analysis, reply.decision, reply.route_class, reply.visual_findings
     )
     if reply.decision == "block" or reply.request is None:
         handler.record_dispatch("policy_block")
@@ -303,6 +330,8 @@ async def process_request(
                 separators=(",", ":"),
             )
             return immediate_response(200, body)
+        if visual_findings is not None:
+            return _image_policy_block(handler)
         return immediate_response(
             403,
             json.dumps(
@@ -313,8 +342,19 @@ async def process_request(
                 }
             ),
         )
+    if (
+        images is not None
+        and isinstance(policy, ModelDestinationPolicy)
+        and isinstance(request, EngineChatRequest | EngineResponsesRequest)
+        and policy.contract_version == 3
+    ):
+        try:
+            if not _v3_image_output(policy, request.model, images, reply):
+                image_locations.clear()
+        except DocumentError:
+            return _image_policy_block(handler)
     transformed = reply.request
-    if isinstance(request, EngineChatRequest | EngineResponsesRequest):
+    if handler.text_pii_enabled and isinstance(request, EngineChatRequest | EngineResponsesRequest):
         transformed = inject_guard_instruction(
             cast(EngineChatRequest | EngineResponsesRequest, transformed)
         )
@@ -327,13 +367,15 @@ async def process_request(
         for message in _dict_list(serialized.get("messages")):
             if message.get("tool_calls") == []:
                 del message["tool_calls"]
-        _restore_opaque_chat_reasoning(serialized, opaque_reasoning, offset=1)
+        _restore_opaque_chat_reasoning(
+            serialized, opaque_reasoning, offset=int(handler.guard_injected)
+        )
     if image_locations:
         try:
             _restore_images(
                 serialized,
                 image_locations,
-                offset=1 if isinstance(request, EngineChatRequest) else 0,
+                offset=int(handler.guard_injected and isinstance(request, EngineChatRequest)),
             )
         except DocumentError as exc:
             return immediate_response(exc.status, json.dumps({"error": exc.message}))
@@ -354,6 +396,125 @@ async def process_request(
         if reply.entities:
             headers["x-pii-entities"] = ",".join(reply.entities)
     return request_mutation(mutated, headers, converted or mutated != body)
+
+
+def _visual_findings(attachments: list[EngineAttachmentPart], images: ImageBatch) -> VisualFindings:
+    """Require complete local facts before calling central visual policy."""
+    expected = {
+        index for index, part in enumerate(attachments) if part.type in {"image_url", "input_image"}
+    }
+    if (
+        images.images.keys() != expected
+        or images.text_present.keys() != expected
+        or any(type(present) is not bool for present in images.text_present.values())
+        or images.scan_status != ("complete" if images.protect_faces else "not_scanned")
+        or (not images.protect_faces and images.face_count != 0)
+    ):
+        raise DocumentError
+    return VisualFindings.model_validate(
+        {
+            "faces": {
+                "scan_status": images.scan_status,
+                "count": images.face_count if images.scan_status == "complete" else None,
+            }
+        },
+        strict=True,
+    )
+
+
+def _v3_image_output(
+    policy: ModelDestinationPolicy, model: str, images: ImageBatch, reply: EngineReply | None
+) -> bool:
+    """Allow pixels only under the selected output gate, never by a routing guess."""
+    forwarding = policy.image_forwarding.get(model, "none")
+    has_text = all(images.text_present.values())
+    face_action = (
+        next((row.action for row in reply.report.rows if row.entity_type == "FACE"), None)
+        if reply is not None
+        else None
+    )
+    if face_action == "text-only":
+        if not has_text:
+            raise DocumentError(403)
+        return False
+    if face_action == "reroute":
+        # Gateway still selects and authorizes the bound backend; do not replace the model ID.
+        if (
+            forwarding == "none"
+            or reply is None
+            or reply.decision != "reroute"
+            or not policy.image_reroutes.get(model, {}).get(reply.route_class or "")
+        ):
+            raise DocumentError(403)
+        return True
+    if forwarding == "none":
+        if not has_text:
+            raise DocumentError(403)
+        return False
+    if forwarding == "pii-unchecked":
+        if not policy.image_models.get(model, False) or (
+            reply is not None and reply.decision not in {"pass", "apply_actions"}
+        ):
+            raise DocumentError(403)
+        return True
+    if (
+        not has_text
+        or reply is None
+        or reply.decision != "pass"
+        or reply.entities
+        or reply.report.rows
+        or not reply.analysis.scan_performed
+        or reply.analysis.text_leaf_count < 1
+        or reply.safety_rule is not None
+    ):
+        raise DocumentError(403)
+    return True
+
+
+def _image_policy_block(handler: StreamHandler) -> ext_proc_pb2.ProcessingResponse:
+    """Return a real denial with the same bounded report used on successful responses."""
+    _clear_request(handler)
+    handler.record_dispatch("policy_block")
+    message = DocumentError(403).message
+    payload: dict[str, object] = {}
+    if stats := handler.request_stats:
+        stats.decision = "block"
+        stats.route_class = None
+        stats.report = stats.report.model_copy(deep=True)
+        for row in stats.report.rows:
+            if row.entity_type == "FACE":
+                # FACE counts are never transformed; expose the effective denial, not a reroute.
+                row.action = "block"
+        payload["pii_report"] = {
+            **stats.report.model_dump(mode="json"),
+            "decision": "block",
+            "analysis": stats.analysis.model_dump(mode="json"),
+            "visual_findings": (
+                stats.visual_findings.model_dump(mode="json") if stats.visual_findings else None
+            ),
+        }
+        if handler.response_notice_allowed:
+            message += render_notice(
+                [],
+                render_report(
+                    stats.report,
+                    stats.analysis,
+                    {},
+                    decision="block",
+                    route_class=None,
+                    visual_findings=stats.visual_findings,
+                    text_pii_enabled=handler.text_pii_enabled,
+                ),
+            )
+    return immediate_response(
+        403,
+        json.dumps(
+            {
+                "error": {"message": message, "type": "policy_error", "code": "policy_blocked"},
+                **payload,
+            }
+        ),
+    )
 
 
 def _converted_request(
@@ -640,7 +801,9 @@ def _presidio_code(reply: EngineReply) -> str:
     """Classify a successful analyzed model request into one stable response code."""
     if reply.decision == "reroute":
         return PRESIDIO_REROUTED
-    if reply.decision == "apply_actions":
+    if reply.decision == "apply_actions" and any(
+        row.transformed_count for row in reply.report.rows
+    ):
         return PRESIDIO_PII_TRANSFORMED
     if reply.entities:
         return PRESIDIO_PII_DETECTED
