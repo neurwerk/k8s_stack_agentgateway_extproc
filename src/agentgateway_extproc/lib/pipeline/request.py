@@ -67,6 +67,10 @@ _MAX_VALIDATION_ERROR_COUNT = 100
 _logger = logging.getLogger(__name__)
 
 
+class _NoImageTextError(DocumentError):
+    """Distinguish an empty text-only face result from a privacy-policy denial."""
+
+
 async def process_request(
     handler: StreamHandler, client: EngineClient
 ) -> ext_proc_pb2.ProcessingResponse:
@@ -351,8 +355,8 @@ async def process_request(
         try:
             if not _v3_image_output(policy, request.model, images, reply):
                 image_locations.clear()
-        except DocumentError:
-            return _image_policy_block(handler)
+        except DocumentError as exc:
+            return _image_policy_block(handler, no_readable_text=isinstance(exc, _NoImageTextError))
     transformed = reply.request
     if handler.text_pii_enabled and isinstance(request, EngineChatRequest | EngineResponsesRequest):
         transformed = inject_guard_instruction(
@@ -435,7 +439,7 @@ def _v3_image_output(
     )
     if face_action == "text-only":
         if not has_text:
-            raise DocumentError(403)
+            raise _NoImageTextError(403)
         return False
     if face_action == "reroute":
         # Gateway still selects and authorizes the bound backend; do not replace the model ID.
@@ -471,21 +475,28 @@ def _v3_image_output(
     return True
 
 
-def _image_policy_block(handler: StreamHandler) -> ext_proc_pb2.ProcessingResponse:
-    """Return a real denial with the same bounded report used on successful responses."""
+def _image_policy_block(
+    handler: StreamHandler, *, no_readable_text: bool = False
+) -> ext_proc_pb2.ProcessingResponse:
+    """Keep the empty-text explanation short and retain its policy facts separately."""
     _clear_request(handler)
     handler.record_dispatch("policy_block")
-    message = DocumentError(403).message
+    message = (
+        "No readable text was found in an attached image. "
+        "This chat can read writing in pictures, but cannot describe photos."
+        if no_readable_text
+        else DocumentError(403).message
+    )
     payload: dict[str, object] = {}
     if stats := handler.request_stats:
         stats.decision = "block"
         stats.route_class = None
         stats.report = stats.report.model_copy(deep=True)
         for row in stats.report.rows:
-            if row.entity_type == "FACE":
+            if row.entity_type == "FACE" and not no_readable_text:
                 # FACE counts are never transformed; expose the effective denial, not a reroute.
                 row.action = "block"
-        payload["pii_report"] = {
+        report: dict[str, object] = {
             **stats.report.model_dump(mode="json"),
             "decision": "block",
             "analysis": stats.analysis.model_dump(mode="json"),
@@ -493,7 +504,10 @@ def _image_policy_block(handler: StreamHandler) -> ext_proc_pb2.ProcessingRespon
                 stats.visual_findings.model_dump(mode="json") if stats.visual_findings else None
             ),
         }
-        if handler.response_notice_allowed:
+        payload["pii_report"] = report
+        if no_readable_text:
+            report["reason"] = "no_readable_text"
+        elif handler.response_notice_allowed:
             message += render_notice(
                 [],
                 render_report(
@@ -510,7 +524,11 @@ def _image_policy_block(handler: StreamHandler) -> ext_proc_pb2.ProcessingRespon
         403,
         json.dumps(
             {
-                "error": {"message": message, "type": "policy_error", "code": "policy_blocked"},
+                "error": {
+                    "message": message,
+                    "type": "policy_error",
+                    "code": "image_text_unavailable" if no_readable_text else "policy_blocked",
+                },
                 **payload,
             }
         ),
