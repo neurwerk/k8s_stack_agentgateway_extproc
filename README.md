@@ -126,9 +126,9 @@ worker resource limits. PII-disabled extracted text is not PII-sanitized.
 
 ### Private Images
 
-Published `0.9.0` supports version-two private image processing. Version three
-below is staged source work, not a release or activation: compatible extProc,
-PII Engine and Base must precede v3 metadata. Publication, verified image pinning
+Version `0.10.0` adds version-three face policy and CPU/HEIC image processing.
+Compatible extProc, PII Engine and Base must precede v3 metadata.
+Publication, verified image pinning
 and activation remain separate approvals; v1/v2 defaults and behavior are preserved.
 
 #### Version Two
@@ -204,7 +204,7 @@ Detection and OCR can miss content: these checks reduce risk, not prove that an
 image contains no personal information. A real-model blank-image smoke test proves
 load/inference only, not detection quality on every kind of photograph.
 
-#### Version Three (Staged)
+#### Version Three (0.10.0)
 
 V3 accepts inline still JPEG, PNG and iPhone HEIC/HEIF images. Docling may use
 `internal-standard` CPU OCR or the qualified `private-vlm` reader. CPU YuNet scans
