@@ -553,7 +553,7 @@ async def test_image_dispatch(engine_reply, api, case):  # noqa: C901
         ("wrong-binding", "reroute", "if-no-pii-detected", True, True, 403),
         ("reroute-none", "reroute", "none", False, True, 403),
         ("text-block", "reroute", "if-no-pii-detected", True, True, 403),
-        ("text-only-no-text", "text-only", "if-no-pii-detected", True, False, 403),
+        ("text-only-no-text", "text-only", "none", True, False, 403),
         ("none-no-text", None, "none", False, False, 403),
         ("external-no-text", None, "if-no-pii-detected", True, False, 403),
         ("text-pii", None, "if-no-pii-detected", True, True, 403),
@@ -732,15 +732,31 @@ async def test_v3_image_dispatch(  # noqa: C901
         blocked = replies[-1].immediate_response
         assert blocked.status.code == 403
         error = json.loads(blocked.body)
-        assert error["error"]["message"].startswith("image withheld")
-        assert ("PII Engine Notice" in error["error"]["message"]) is not structured
+        no_text = case == "text-only-no-text"
+        if no_text:
+            assert error["error"] == {
+                "message": "No readable text was found in an attached image. "
+                "This chat can read writing in pictures, but cannot describe photos.",
+                "type": "policy_error",
+                "code": "image_text_unavailable",
+            }
+            assert error["pii_report"]["reason"] == "no_readable_text"
+            assert error["pii_report"]["visual_findings"] == {"faces": faces}
+            assert not any(reply.HasField("request_body") for reply in replies)
+        else:
+            assert error["error"]["message"].startswith("image withheld")
+            assert error["error"]["code"] == "policy_blocked"
+            assert "reason" not in error["pii_report"]
+        assert ("PII Engine Notice" in error["error"]["message"]) is (
+            not structured and not no_text
+        )
         assert error["pii_report"]["decision"] == "block"
         face_rows = [row for row in error["pii_report"]["rows"] if row["entity_type"] == "FACE"]
         assert face_rows == (
             [
                 {
                     "entity_type": "FACE",
-                    "action": "block",
+                    "action": "text-only" if no_text else "block",
                     "detected_count": 3,
                     "transformed_count": 0,
                     "unique_transformed_count": 0,
@@ -749,7 +765,7 @@ async def test_v3_image_dispatch(  # noqa: C901
             if face_action
             else []
         )
-        if face_action and not structured:
+        if face_action and not structured and not no_text:
             assert "| Face | `block`: 3 detected; images blocked |" in error["error"]["message"]
         assert "forwarded to" not in blocked.body and "forwarded without" not in blocked.body
         assert "Effective route" not in blocked.body
