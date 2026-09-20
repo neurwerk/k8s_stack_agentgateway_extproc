@@ -243,7 +243,7 @@ Face-only requests do not enable text scanning, guard injection or response
 reversal, and omit `x-presidio-code` rather than claim clean text with `P00`.
 Normal JSON/SSE notice placement and structured-output/MCP suppression remain.
 Blocks stay HTTP 403 with a short `error.message`, a table when suitable and a
-bounded `pii_report`. The unreleased no-text correction changes only this case:
+bounded `pii_report`. The `0.10.1` no-text correction changes only this case:
 when face policy selects `text-only` but an image has no
 readable text, the 403 instead uses code `image_text_unavailable` and a short
 plain-language message without the Markdown table. Its structured report retains
