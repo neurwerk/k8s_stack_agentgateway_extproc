@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import signal
 from typing import cast
 
 import grpc
@@ -39,12 +40,22 @@ async def _run(settings: Settings) -> None:
     server.add_insecure_port("[::]:9000")
     await server.start()
     http_server = uvicorn.Server(uvicorn.Config(create_http_app(client), host="0.0.0.0", port=8000))
+    # Uvicorn re-raises captured signals after its HTTP shutdown. Keep those
+    # signals graceful until the gRPC drain and client cleanup have completed.
+    handlers = {
+        sig: signal.signal(sig, lambda *_: setattr(http_server, "should_exit", True))
+        for sig in (signal.SIGTERM, signal.SIGINT)
+    }
     try:
         await http_server.serve()
     finally:
-        await server.stop(grace=settings.shutdown_grace_seconds)
-        await docling.close()
-        await client.close()
+        try:
+            await server.stop(grace=settings.shutdown_grace_seconds)
+            await docling.close()
+            await client.close()
+        finally:
+            for sig, handler in handlers.items():
+                signal.signal(sig, handler)
 
 
 def create_grpc_server(
