@@ -36,7 +36,8 @@ def test_transport_limit_defaults_are_exact() -> None:
         ("max_request_bytes", MAX_UPLOAD_REQUEST_BYTES),
         ("max_response_bytes", MAX_RESPONSE_BYTES),
         ("max_transformed_request_bytes", MAX_RESPONSE_BYTES),
-        ("grpc_maximum_concurrent_rpcs", 16),
+        ("grpc_maximum_concurrent_rpcs", 128),
+        ("shutdown_grace_seconds", 1200),
     ],
 )
 def test_top_level_limits_accept_the_boundary_and_reject_larger(field: str, maximum: int) -> None:

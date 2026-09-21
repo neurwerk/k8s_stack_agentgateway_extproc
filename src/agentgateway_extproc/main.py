@@ -42,7 +42,7 @@ async def _run(settings: Settings) -> None:
     try:
         await http_server.serve()
     finally:
-        await server.stop(grace=1)
+        await server.stop(grace=settings.shutdown_grace_seconds)
         await docling.close()
         await client.close()
 
@@ -55,7 +55,9 @@ def create_grpc_server(
         grpc.aio.Server,
         grpc.aio.server(
             options=[("grpc.max_receive_message_length", settings.grpc_max_receive_message_bytes)],
-            maximum_concurrent_rpcs=settings.grpc_maximum_concurrent_rpcs,
+            # Reserve transport headroom so application admission can return a
+            # retryable HTTP response rather than a bare gRPC RESOURCE_EXHAUSTED.
+            maximum_concurrent_rpcs=2 * settings.grpc_maximum_concurrent_rpcs,
         ),
     )
     ext_proc_pb2_grpc.add_ExternalProcessorServicer_to_server(
