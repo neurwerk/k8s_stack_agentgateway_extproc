@@ -430,6 +430,7 @@ def _render_handler_notice(handler: StreamHandler) -> str:
             route_class=stats.route_class,
             visual_findings=stats.visual_findings,
             text_pii_enabled=handler.text_pii_enabled,
+            images_forwarded=stats.images_forwarded,
         )
     return render_notice(handler.notice_messages, report)
 

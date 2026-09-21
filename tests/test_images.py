@@ -534,7 +534,8 @@ async def test_image_dispatch(engine_reply, api, case):  # noqa: C901
                 assert native_calls and not engine_calls
                 assert result.immediate_response.status.code == 503
             if case in {"pass-pii", "mask-pii", "face", "block"}:
-                assert "text only" in result.immediate_response.body
+                assert "neurwerk:" in result.immediate_response.body
+                assert "retry" not in result.immediate_response.body
         await docling.close()
 
 
@@ -561,6 +562,17 @@ async def test_image_dispatch(engine_reply, api, case):  # noqa: C901
         ("bypass-no-text", None, "pii-unchecked", False, False, 200),
         ("structured-success", "text-only", "none", False, True, 200),
         ("structured-block", "block", "none", False, True, 403),
+        ("policy-pass", None, "if-policy-allows", True, True, 200),
+        ("policy-mask", None, "if-policy-allows", True, True, 200),
+        ("policy-replace", None, "if-policy-allows", True, True, 200),
+        ("policy-structured-replace", None, "if-policy-allows", True, True, 200),
+        ("policy-text-reroute", None, "if-policy-allows", True, True, 200),
+        ("policy-face-replace", "reroute", "if-policy-allows", True, True, 200),
+        ("policy-face-text-only", "text-only", "if-policy-allows", True, True, 200),
+        ("policy-face-block", "block", "if-policy-allows", True, True, 403),
+        ("policy-no-text", None, "if-policy-allows", True, False, 403),
+        ("policy-face-no-text", "text-only", "if-policy-allows", True, False, 403),
+        ("policy-face-reroute-no-text", "reroute", "if-policy-allows", True, False, 200),
     ],
 )
 async def test_v3_image_dispatch(  # noqa: C901
@@ -568,7 +580,21 @@ async def test_v3_image_dispatch(  # noqa: C901
 ):
     unchecked = forwarding == "pii-unchecked"
     bypass = unchecked and not pii
-    structured = case.startswith("structured")
+    structured = "structured" in case
+    text_action = (
+        "reversible_replace"
+        if case.endswith("replace")
+        else "mask"
+        if case == "policy-mask"
+        else "reroute"
+        if case == "policy-text-reroute"
+        else "pass"
+        if case in {"text-pii", "policy-pass"}
+        else "block"
+        if case == "text-block"
+        else None
+    )
+    transformed = text_action in {"mask", "reversible_replace"}
     policy = {
         **MODEL_POLICY,
         "contract_version": 3,
@@ -620,7 +646,7 @@ async def test_v3_image_dispatch(  # noqa: C901
         images.scan_status = faces["scan_status"]
         images.face_count = faces["count"] or 0
         return [
-            "image text",
+            "Jane Doe" if transformed else "image text",
             "document text",
             "image text" if has_text else "[Image: no text extracted]",
         ]
@@ -647,14 +673,14 @@ async def test_v3_image_dispatch(  # noqa: C901
                     "unique_transformed_count": 0,
                 }
             )
-        if case in {"text-block", "text-pii"}:
+        if text_action:
             rows.append(
                 {
                     "entity_type": "PERSON",
-                    "action": "block" if case == "text-block" else "pass",
+                    "action": text_action,
                     "detected_count": 1,
-                    "transformed_count": 0,
-                    "unique_transformed_count": 0,
+                    "transformed_count": int(transformed),
+                    "unique_transformed_count": int(transformed),
                 }
             )
         decision = (
@@ -662,14 +688,19 @@ async def test_v3_image_dispatch(  # noqa: C901
             if case == "text-block" or face_action == "block"
             else (
                 "reroute"
-                if face_action == "reroute"
+                if face_action == "reroute" or text_action == "reroute"
                 else "apply_actions"
-                if face_action
+                if face_action or transformed
                 else "pass"
             )
         )
+        processed = copy.deepcopy(sent["request"])
+        if transformed:
+            processed[field][0]["content"][0]["text"] = (
+                REVERSIBLE_TOKEN if text_action == "reversible_replace" else "***"
+            )
         engine_reply.update(
-            request=None if decision == "block" else sent["request"],
+            request=None if decision == "block" else processed,
             visual_findings=sent["visual_findings"],
             entities=[row["entity_type"] for row in rows],
             entity_counts={row["entity_type"]: row["detected_count"] for row in rows},
@@ -680,7 +711,7 @@ async def test_v3_image_dispatch(  # noqa: C901
             remote_allowed=decision not in {"block", "reroute"},
             route_class="local-faces" if decision == "reroute" else None,
             report={"rows": rows},
-            reversal={},
+            reversal={REVERSIBLE_TOKEN: "Jane Doe"} if text_action == "reversible_replace" else {},
             notices={"request": [], "response": []},
         )
         engine_reply["analysis"].update(scan_performed=pii, duration_ms=1 if pii else None)
@@ -688,7 +719,9 @@ async def test_v3_image_dispatch(  # noqa: C901
 
     # Exercise both successful carriers without enabling text PII merely to render a report.
     sse = api == "responses"
-    output_text = "answer" if pii else REVERSIBLE_TOKEN
+    output_text = REVERSIBLE_TOKEN if text_action == "reversible_replace" or not pii else "answer"
+    if structured:
+        output_text = json.dumps({"answer": output_text})
     answer = (
         {"choices": [{"index": 0, "message": {"content": output_text}}]}
         if not sse
@@ -732,11 +765,20 @@ async def test_v3_image_dispatch(  # noqa: C901
         blocked = replies[-1].immediate_response
         assert blocked.status.code == 403
         error = json.loads(blocked.body)
-        no_text = case == "text-only-no-text"
+        no_text = not has_text
         if no_text:
+            expected_message = (
+                "neurwerk: faces detected; configured policy permits sending only extracted text. "
+                "No text was extracted from an image."
+                if face_action == "text-only"
+                else "neurwerk: image text extraction only; no text extracted from an image. "
+                "Image forwarding is disabled for this model."
+                if forwarding == "none"
+                else "neurwerk: image forwarding requires extracted text for PII analysis; "
+                "no text extracted from an image."
+            )
             assert error["error"] == {
-                "message": "No readable text was found in an attached image. "
-                "This chat can read writing in pictures, but cannot describe photos.",
+                "message": expected_message,
                 "type": "policy_error",
                 "code": "image_text_unavailable",
             }
@@ -744,9 +786,8 @@ async def test_v3_image_dispatch(  # noqa: C901
             assert error["pii_report"]["visual_findings"] == {"faces": faces}
             assert not any(reply.HasField("request_body") for reply in replies)
         else:
-            assert error["error"]["message"].startswith("image withheld")
-            assert error["error"]["code"] == "policy_blocked"
-            assert "reason" not in error["pii_report"]
+            assert error["error"]["message"].startswith("neurwerk:")
+            assert error["error"]["code"] == error["pii_report"]["reason"]
         assert ("PII Engine Notice" in error["error"]["message"]) is (
             not structured and not no_text
         )
@@ -756,7 +797,7 @@ async def test_v3_image_dispatch(  # noqa: C901
             [
                 {
                     "entity_type": "FACE",
-                    "action": "text-only" if no_text else "block",
+                    "action": face_action,
                     "detected_count": 3,
                     "transformed_count": 0,
                     "unique_transformed_count": 0,
@@ -766,21 +807,51 @@ async def test_v3_image_dispatch(  # noqa: C901
             else []
         )
         if face_action and not structured and not no_text:
-            assert "| Face | `block`: 3 detected; images blocked |" in error["error"]["message"]
+            assert f"| Face | `{face_action}`: 3 detected;" in error["error"]["message"]
+            assert "images blocked" in error["error"]["message"] or (
+                "not forwarded (request blocked)" in error["error"]["message"]
+            )
         assert "forwarded to" not in blocked.body and "forwarded without" not in blocked.body
         assert "Effective route" not in blocked.body
         return
     sent_body = replies[1].request_body.response.body_mutation.body
     sent = json.loads(sent_body)
     content = sent[field][int(pii and api == "chat")]["content"]
-    restores_images = forwarding != "none" and face_action != "text-only"
+    restores_images = (
+        forwarding != "none"
+        and face_action != "text-only"
+        and not transformed
+        and text_action != "reroute"
+    )
     assert sum(part["type"] in {"image_url", "input_image"} for part in content) == (
         2 if restores_images else 0
     )
     if not has_text:
         assert b"[Image: no text extracted]" in sent_body
+    if transformed:
+        assert b"Jane Doe" not in sent_body
+        assert b"base64" not in sent_body
+        assert (REVERSIBLE_TOKEN if text_action == "reversible_replace" else "***") in (
+            content[0]["text"]
+        )
+    if text_action == "reroute" or face_action == "reroute":
+        headers = replies[1].request_body.response.header_mutation.set_headers
+        routed_headers = {item.header.key: item.header.value for item in headers}
+        assert routed_headers["x-remote-allowed"] == "false"
     response = replies[-1].response_body.response.body_mutation.streamed_response.body.decode()
-    assert output_text in response
+    expected_text = (
+        "Jane Doe"
+        if text_action == "reversible_replace"
+        else (REVERSIBLE_TOKEN if not pii else "answer")
+    )
+    assert expected_text in response
+    if text_action == "reversible_replace":
+        assert REVERSIBLE_TOKEN not in response
+    if transformed and not structured:
+        assert "neurwerk: PII policy applied; extracted text forwarded without images." in response
+        if face_action == "reroute":
+            assert "images withheld; extracted text forwarded to approved local model" in response
+            assert "images forwarded" not in response
     if not pii and not bypass:
         headers = next(
             reply.response_headers.response.header_mutation
@@ -792,7 +863,8 @@ async def test_v3_image_dispatch(  # noqa: C901
     assert ("PII Engine Notice" in response) is (not structured and not bypass)
     if face_action and not structured:
         assert f"| Face | `{face_action}`: 3 detected" in response
-        assert "masked" not in response and "restored" not in response
+        if not transformed:
+            assert "masked" not in response and "restored" not in response
     if not pii and not structured and not bypass:
         assert "Text PII analysis was disabled." in response
         assert "PII scan completed" not in response

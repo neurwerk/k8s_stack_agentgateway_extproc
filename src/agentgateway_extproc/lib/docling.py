@@ -59,7 +59,7 @@ class DoclingClient:
     ) -> list[str]:
         """Fail busy immediately and shield admitted work from caller cancellation."""
         if not self.settings.enabled or self._closed or self._poisoned or self._task is not None:
-            raise DocumentError
+            raise DocumentError(reason="extraction_unavailable")
         abandoned = threading.Event()
         self._abandoned = abandoned
         deadline = time.monotonic() + self.settings.timeout
@@ -178,7 +178,7 @@ class DoclingClient:
         client = self._client
         key = self.settings.api_key
         if client is None or key is None:
-            raise DocumentError
+            raise DocumentError(reason="extraction_unavailable")
         files = None
         options = None
         if upload is not None:
@@ -199,10 +199,9 @@ class DoclingClient:
                     follow_redirects=False,
                 ) as response,
             ):
-                if (
-                    not response.is_success
-                    or response.headers.get("content-encoding", "identity") != "identity"
-                ):
+                if not response.is_success:
+                    raise DocumentError(reason="extraction_unavailable")
+                if response.headers.get("content-encoding", "identity") != "identity":
                     raise DocumentError
                 content = bytearray()
                 async for chunk in response.aiter_bytes():
@@ -210,7 +209,11 @@ class DoclingClient:
                         raise DocumentError
                     content.extend(chunk)
                 return strict_json_loads(content.decode("utf-8"))
-        except (TimeoutError, httpx.HTTPError, ValueError):
+        except (TimeoutError, httpx.TimeoutException):
+            raise DocumentError(504) from None
+        except httpx.HTTPError:
+            raise DocumentError(reason="extraction_unavailable") from None
+        except ValueError:
             raise DocumentError from None
 
     def _options(self, source_format: str) -> dict[str, str]:

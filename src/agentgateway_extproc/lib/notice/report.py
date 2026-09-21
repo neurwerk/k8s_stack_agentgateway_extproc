@@ -20,6 +20,7 @@ def render_report(
     route_class: str | None,
     visual_findings: VisualFindings | None = None,
     text_pii_enabled: bool = True,
+    images_forwarded: bool | None = None,
 ) -> str:
     """Render provenance and per-entity counts without including literal PII."""
     lines: list[str] = []
@@ -53,7 +54,12 @@ def render_report(
                 "| Entity | Request | Response |",
                 "| --- | --- | --- |",
                 *[
-                    _render_row(row, restored_counts.get(row.entity_type, 0), decision=decision)
+                    _render_row(
+                        row,
+                        restored_counts.get(row.entity_type, 0),
+                        decision=decision,
+                        images_forwarded=images_forwarded,
+                    )
                     for row in report.rows
                 ],
             ]
@@ -61,18 +67,24 @@ def render_report(
     return "\n".join(lines)
 
 
-def _render_row(row: PIIReportRow, restored_count: int, *, decision: str) -> str:
-    request = _request_cell(row, blocked=decision == "block")
+def _render_row(
+    row: PIIReportRow, restored_count: int, *, decision: str, images_forwarded: bool | None
+) -> str:
+    request = _request_cell(row, blocked=decision == "block", images_forwarded=images_forwarded)
     response = f"{restored_count} restored" if restored_count else "-"
     return f"| {_label(row.entity_type)} | {request} | {response} |"
 
 
-def _request_cell(row: PIIReportRow, *, blocked: bool) -> str:
+def _request_cell(row: PIIReportRow, *, blocked: bool, images_forwarded: bool | None) -> str:
     prefix = f"`{row.action}`: {row.detected_count} detected"
     if blocked and row.action in {"reroute", "text-only"}:
         return f"{prefix}; not forwarded (request blocked)"
     if row.entity_type == "FACE":
         if row.action == "reroute":
+            if images_forwarded is False:
+                return (
+                    f"{prefix}; images withheld; extracted text forwarded to approved local model"
+                )
             return f"{prefix}; images forwarded to approved local model without masking"
         if row.action == "text-only":
             return f"{prefix}; all request images withheld; extracted text only"

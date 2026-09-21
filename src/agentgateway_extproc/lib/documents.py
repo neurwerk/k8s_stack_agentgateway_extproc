@@ -51,17 +51,67 @@ _OFFICE_PARTS = {
 class DocumentError(Exception):
     """Expose only fixed, content-free errors at the caller boundary."""
 
-    def __init__(self, status: int = 503) -> None:
+    def __init__(self, status: int = 503, *, reason: str | None = None) -> None:
         """Select a fixed public error without retaining upstream exception text."""
         self.status = status
-        self.message = {
-            400: "invalid document upload",
-            403: "image withheld by safety policy; retry with text only",
-            413: "document limits exceeded",
-            503: "document conversion unavailable",
-            504: "document conversion deadline exceeded",
-        }[status]
+        self.reason = (
+            reason
+            or {
+                400: "invalid_upload",
+                403: "policy_blocked",
+                413: "processing_limits",
+                503: "extraction_failed",
+                504: "extraction_timeout",
+            }[status]
+        )
+        self.message = (
+            "neurwerk: "
+            + {
+                "invalid_upload": "attachment could not be decoded or validated.",
+                "unsupported_format": (
+                    "attachment format is not supported by the configured processor."
+                ),
+                "attachments_disabled": "attachments are disabled for this model.",
+                "policy_blocked": "request blocked by configured data policy.",
+                "face_policy_blocked": "request blocked by configured face policy.",
+                "processing_limits": "attachment exceeds configured processing limits.",
+                "extraction_unavailable": "text extraction service unavailable.",
+                "extraction_failed": "text extraction could not be completed.",
+                "extraction_timeout": "text extraction timed out.",
+                "image_analysis_failed": "required image safety analysis could not be completed.",
+                "image_processing_unavailable": (
+                    "configured extraction mode does not support images."
+                ),
+                "image_text_unavailable": (
+                    "image text extraction only; no text extracted from an image. "
+                    "Image forwarding is disabled for this model."
+                ),
+                "face_text_unavailable": (
+                    "faces detected; configured policy permits sending only extracted text. "
+                    "No text was extracted from an image."
+                ),
+                "image_analysis_text_unavailable": (
+                    "image forwarding requires extracted text for PII analysis; "
+                    "no text extracted from an image."
+                ),
+                "image_pii_detected": (
+                    "image forwarding requires zero PII detections; PII was detected."
+                ),
+                "image_reroute_unavailable": (
+                    "image rerouting required; no approved image route available."
+                ),
+            }[self.reason]
+        )
         super().__init__(self.message)
+
+    @property
+    def no_text(self) -> bool:
+        """Distinguish successful empty extraction from processing and policy failures."""
+        return self.reason in {
+            "image_text_unavailable",
+            "face_text_unavailable",
+            "image_analysis_text_unavailable",
+        }
 
 
 @dataclass
@@ -141,7 +191,7 @@ def _decode_image(
 ) -> Upload:
     modern = images.policy_version == 3
     if not modern and settings.inference_mode not in {"private-vlm", "remote"}:
-        raise DocumentError(403)
+        raise DocumentError(403, reason="image_processing_unavailable")
     limit = min(settings.file_bytes, MAX_SOURCE_BYTES if modern else MAX_IMAGE_BYTES)
     mime, data = _image_data(part, limit, policy_version=images.policy_version)
     _check_preflight(abandoned, deadline)
@@ -176,7 +226,7 @@ def _image_data(
         else {"jpeg", "png"}
     )
     if match is None or match[1] not in allowed:
-        raise DocumentError(400)
+        raise DocumentError(400, reason="unsupported_format" if match else "invalid_upload")
     mime, encoded = match.groups()
     if len(encoded) > 4 * ((limit + 2) // 3):
         raise DocumentError(413)
@@ -216,11 +266,11 @@ def _normalize_image(
     except subprocess.TimeoutExpired:
         raise DocumentError(413) from None
     except OSError:
-        raise DocumentError from None
+        raise DocumentError(reason="image_analysis_failed") from None
     if result.returncode in {2, -signal.SIGKILL, -signal.SIGXCPU}:
         raise DocumentError(413)
     if result.returncode == 3:
-        raise DocumentError
+        raise DocumentError(reason="image_analysis_failed")
     if result.returncode:
         raise DocumentError(400)
     if policy_version == 3:
@@ -236,9 +286,9 @@ def _normalize_image(
         valid = result.stdout[:1] in {b"\x00", b"\x01"}
         count, normalized = int.from_bytes(result.stdout[:1], "big"), result.stdout[1:]
     if not valid:
-        raise DocumentError(503 if policy_version == 3 else 400)
+        raise DocumentError(503 if policy_version == 3 else 400, reason="image_analysis_failed")
     if count and policy_version != 3:
-        raise DocumentError(403)
+        raise DocumentError(403, reason="face_policy_blocked")
     if not normalized.startswith(b"\x89PNG\r\n\x1a\n") or len(normalized) > MAX_IMAGE_BYTES:
         raise DocumentError(413)
     return normalized, count
@@ -304,7 +354,7 @@ def _decode_upload(part: EngineAttachmentPart, limit: int) -> Upload:
     extension = filename.rsplit(".", 1)[-1].lower()
     mime = _MIMES.get(extension)
     if mime is None or "." not in filename:
-        raise DocumentError(400)
+        raise DocumentError(400, reason="unsupported_format")
     prefix = f"data:{mime};base64,"
     if not isinstance(encoded, str) or not encoded.startswith(prefix):
         raise DocumentError(400)
