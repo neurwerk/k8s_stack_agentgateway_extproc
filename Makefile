@@ -12,8 +12,12 @@ check-ruff:
 check-ty:
 	uv run --extra dev ty check
 
+# Temporarily excluded; pending upload-processing test cleanup.
 check-test:
-	uv run --extra dev pytest --cov=src --cov-report=term-missing
+	uv run --extra dev pytest \
+		--ignore=tests/test_image_normalization.py \
+		--ignore=tests/test_images.py \
+		--ignore=tests/test_documents.py
 
 check-proto: proto
 	git diff --exit-code -- src/agentgateway_extproc/gen

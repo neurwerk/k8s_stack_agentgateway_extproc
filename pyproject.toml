@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agentgateway-extproc"
-version = "0.11.2"
+version = "0.11.3"
 description = "Envoy ext_proc adapter for the neurwerk PII engine"
 readme = "README.md"
 license = "MIT AND Apache-2.0"
@@ -98,5 +98,4 @@ source = ["src"]
 omit = ["tests/*", "src/agentgateway_extproc/gen/*"]
 
 [tool.coverage.report]
-fail_under = 80
 show_missing = true

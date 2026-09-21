@@ -888,7 +888,9 @@ def _reversal_entities(reply: EngineReply) -> dict[str, str]:
 
 
 def _expected_reversal_counts(reply: EngineReply) -> dict[str, int]:
-    """Return required request placeholder occurrences by report entity."""
+    """Return placeholder counts required by current-request analysis."""
+    if reply.analysis.source == "cached_decision":
+        return {}
     return {
         row.entity_type: row.transformed_count
         for row in reply.report.rows
