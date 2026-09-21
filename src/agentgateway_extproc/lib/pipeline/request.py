@@ -18,6 +18,7 @@ from agentgateway_extproc.config.settings import MAX_REQUEST_BYTES
 from agentgateway_extproc.gen import ext_proc_pb2
 from agentgateway_extproc.lib.documents import MAX_TEXT, DocumentError, ImageBatch
 from agentgateway_extproc.lib.engine.client import EngineClient
+from agentgateway_extproc.lib.image_policy import image_output
 from agentgateway_extproc.lib.json_limits import JsonBudgetError
 from agentgateway_extproc.lib.masking.reversal import placeholder_entity_prefixes
 from agentgateway_extproc.lib.notice.inject import render_notice
@@ -42,7 +43,7 @@ from agentgateway_extproc.models.engine import (
     EngineResponsesRequest,
     VisualFindings,
 )
-from agentgateway_extproc.models.exceptions import InvalidEngineReplyError
+from agentgateway_extproc.models.exceptions import EngineUnavailableError, InvalidEngineReplyError
 from agentgateway_extproc.models.types import (
     PRESIDIO_NO_PII,
     PRESIDIO_PII_DETECTED,
@@ -65,10 +66,6 @@ _TEXT_LEAF = object()
 _OPAQUE_REQUEST_REASONING_FIELDS = ("reasoning_content", "reasoning_signature")
 _MAX_VALIDATION_ERROR_COUNT = 100
 _logger = logging.getLogger(__name__)
-
-
-class _NoImageTextError(DocumentError):
-    """Distinguish an empty text-only face result from a privacy-policy denial."""
 
 
 async def process_request(
@@ -169,21 +166,22 @@ async def process_request(
             allowed = {"file", "input_file"}
             if policy.contract_version >= 2:
                 allowed |= {"image_url", "input_image"}
-            if attachment_mode not in {"extract", "process"} or any(
-                part.type not in allowed for part in attachments
-            ):
+            if attachment_mode not in {"extract", "process"}:
                 _clear_request(handler)
                 handler.record_dispatch("policy_block")
-                return immediate_response(403, '{"error":"attachments are not supported"}')
+                error = DocumentError(403, reason="attachments_disabled")
+                return immediate_response(error.status, json.dumps({"error": error.message}))
             try:
+                if any(part.type not in allowed for part in attachments):
+                    raise DocumentError(400, reason="unsupported_format")  # noqa: TRY301
                 if handler.docling is None:
-                    raise DocumentError  # noqa: TRY301
+                    raise DocumentError(reason="extraction_unavailable")  # noqa: TRY301
                 expected_type = "file" if isinstance(request, EngineChatRequest) else "input_file"
                 expected_image = (
                     "image_url" if isinstance(request, EngineChatRequest) else "input_image"
                 )
                 if any(part.type not in {expected_type, expected_image} for part in attachments):
-                    raise DocumentError(400)  # noqa: TRY301
+                    raise DocumentError(400, reason="unsupported_format")  # noqa: TRY301
                 if any(part.type == expected_image for part in attachments):
                     images = ImageBatch(
                         protect_faces=(policy.contract_version == 3 or image_forwarding != "none")
@@ -201,10 +199,7 @@ async def process_request(
             except DocumentError as exc:
                 _clear_request(handler)
                 handler.record_dispatch("transport_failure")
-                message = exc.message
-                if any(part.type in {"image_url", "input_image"} for part in attachments):
-                    message = "image request rejected; retry with text only"
-                return immediate_response(exc.status, json.dumps({"error": message}))
+                return immediate_response(exc.status, json.dumps({"error": exc.message}))
             converted = True
             # Discard base64 and wire buffers before the potentially long PII call.
             handler.request_body_chunks.clear()
@@ -213,9 +208,9 @@ async def process_request(
         if not handler.text_pii_enabled and not (images and images.protect_faces):
             if images is not None and policy.contract_version == 3:
                 try:
-                    _v3_image_output(policy, request.model, images, None)
-                except DocumentError:
-                    return _image_policy_block(handler)
+                    image_output(policy, request.model, images, None)
+                except DocumentError as exc:
+                    return _image_policy_block(handler, exc)
             if image_locations:
                 data = cast(dict[str, object], strict_json_loads(body.decode()))
                 try:
@@ -244,23 +239,31 @@ async def process_request(
             request_nonce=handler.request_nonce,
         )
         handler.record_dispatch("model_analyzed")
-    if converted:
-        _clear_request(handler)
-        if visual_findings is not None:
-            reply = await client.analyze_request(
-                request,
-                session_key,
-                document=True,
-                text_pii_enabled=handler.text_pii_enabled,
-                visual_findings=visual_findings,
-            )
+    try:
+        if converted:
+            _clear_request(handler)
+            if visual_findings is not None:
+                reply = await client.analyze_request(
+                    request,
+                    session_key,
+                    document=True,
+                    text_pii_enabled=handler.text_pii_enabled,
+                    visual_findings=visual_findings,
+                )
+            else:
+                reply = await client.analyze_request(request, session_key, document=True)
         else:
-            reply = await client.analyze_request(request, session_key, document=True)
-    else:
-        reply = await client.analyze_request(request, session_key)
-    _validate_request_mutation(request, reply)
-    if handler.text_pii_enabled:
-        _validate_reversal(request, reply)
+            reply = await client.analyze_request(request, session_key)
+        _validate_request_mutation(request, reply)
+        if handler.text_pii_enabled:
+            _validate_reversal(request, reply)
+    except (EngineUnavailableError, InvalidEngineReplyError):
+        if images is None:
+            raise
+        _clear_request(handler)
+        handler.record_dispatch("transport_failure")
+        error = DocumentError(reason="image_analysis_failed")
+        return immediate_response(error.status, json.dumps({"error": error.message}))
     if (
         image_locations
         and visual_findings is None
@@ -278,7 +281,10 @@ async def process_request(
     ):
         _clear_request(handler)
         handler.record_dispatch("policy_block")
-        return immediate_response(403, json.dumps({"error": DocumentError(403).message}))
+        error = DocumentError(
+            403, reason=("image_pii_detected" if reply.entities else "policy_blocked")
+        )
+        return immediate_response(error.status, json.dumps({"error": error.message}))
     if isinstance(request, EngineMcpRequest) and (
         reply.decision == "reroute" or reply.route_class is not None
     ):
@@ -306,7 +312,7 @@ async def process_request(
         and isinstance(request, EngineChatRequest | EngineResponsesRequest)
         else None
     )
-    handler.notice_messages = [] if is_mcp else reply.notices.response
+    handler.notice_messages = [] if is_mcp else list(reply.notices.response)
     handler.reversal_map.update(reply.reversal)
     handler.reversal_entity_prefixes = placeholder_entity_prefixes(handler.reversal_map)
     handler.request_stats = RequestStats(
@@ -353,10 +359,14 @@ async def process_request(
         and policy.contract_version == 3
     ):
         try:
-            if not _v3_image_output(policy, request.model, images, reply):
+            output = image_output(policy, request.model, images, reply)
+            handler.request_stats.images_forwarded = output.forward_pixels
+            if not output.forward_pixels:
                 image_locations.clear()
+            if output.notice:
+                handler.notice_messages.append(output.notice)
         except DocumentError as exc:
-            return _image_policy_block(handler, no_readable_text=isinstance(exc, _NoImageTextError))
+            return _image_policy_block(handler, exc)
     transformed = reply.request
     if handler.text_pii_enabled and isinstance(request, EngineChatRequest | EngineResponsesRequest):
         transformed = inject_guard_instruction(
@@ -414,7 +424,7 @@ def _visual_findings(attachments: list[EngineAttachmentPart], images: ImageBatch
         or images.scan_status != ("complete" if images.protect_faces else "not_scanned")
         or (not images.protect_faces and images.face_count != 0)
     ):
-        raise DocumentError
+        raise DocumentError(reason="image_analysis_failed")
     return VisualFindings.model_validate(
         {
             "faces": {
@@ -426,88 +436,38 @@ def _visual_findings(attachments: list[EngineAttachmentPart], images: ImageBatch
     )
 
 
-def _v3_image_output(
-    policy: ModelDestinationPolicy, model: str, images: ImageBatch, reply: EngineReply | None
-) -> bool:
-    """Allow pixels only under the selected output gate, never by a routing guess."""
-    forwarding = policy.image_forwarding.get(model, "none")
-    has_text = all(images.text_present.values())
-    face_action = (
-        next((row.action for row in reply.report.rows if row.entity_type == "FACE"), None)
-        if reply is not None
-        else None
-    )
-    if face_action == "text-only":
-        if not has_text:
-            raise _NoImageTextError(403)
-        return False
-    if face_action == "reroute":
-        # Gateway still selects and authorizes the bound backend; do not replace the model ID.
-        if (
-            forwarding == "none"
-            or reply is None
-            or reply.decision != "reroute"
-            or not policy.image_reroutes.get(model, {}).get(reply.route_class or "")
-        ):
-            raise DocumentError(403)
-        return True
-    if forwarding == "none":
-        if not has_text:
-            raise DocumentError(403)
-        return False
-    if forwarding == "pii-unchecked":
-        if not policy.image_models.get(model, False) or (
-            reply is not None and reply.decision not in {"pass", "apply_actions"}
-        ):
-            raise DocumentError(403)
-        return True
-    if (
-        not has_text
-        or reply is None
-        or reply.decision != "pass"
-        or reply.entities
-        or reply.report.rows
-        or not reply.analysis.scan_performed
-        or reply.analysis.text_leaf_count < 1
-        or reply.safety_rule is not None
-    ):
-        raise DocumentError(403)
-    return True
-
-
 def _image_policy_block(
-    handler: StreamHandler, *, no_readable_text: bool = False
+    handler: StreamHandler, error: DocumentError | None = None
 ) -> ext_proc_pb2.ProcessingResponse:
-    """Keep the empty-text explanation short and retain its policy facts separately."""
+    """Report the actual rejection reason without rewriting the engine's FACE action."""
     _clear_request(handler)
     handler.record_dispatch("policy_block")
-    message = (
-        "No readable text was found in an attached image. "
-        "This chat can read writing in pictures, but cannot describe photos."
-        if no_readable_text
-        else DocumentError(403).message
-    )
+    if error is None:
+        blocked_entities = (
+            {row.entity_type for row in handler.request_stats.report.rows if row.action == "block"}
+            if handler.request_stats
+            else set()
+        )
+        error = DocumentError(
+            403,
+            reason=("face_policy_blocked" if blocked_entities == {"FACE"} else "policy_blocked"),
+        )
+    message = error.message
     payload: dict[str, object] = {}
     if stats := handler.request_stats:
         stats.decision = "block"
         stats.route_class = None
-        stats.report = stats.report.model_copy(deep=True)
-        for row in stats.report.rows:
-            if row.entity_type == "FACE" and not no_readable_text:
-                # FACE counts are never transformed; expose the effective denial, not a reroute.
-                row.action = "block"
         report: dict[str, object] = {
             **stats.report.model_dump(mode="json"),
             "decision": "block",
+            "reason": "no_readable_text" if error.no_text else error.reason,
             "analysis": stats.analysis.model_dump(mode="json"),
             "visual_findings": (
                 stats.visual_findings.model_dump(mode="json") if stats.visual_findings else None
             ),
         }
         payload["pii_report"] = report
-        if no_readable_text:
-            report["reason"] = "no_readable_text"
-        elif handler.response_notice_allowed:
+        if not error.no_text and handler.response_notice_allowed:
             message += render_notice(
                 [],
                 render_report(
@@ -521,13 +481,13 @@ def _image_policy_block(
                 ),
             )
     return immediate_response(
-        403,
+        error.status,
         json.dumps(
             {
                 "error": {
                     "message": message,
-                    "type": "policy_error",
-                    "code": "image_text_unavailable" if no_readable_text else "policy_blocked",
+                    "type": "policy_error" if error.status == 403 else "processing_error",
+                    "code": "image_text_unavailable" if error.no_text else error.reason,
                 },
                 **payload,
             }

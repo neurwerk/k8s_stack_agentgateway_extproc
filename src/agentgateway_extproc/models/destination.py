@@ -35,9 +35,9 @@ class ModelDestinationPolicy(DestinationModel):
     attachment_modes: dict[ModelId, Literal["block", "extract", "process", "passthrough"]] = Field(
         default_factory=dict, max_length=256
     )
-    image_forwarding: dict[ModelId, Literal["none", "if-no-pii-detected", "pii-unchecked"]] = Field(
-        default_factory=dict, max_length=256
-    )
+    image_forwarding: dict[
+        ModelId, Literal["none", "if-no-pii-detected", "if-policy-allows", "pii-unchecked"]
+    ] = Field(default_factory=dict, max_length=256)
     face_protection: dict[ModelId, bool] = Field(default_factory=dict, max_length=256)
     local_models: dict[ModelId, bool] = Field(default_factory=dict, max_length=256)
     image_models: dict[ModelId, bool] = Field(default_factory=dict, max_length=256)
@@ -104,7 +104,9 @@ class ModelDestinationPolicy(DestinationModel):
                 and not self.image_models.get(model, False)
             ):
                 raise ValueError("unchecked images require a proven local image model")  # noqa: TRY003
-            if forwarding == "if-no-pii-detected" and not (pii and face):
+            if forwarding == "if-policy-allows" and self.contract_version != 3:
+                raise ValueError("policy-aware images require contract version three")  # noqa: TRY003
+            if forwarding in {"if-no-pii-detected", "if-policy-allows"} and not (pii and face):
                 raise ValueError("conditional images require PII and face protection")  # noqa: TRY003
         return self
 

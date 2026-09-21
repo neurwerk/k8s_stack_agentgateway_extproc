@@ -310,7 +310,9 @@ async def test_model_attachments_stop_before_engine_or_upstream(
         "immediate_response",
     ]
     assert responses[-1].immediate_response.status.code == 403
-    assert responses[-1].immediate_response.body == '{"error":"attachments are not supported"}'
+    assert json.loads(responses[-1].immediate_response.body) == {
+        "error": "neurwerk: attachments are disabled for this model."
+    }
 
 
 @pytest.mark.parametrize("role", ["user", "tool"])
@@ -346,7 +348,7 @@ async def test_attachment_block_precedes_mixed_catalog_pii_bypass(engine_client,
 @pytest.mark.parametrize("api_kind", ["chat", "responses"])
 @pytest.mark.parametrize(
     ("mode", "attachment_type", "status"),
-    [("block", "file", 403), ("extract", "file", 503), ("extract", "image_url", 403)],
+    [("block", "file", 403), ("extract", "file", 503), ("extract", "image_url", 400)],
 )
 async def test_explicit_attachment_modes_fail_closed_without_converter(
     engine_client, pii_enabled, api_kind, mode, attachment_type, status
@@ -368,7 +370,7 @@ async def test_explicit_attachment_modes_fail_closed_without_converter(
     assert response.immediate_response.status.code == status
     if status == 503:
         assert json.loads(response.immediate_response.body) == {
-            "error": "document conversion unavailable"
+            "error": "neurwerk: text extraction service unavailable."
         }
 
 

@@ -225,7 +225,7 @@ converted Chat/Responses `request`, trusted `text_pii_enabled` and aggregate
 `visual_findings.faces`, never pixels. Its exact fresh findings echo is required.
 Central FACE actions are `block`, `text-only` (withhold **all** request images) and
 `reroute` (only with forwarding enabled and an exact approved local binding).
-Text blocks win; real text PII findings still prohibit conditional remote pixels.
+Text blocks win; real text PII findings still prohibit strict `if-no-pii-detected` remote pixels.
 Successful extraction with no text uses `[Image: no text extracted]`, not a clean
 PII claim: such images require an approved local reroute or unchecked local path;
 text-only handling blocks them. Failed extraction or detection remains fatal.
@@ -252,6 +252,46 @@ FACE `text-only` and the original counts, with `decision: block` and
 The pinned LibreChat error display is plain text and may truncate this message,
 so it cannot reliably display the full Markdown table. This is not hidden by
 returning a fake HTTP 200, and a zero face count never proves text PII is absent.
+
+#### Policy-Aware Forwarding (0.11.0)
+
+V3 adds opt-in `image_forwarding: if-policy-allows`, requiring processed attachments,
+text PII and face protection. Deploy this consumer before emitting the new value;
+v1/v2 and older consumers reject it. Existing `none`, `if-no-pii-detected`,
+`pii-unchecked` and passthrough behavior remains distinct.
+
+After complete current-request analysis, a `pass` decision permits normalized
+pixels even when text entities were detected and explicitly allowed to pass.
+Text transformations instead forward the engine's transformed extracted text,
+withhold all request images, and preserve response reversal. This is successful
+processing, with the notice:
+
+> neurwerk: PII policy applied; extracted text forwarded without images.
+
+Text-triggered reroutes also use extracted text, retaining the approved route and
+Gateway authorization. FACE `block` remains terminal; `text-only` withholds all
+images; `reroute` still requires its exact local image binding. Under the new mode,
+text transformations also withhold pixels on an approved FACE reroute, and its
+report describes text-only forwarding accurately. An approved local image reroute
+without text transformations may accept textless images. No remote pixel path
+treats empty OCR, incomplete scans, or cached decisions as a clean result.
+
+Empty extraction is tracked per image. If any image has no extracted text and the
+selected output requires text, the request stops with `image_text_unavailable` and
+`pii_report.reason: no_readable_text`. The message states the effective restriction:
+
+- Text-only model: `neurwerk: image text extraction only; no text extracted from an image. Image forwarding is disabled for this model.`
+- FACE text-only: `neurwerk: faces detected; configured policy permits sending only extracted text. No text was extracted from an image.`
+- Conditional forwarding: `neurwerk: image forwarding requires extracted text for PII analysis; no text extracted from an image.`
+
+Other errors distinguish invalid/unsupported input, disabled attachments, processing
+limits, extraction service availability, extraction failure/deadline, failed image
+analysis, strict zero-detection policy, explicit data/face blocks and unavailable
+image reroutes. Only fixed content-free messages are exposed; native exception text
+is never returned. A rejection retains the actual FACE action and counts rather
+than relabeling a failed reroute as a FACE block. Successful notices use the
+existing response notice path; structured-output/MCP suppression and unprotected
+PII-disabled byte-preserving bypass remain intact.
 
 ### Stateless MCP
 

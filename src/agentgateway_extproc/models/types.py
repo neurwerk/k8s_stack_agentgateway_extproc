@@ -40,3 +40,4 @@ class RequestStats:
     decision: str = "pass"
     route_class: str | None = None
     visual_findings: VisualFindings | None = None
+    images_forwarded: bool | None = None
