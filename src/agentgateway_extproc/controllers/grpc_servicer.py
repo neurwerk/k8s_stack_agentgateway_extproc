@@ -7,7 +7,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator
+from contextlib import aclosing
 from dataclasses import dataclass
 from typing import NoReturn, Protocol, cast, override
 
@@ -65,20 +66,54 @@ class ExtProcServicer(ext_proc_pb2_grpc.ExternalProcessorServicer):
         self._client = client
         self._settings = settings or Settings()
         self._docling = docling
+        self._active = 0
+        self._buffered_bytes = 0
 
     @override
     async def Process(
         self, request_iterator: AsyncIterator[ext_proc_pb2.ProcessingRequest], context: object
     ) -> AsyncIterator[ext_proc_pb2.ProcessingResponse]:
         """Process one Envoy bidirectional stream."""
+        if self._active >= self._settings.grpc_maximum_concurrent_rpcs:
+            yield _overloaded()
+            return
+        self._active += 1
+        try:
+            async with aclosing(self._process(request_iterator, context)) as stream:
+                async for response in stream:
+                    yield response
+        finally:
+            self._active -= 1
+
+    def _reserve_body(self, request: ext_proc_pb2.ProcessingRequest) -> int | None:
+        size = len(request.request_body.body) if request.HasField("request_body") else 0
+        # Bound retained input before JSON/base64 decoding; Docling separately
+        # admits one native conversion per Pod.
+        if self._buffered_bytes + size > 4 * self._settings.max_request_bytes:
+            return None
+        self._buffered_bytes += size
+        return size
+
+    async def _process(
+        self, request_iterator: AsyncIterator[ext_proc_pb2.ProcessingRequest], context: object
+    ) -> AsyncGenerator[ext_proc_pb2.ProcessingResponse, None]:
         active_streams.inc()
         handler = StreamHandler(self._client, self._settings, self._docling)
         phase = StreamPhase()
+        buffered_bytes = 0
         try:
             async for request in request_iterator:
                 kind = request.WhichOneof("request") or "unknown"
+                size = self._reserve_body(request)
+                if size is None:
+                    yield _overloaded()
+                    return
+                buffered_bytes += size
                 try:
                     outputs = await _handle_message(handler, request, kind)
+                    if handler.request_processed:
+                        self._buffered_bytes -= buffered_bytes
+                        buffered_bytes = 0
                     for output in outputs:
                         phase.observe(output)
                         yield output
@@ -102,7 +137,18 @@ class ExtProcServicer(ext_proc_pb2_grpc.ExternalProcessorServicer):
                 yield await _failure_for_phase(context, phase, "response_eof", exc)
         finally:
             handler.clear_sensitive_state()
+            self._buffered_bytes -= buffered_bytes
             active_streams.dec()
+
+
+def _overloaded() -> ext_proc_pb2.ProcessingResponse:
+    """Reject before forwarding any request or unprocessed response content."""
+    errors_total.labels(type="overloaded").inc()
+    response = immediate_response(503, '{"error":"processor busy","retryable":true}')
+    response.immediate_response.headers.set_headers.add(
+        header={"key": "retry-after", "value": "1"}, append_action=2
+    )
+    return response
 
 
 def _ordered_response(

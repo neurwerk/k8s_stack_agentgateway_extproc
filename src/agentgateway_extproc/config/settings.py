@@ -91,7 +91,8 @@ class Settings(BaseSettings):
         ge=1_024,
         le=MAX_GRPC_RECEIVE_MESSAGE_BYTES,
     )
-    grpc_maximum_concurrent_rpcs: int = Field(default=4, ge=1, le=16)
+    grpc_maximum_concurrent_rpcs: int = Field(default=4, ge=1, le=128)
+    shutdown_grace_seconds: int = Field(default=300, ge=1, le=1200)
 
     @model_validator(mode="after")
     def validate_transport_limits(self) -> Settings:
