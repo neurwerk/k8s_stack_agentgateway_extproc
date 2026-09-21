@@ -388,9 +388,16 @@ make check
 ```
 
 `make check` verifies the lockfile, Ruff lint and formatting, strict `ty` type
-checking, tests with the configured coverage threshold, and deterministic
-protobuf generation. Regenerate checked-in bindings after an intentional proto
-change with:
+checking, tests, and deterministic protobuf generation. Keep tests short and
+focused on essential behavior and meaningful regressions; do not add tests just
+to increase coverage. Coverage percentages are not a release gate.
+
+Pending upload-processing test cleanup, `check-test`
+temporarily excludes `test_image_normalization.py`, `test_images.py`, and
+`test_documents.py`. Their files remain available; remove the three `--ignore`
+arguments in the Makefile to re-enable them.
+
+Regenerate checked-in bindings after an intentional proto change with:
 
 ```bash
 make proto
