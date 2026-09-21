@@ -308,6 +308,17 @@ There is no compatibility toggle. Activation of this binary requires a stateless
 AgentGateway configuration. Model conversation headers and JSON `session_id`
 fields are not transport-session headers and are unaffected by this rejection.
 
+## Cached PII Decisions
+
+Replies with `analysis.source: cached_decision` retain historical report rows but
+carry no request-local reversal mappings. Historical transformation counts do not
+require placeholders in the current request. The adapter still rejects reversal
+mappings on cached-only replies and unauthorized placeholders.
+
+A reply with `analysis.source: current_request` must satisfy all current-request
+reversal checks, including when `cached_decision_applied: true` preserves an earlier
+routing decision alongside fresh analysis.
+
 ## Packages
 
 - Repository: `neurwerk/k8s_stack_agentgateway_extproc`

@@ -1054,6 +1054,60 @@ async def test_reversal_occurrences_must_match_the_detailed_report(
         await handler.handle(body_request(request_json()))
 
 
+async def test_cached_reroute_preserves_historical_report_without_reversal(
+    engine_client, engine_reply
+) -> None:
+    """Historical masking counts must not prevent forwarding a cached reroute."""
+    engine_reply.update(
+        {
+            "decision": "reroute",
+            "remote_allowed": False,
+            "route_class": "local-sensitive",
+            "applied_actions": ["reroute"],
+            "entities": ["PERSON", "TAX_ID"],
+            "entity_counts": {"PERSON": 1, "TAX_ID": 1},
+            "reversal": {},
+        }
+    )
+    engine_reply["request"]["messages"][0]["content"] = "Jane Doe"
+    engine_reply["analysis"].update(
+        {
+            "source": "cached_decision",
+            "scan_performed": False,
+            "duration_ms": None,
+            "text_leaf_count": 0,
+            "cached_decision_applied": True,
+        }
+    )
+    engine_reply["report"]["rows"].append(
+        {
+            "entity_type": "TAX_ID",
+            "action": "reroute",
+            "detected_count": 1,
+            "transformed_count": 0,
+            "unique_transformed_count": 0,
+        }
+    )
+    handler = StreamHandler(engine_client)
+    await handler.handle(header_request())
+
+    response = await handler.handle(body_request(request_json()))
+
+    assert response is not None and response.HasField("request_body")
+    forwarded = json.loads(response.request_body.response.body_mutation.body)
+    assert forwarded["messages"][1]["content"] == "Jane Doe"
+    headers = {
+        item.header.key: item.header.value
+        for item in response.request_body.response.header_mutation.set_headers
+    }
+    assert headers["x-remote-allowed"] == "false"
+    assert headers["x-route-class"] == "local-sensitive"
+    assert handler.reversal_map == {}
+    assert handler.request_stats is not None
+    assert handler.request_stats.analysis.source == "cached_decision"
+    assert handler.request_stats.report.model_dump() == engine_reply["report"]
+
+
 async def test_preexisting_request_placeholder_is_rejected(engine_client) -> None:
     handler = StreamHandler(engine_client)
     await handler.handle(header_request())
