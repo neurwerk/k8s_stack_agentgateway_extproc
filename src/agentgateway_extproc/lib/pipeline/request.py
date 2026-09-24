@@ -63,6 +63,7 @@ type OpaqueReasoning = dict[int, dict[str, object]]
 _TEXT_LEAF = object()
 _OPAQUE_REQUEST_REASONING_FIELDS = ("reasoning_content", "reasoning_signature")
 _MAX_VALIDATION_ERROR_COUNT = 100
+_UNCHECKED_IMAGE_MARKER = "[Image forwarded without privacy inspection]"
 _logger = logging.getLogger(__name__)
 
 
@@ -88,6 +89,7 @@ async def process_request(
     opaque_reasoning: OpaqueReasoning = {}
     converted = False
     image_locations: dict[tuple[int, int], str] = {}
+    unchecked_image_locations: dict[tuple[int, int], str] = {}
     image_forwarding = "none"
     images: ImageBatch | None = None
     visual_findings: VisualFindings | None = None
@@ -160,7 +162,82 @@ async def process_request(
         attachments = _model_attachments(request)
         attachment_mode = policy.attachment_modes.get(request.model, "block")
         image_forwarding = policy.image_forwarding.get(request.model, "none")
-        if attachments and attachment_mode != "passthrough":
+        unchecked_without_documents = False
+        if attachments and policy.contract_version == 4:
+            document_indexes = {
+                index
+                for index, part in enumerate(attachments)
+                if part.type in {"file", "input_file"}
+            }
+            image_indexes = {
+                index
+                for index, part in enumerate(attachments)
+                if part.type in {"image_url", "input_image"}
+            }
+            try:
+                if len(document_indexes | image_indexes) != len(attachments):
+                    raise DocumentError(400, reason="unsupported_format")  # noqa: TRY301
+                expected_type = "file" if isinstance(request, EngineChatRequest) else "input_file"
+                expected_image = (
+                    "image_url" if isinstance(request, EngineChatRequest) else "input_image"
+                )
+                if any(
+                    (index in document_indexes and part.type != expected_type)
+                    or (index in image_indexes and part.type != expected_image)
+                    for index, part in enumerate(attachments)
+                ):
+                    raise DocumentError(400, reason="unsupported_format")  # noqa: TRY301
+                if (document_indexes and policy.document_mode(request.model) == "block") or (
+                    image_indexes and policy.image_mode(request.model) == "block"
+                ):
+                    raise DocumentError(403, reason="attachments_disabled")  # noqa: TRY301
+                unchecked = bool(image_indexes) and image_forwarding == "pii-unchecked"
+                images = (
+                    ImageBatch(
+                        protect_faces=not unchecked and policy.protects_faces(request.model),
+                        policy_version=4,
+                    )
+                    if image_indexes
+                    else None
+                )
+                if unchecked:
+                    images = cast(ImageBatch, images)
+                    if document_indexes:
+                        if handler.docling is None:
+                            raise DocumentError(reason="extraction_unavailable")  # noqa: TRY301
+                        texts_by_index = await handler.docling.convert_selected(
+                            attachments, document_indexes, images=images
+                        )
+                    else:
+                        if handler.docling is None:
+                            raise DocumentError(reason="extraction_unavailable")  # noqa: TRY301
+                        texts_by_index = await handler.docling.convert_selected(
+                            attachments, set(), images=images
+                        )
+                    request, body, unchecked_image_locations = _converted_unchecked_request(
+                        payload, texts_by_index, images, opaque_reasoning
+                    )
+                    unchecked_without_documents = not document_indexes
+                else:
+                    if handler.docling is None:
+                        raise DocumentError(reason="extraction_unavailable")  # noqa: TRY301
+                    texts = await handler.docling.convert(attachments, images=images)
+                    if images is not None:
+                        visual_findings = _visual_findings(attachments, images)
+                        if image_forwarding != "none":
+                            image_locations = _image_locations(payload, images)
+                    request, body = _converted_request(payload, texts, opaque_reasoning)
+            except DocumentError as exc:
+                _clear_request(handler)
+                handler.record_dispatch(
+                    "policy_block" if exc.reason == "attachments_disabled" else "transport_failure"
+                )
+                return immediate_response(exc.status, json.dumps({"error": exc.message}))
+            converted = True
+            handler.request_body_chunks.clear()
+            attachments.clear()
+            payload = None
+        elif attachments and attachment_mode != "passthrough":
             allowed = {"file", "input_file"}
             if policy.contract_version >= 2:
                 allowed |= {"image_url", "input_image"}
@@ -187,7 +264,7 @@ async def process_request(
                         policy_version=policy.contract_version,
                     )
                     texts = await handler.docling.convert(attachments, images=images)
-                    if policy.contract_version == 3:
+                    if policy.contract_version >= 3:
                         visual_findings = _visual_findings(attachments, images)
                     if image_forwarding != "none":
                         image_locations = _image_locations(payload, images)
@@ -203,8 +280,14 @@ async def process_request(
             handler.request_body_chunks.clear()
             attachments.clear()
             payload = None
-        if not handler.text_pii_enabled and not (images and images.protect_faces):
-            if images is not None and policy.contract_version == 3:
+        if unchecked_without_documents or (
+            not handler.text_pii_enabled and not (images and images.protect_faces)
+        ):
+            if (
+                images is not None
+                and policy.contract_version >= 3
+                and not unchecked_without_documents
+            ):
                 try:
                     image_output(policy, request.model, images, None)
                 except DocumentError as exc:
@@ -213,6 +296,17 @@ async def process_request(
                 data = cast(dict[str, object], strict_json_loads(body.decode()))
                 try:
                     _restore_images(data, image_locations, offset=0)
+                    body = json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode()
+                    if len(body) > handler.max_transformed_request_bytes:
+                        raise DocumentError(413)  # noqa: TRY301
+                except DocumentError as exc:
+                    _clear_request(handler)
+                    return immediate_response(exc.status, json.dumps({"error": exc.message}))
+            if unchecked_image_locations:
+                data = cast(dict[str, object], strict_json_loads(body.decode()))
+                try:
+                    _replace_unchecked_images(data, unchecked_image_locations, offset=0)
+                    _restore_opaque_chat_reasoning(data, opaque_reasoning, offset=0)
                     body = json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode()
                     if len(body) > handler.max_transformed_request_bytes:
                         raise DocumentError(413)  # noqa: TRY301
@@ -354,7 +448,7 @@ async def process_request(
         images is not None
         and isinstance(policy, ModelDestinationPolicy)
         and isinstance(request, EngineChatRequest | EngineResponsesRequest)
-        and policy.contract_version == 3
+        and policy.contract_version >= 3
     ):
         try:
             output = image_output(policy, request.model, images, reply)
@@ -387,6 +481,15 @@ async def process_request(
             _restore_images(
                 serialized,
                 image_locations,
+                offset=int(handler.guard_injected and isinstance(request, EngineChatRequest)),
+            )
+        except DocumentError as exc:
+            return immediate_response(exc.status, json.dumps({"error": exc.message}))
+    if unchecked_image_locations:
+        try:
+            _replace_unchecked_images(
+                serialized,
+                unchecked_image_locations,
                 offset=int(handler.guard_injected and isinstance(request, EngineChatRequest)),
             )
         except DocumentError as exc:
@@ -515,6 +618,78 @@ def _converted_request(
     if len(body) > MAX_REQUEST_BYTES:
         raise DocumentError(413)
     return request, body
+
+
+def _converted_unchecked_request(
+    payload: object,
+    texts: dict[int, str],
+    images: ImageBatch,
+    reasoning: OpaqueReasoning,
+) -> tuple[
+    EngineChatRequest | EngineResponsesRequest,
+    bytes,
+    dict[tuple[int, int], str],
+]:
+    """Convert documents while keeping unchecked image bytes outside policy analysis."""
+    data = cast(dict[str, object], payload)
+    chat = "messages" in data
+    locations: dict[tuple[int, int], str] = {}
+    attachment = 0
+    for mi, message in enumerate(_dict_list(data.get("messages" if chat else "input"))):
+        if not chat and message.get("type", "message") != "message":
+            continue
+        for pi, part in enumerate(_dict_list(message.get("content"))):
+            if part.get("type") not in {"file", "input_file", "image_url", "input_image"}:
+                continue
+            if attachment in images.images:
+                locations[mi, pi] = images.images[attachment]
+                value = _UNCHECKED_IMAGE_MARKER
+            else:
+                value = texts.get(attachment)
+                if value is None:
+                    raise DocumentError
+            part.clear()
+            part.update(type="text" if chat else "input_text", text=value)
+            attachment += 1
+    if attachment != len(texts) + len(images.images) or len(locations) != len(images.images):
+        raise DocumentError
+    request = cast(
+        EngineChatRequest | EngineResponsesRequest,
+        ENGINE_REQUEST_ADAPTER.validate_python(data, strict=True),
+    )
+    if sum(len(text) for text in _mutable_text_leaves(request).values()) > MAX_TEXT:
+        raise DocumentError(413)
+    body = json.dumps(data, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode()
+    if len(body) > MAX_REQUEST_BYTES:
+        raise DocumentError(413)
+    return request, body, locations
+
+
+def _replace_unchecked_images(
+    data: dict[str, object],
+    locations: dict[tuple[int, int], str],
+    *,
+    offset: int,
+) -> None:
+    """Replace private analysis markers with canonical pixels at the original position."""
+    chat = "messages" in data
+    messages = _dict_list(data.get("messages" if chat else "input"))
+    for (mi, pi), uri in locations.items():
+        content = messages[mi + offset].get("content") if mi + offset < len(messages) else None
+        if not isinstance(content, list) or pi >= len(content):
+            raise DocumentError
+        part = content[pi]
+        expected_type = "text" if chat else "input_text"
+        if not isinstance(part, dict) or part != {
+            "type": expected_type,
+            "text": _UNCHECKED_IMAGE_MARKER,
+        }:
+            raise DocumentError
+        content[pi] = (
+            {"type": "image_url", "image_url": {"url": uri}}
+            if chat
+            else {"type": "input_image", "image_url": uri}
+        )
 
 
 def _image_locations(payload: object, images: ImageBatch) -> dict[tuple[int, int], str]:

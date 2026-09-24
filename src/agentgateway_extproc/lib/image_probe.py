@@ -35,12 +35,12 @@ def normalize(
 
     # Enforce our own stricter dimensions before load(), with one stable limit error.
     Image.MAX_IMAGE_PIXELS = None
-    modern = policy_version == 3
+    modern = policy_version >= 3
     if expected == "HEIF":
         if not modern:
             raise ValueError("unsupported image format")  # noqa: TRY003
         _register_heif(data)
-    elif expected not in {"JPEG", "PNG"}:
+    elif expected not in {"JPEG", "PNG"} and (expected != "WEBP" or policy_version != 4):
         raise ValueError("unsupported image format")  # noqa: TRY003
     pixel_limit = (
         MAX_SOURCE_PIXELS if modern else MAX_DETECTION_PIXELS if protect_faces else MAX_PIXELS
@@ -206,7 +206,7 @@ def main() -> int:
         logging.disable(logging.CRITICAL)
         warnings.simplefilter("error")
         version = int(sys.argv[3]) if len(sys.argv) == 4 else 2
-        limit = MAX_SOURCE_BYTES if version == 3 else MAX_IMAGE_BYTES
+        limit = MAX_SOURCE_BYTES if version >= 3 else MAX_IMAGE_BYTES
         data = sys.stdin.buffer.read(limit + 1)
         if len(data) > limit:
             return 2
@@ -221,7 +221,7 @@ def main() -> int:
             return 3
         with os.fdopen(output, "wb", closefd=False) as stream:
             header = (
-                COUNT_HEADER + count.to_bytes(2, "big") if version == 3 else bytes([bool(count)])
+                COUNT_HEADER + count.to_bytes(2, "big") if version >= 3 else bytes([bool(count)])
             )
             stream.write(header + normalized)
     except MemoryError:
