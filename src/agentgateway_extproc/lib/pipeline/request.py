@@ -21,8 +21,6 @@ from agentgateway_extproc.lib.engine.client import EngineClient
 from agentgateway_extproc.lib.image_policy import image_output
 from agentgateway_extproc.lib.json_limits import JsonBudgetError
 from agentgateway_extproc.lib.masking.reversal import placeholder_entity_prefixes
-from agentgateway_extproc.lib.notice.inject import render_notice
-from agentgateway_extproc.lib.notice.report import render_report
 from agentgateway_extproc.lib.pipeline.guard import inject_guard_instruction
 from agentgateway_extproc.lib.pipeline.mcp import (
     McpProtocolError,
@@ -467,19 +465,6 @@ def _image_policy_block(
             ),
         }
         payload["pii_report"] = report
-        if not error.no_text and handler.response_notice_allowed:
-            message += render_notice(
-                [],
-                render_report(
-                    stats.report,
-                    stats.analysis,
-                    {},
-                    decision="block",
-                    route_class=None,
-                    visual_findings=stats.visual_findings,
-                    text_pii_enabled=handler.text_pii_enabled,
-                ),
-            )
     return immediate_response(
         error.status,
         json.dumps(
