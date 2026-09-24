@@ -189,7 +189,7 @@ def _decode_image(
     abandoned: threading.Event | None,
     deadline: float,
 ) -> Upload:
-    modern = images.policy_version == 3
+    modern = images.policy_version >= 3
     if not modern and settings.inference_mode not in {"private-vlm", "remote"}:
         raise DocumentError(403, reason="image_processing_unavailable")
     limit = min(settings.file_bytes, MAX_SOURCE_BYTES if modern else MAX_IMAGE_BYTES)
@@ -214,7 +214,7 @@ def _image_data(
     else:
         value.pop("type")
     # Caller detail is only a rendering hint, never a normalization/OCR setting.
-    if policy_version == 3 and value.pop("detail", "auto") not in ("auto", "low", "high"):
+    if policy_version >= 3 and value.pop("detail", "auto") not in ("auto", "low", "high"):
         raise DocumentError(400)
     url = value.get(url_key)
     if set(value) != {url_key} or not isinstance(url, str):
@@ -222,7 +222,8 @@ def _image_data(
     match = re.fullmatch(r"data:image/([a-z-]+);base64,([A-Za-z0-9+/]*={0,2})", url)
     allowed = (
         {"jpeg", "png", "heic", "heif", "x-heic", "x-heif"}
-        if policy_version == 3
+        | ({"webp"} if policy_version == 4 else set())
+        if policy_version >= 3
         else {"jpeg", "png"}
     )
     if match is None or match[1] not in allowed:
@@ -252,9 +253,15 @@ def _normalize_image(
                 "-B",
                 "-m",
                 "agentgateway_extproc.lib.image_probe",
-                "JPEG" if mime == "jpeg" else "PNG" if mime == "png" else "HEIF",
+                "JPEG"
+                if mime == "jpeg"
+                else "PNG"
+                if mime == "png"
+                else "WEBP"
+                if mime == "webp"
+                else "HEIF",
                 "detect" if protect_faces else "skip",
-                *(["3"] if policy_version == 3 else []),
+                *([str(policy_version)] if policy_version >= 3 else []),
             ],
             input=data,
             stdout=subprocess.PIPE,
@@ -273,7 +280,7 @@ def _normalize_image(
         raise DocumentError(reason="image_analysis_failed")
     if result.returncode:
         raise DocumentError(400)
-    if policy_version == 3:
+    if policy_version >= 3:
         count = int.from_bytes(result.stdout[4:6], "big")
         valid = (
             result.stdout.startswith(COUNT_HEADER)
@@ -286,8 +293,8 @@ def _normalize_image(
         valid = result.stdout[:1] in {b"\x00", b"\x01"}
         count, normalized = int.from_bytes(result.stdout[:1], "big"), result.stdout[1:]
     if not valid:
-        raise DocumentError(503 if policy_version == 3 else 400, reason="image_analysis_failed")
-    if count and policy_version != 3:
+        raise DocumentError(503 if policy_version >= 3 else 400, reason="image_analysis_failed")
+    if count and policy_version < 3:
         raise DocumentError(403, reason="face_policy_blocked")
     if not normalized.startswith(b"\x89PNG\r\n\x1a\n") or len(normalized) > MAX_IMAGE_BYTES:
         raise DocumentError(413)

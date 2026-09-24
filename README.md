@@ -23,8 +23,9 @@ and placeholder boundaries. `/health` checks the process; `/ready` verifies the
 PII Engine path; `/metrics` exposes bounded operational metrics. Deployment
 network policy and workload identity are outside this repository.
 
-Typed attachment content parts in Chat Completions and Responses messages,
-including history, follow the selected model's trusted attachment mode:
+In trusted contract versions one through three, typed attachment content parts in
+Chat Completions and Responses messages, including history, follow the selected
+model's legacy attachment mode:
 
 | Mode | Behavior |
 | --- | --- |
@@ -52,6 +53,38 @@ files, or guarantee the provider supports the attachment. Existing request-size
 and protocol bounds still apply. Inline image bytes and URL references remain
 untouched; the passthrough backend owns URL handling.
 Ordinary text-only bypass, arbitrary tool JSON and MCP handling are unchanged.
+
+Contract version four replaces `attachment_modes` with independent dense
+`document_modes` and `image_modes` maps. All v4 policy maps cover every model so
+the consumer can verify the producer's derived safety state. V4 rejects `attachment_modes`, while
+versions one through three reject both new maps, including when explicitly empty.
+Document modes are `block` (default) and `extract-text`. Image modes are `block`
+(default), `extract-text` and `forward-normalized`. The existing trusted
+`image_forwarding`, `face_protection`, `local_models`, `image_models` and
+`image_reroutes` maps remain internal policy and routing inputs. Metadata validation
+rejects forwarding that is inconsistent with the selected image mode or its
+required PII, face, locality and image-capability proofs.
+
+V4 validates the complete attachment batch before any Docling or downstream model
+dispatch. A blocked, malformed or unsupported document or image rejects the whole
+request. Document extraction continues through Docling. Image `extract-text` uses
+the existing bounded normalization, OCR, face scan and central text/face policy,
+and never forwards pixels. Checked `forward-normalized` uses the same v3 policy
+semantics for `if-no-pii-detected` and `if-policy-allows`.
+
+V4 `forward-normalized` with `pii-unchecked` is deliberately different: it performs
+only bounded isolated normalization to canonical RGB PNG. It does not submit the
+image to Docling, PII Engine or YuNet. The original image part is replaced at the
+same logical position, and trusted `local_models` plus `image_models` proofs remain
+mandatory. In a mixed batch, documents still convert through Docling; unchecked
+image bytes are excluded from any document text-policy request. V4 processed images
+also accept an exact `data:image/webp;base64,...` URI. WebP remains unsupported in
+v1-v3; animation and multiple frames are rejected, and the existing limits,
+orientation, transparency compositing and metadata stripping apply.
+
+All attachment paths share one batch admission, deadline and cancellation lifecycle.
+Image-only unchecked batches require no enabled Docling service or credentials;
+Docling is required only when the batch selects attachments for text extraction.
 
 ### Document Conversion
 

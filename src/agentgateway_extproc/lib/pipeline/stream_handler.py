@@ -288,9 +288,10 @@ class StreamHandler:
         disable_response = isinstance(policy, ModelDestinationPolicy) and not (
             any(policy.models.values())
             or (
-                policy.contract_version == 3
+                policy.contract_version >= 3
                 and any(
-                    policy.attachment_modes.get(model) in {"extract", "process"}
+                    policy.image_mode(model)
+                    in {"extract", "process", "extract-text", "forward-normalized"}
                     and policy.protects_faces(model)
                     for model in policy.models
                 )

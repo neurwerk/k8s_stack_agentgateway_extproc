@@ -46,7 +46,7 @@ class DoclingClient:
                 timeout=httpx.Timeout(30),
                 limits=httpx.Limits(max_connections=1, max_keepalive_connections=1),
             )
-        self._task: asyncio.Task[list[str]] | None = None
+        self._task: asyncio.Task[dict[int, str]] | None = None
         self._abandoned = threading.Event()
         self._poisoned = False
         self._closed = False
@@ -57,13 +57,29 @@ class DoclingClient:
         *,
         images: ImageBatch | None = None,
     ) -> list[str]:
-        """Fail busy immediately and shield admitted work from caller cancellation."""
-        if not self.settings.enabled or self._closed or self._poisoned or self._task is not None:
+        """Extract every attachment, preserving the legacy ordered result."""
+        texts = await self.convert_selected(parts, set(range(len(parts))), images=images)
+        return list(texts.values())
+
+    async def convert_selected(
+        self,
+        parts: list[EngineAttachmentPart],
+        selected: set[int],
+        *,
+        images: ImageBatch | None = None,
+    ) -> dict[int, str]:
+        """Admit one batch; an empty selection normalizes images without Docling."""
+        if (
+            (selected and not self.settings.enabled)
+            or self._closed
+            or self._poisoned
+            or self._task is not None
+        ):
             raise DocumentError(reason="extraction_unavailable")
         abandoned = threading.Event()
         self._abandoned = abandoned
         deadline = time.monotonic() + self.settings.timeout
-        task = asyncio.create_task(self._batch(parts, abandoned, deadline, images))
+        task = asyncio.create_task(self._batch(parts, selected, abandoned, deadline, images))
         self._task = task
         task.add_done_callback(self._finished)
         try:
@@ -76,7 +92,7 @@ class DoclingClient:
             abandoned.set()
             raise
 
-    def _finished(self, task: asyncio.Task[list[str]]) -> None:
+    def _finished(self, task: asyncio.Task[dict[int, str]]) -> None:
         # Retrieve errors even after the requesting stream has gone away.
         if not task.cancelled():
             task.exception()
@@ -94,10 +110,12 @@ class DoclingClient:
     async def _batch(
         self,
         parts: list[EngineAttachmentPart],
+        selected: set[int],
         abandoned: threading.Event,
         deadline: float,
         images: ImageBatch | None = None,
-    ) -> list[str]:
+    ) -> dict[int, str]:
+        """Validate every part before extracting the selected uploads in order."""
         try:
             uploads = await asyncio.to_thread(
                 preflight, parts, self.settings, images, abandoned, deadline
@@ -109,9 +127,12 @@ class DoclingClient:
             raise DocumentError(400) from None
         del parts
         # The retained task owns the thread and native job, not the caller timeout.
-        output: list[str] = []
+        output: dict[int, str] = {}
         pages = size = 0
         for index, upload in enumerate(uploads):
+            if index not in selected:
+                upload.data = b""
+                continue
             if abandoned.is_set():
                 break
             if time.monotonic() >= deadline:
@@ -125,18 +146,17 @@ class DoclingClient:
                 document,
                 upload,
                 self.settings.pages - pages,
-                allow_empty_image=images is not None and images.policy_version == 3,
+                allow_empty_image=images is not None and images.policy_version >= 3,
             )
             if images is not None and upload.format == "img":
                 images.text_present[index] = bool(text)
-                if not text:
-                    text = "[Image: no text extracted]"
+                text = text or "[Image: no text extracted]"
             document = None
             pages += count
             size += len(text)
             if size > MAX_TEXT:
                 raise DocumentError(413)
-            output.append(text)
+            output[index] = text
         return output
 
     async def _convert_one(self, upload: Upload, abandoned: threading.Event) -> object:
