@@ -77,7 +77,6 @@ class StreamHandler:
         limits = settings or Settings()
         self.client = client
         self.docling = docling
-        self.document_settings = limits.docling
         self.reversal_map: dict[str, str] = {}
         self.reversal_entity_prefixes: tuple[tuple[str, str], ...] = ()
         self.request_headers: dict[str, str] = {}

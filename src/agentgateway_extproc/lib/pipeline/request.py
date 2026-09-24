@@ -202,18 +202,11 @@ async def process_request(
                 )
                 if unchecked:
                     images = cast(ImageBatch, images)
-                    if document_indexes:
-                        if handler.docling is None:
-                            raise DocumentError(reason="extraction_unavailable")  # noqa: TRY301
-                        texts_by_index = await handler.docling.convert_selected(
-                            attachments, document_indexes, images=images
-                        )
-                    else:
-                        if handler.docling is None:
-                            raise DocumentError(reason="extraction_unavailable")  # noqa: TRY301
-                        texts_by_index = await handler.docling.convert_selected(
-                            attachments, set(), images=images
-                        )
+                    if handler.docling is None:
+                        raise DocumentError(reason="extraction_unavailable")  # noqa: TRY301
+                    texts_by_index = await handler.docling.convert_selected(
+                        attachments, document_indexes, images=images
+                    )
                     request, body, unchecked_image_locations = _converted_unchecked_request(
                         payload, texts_by_index, images, opaque_reasoning
                     )

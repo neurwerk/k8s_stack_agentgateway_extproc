@@ -82,6 +82,10 @@ also accept an exact `data:image/webp;base64,...` URI. WebP remains unsupported 
 v1-v3; animation and multiple frames are rejected, and the existing limits,
 orientation, transparency compositing and metadata stripping apply.
 
+All attachment paths share one batch admission, deadline and cancellation lifecycle.
+Image-only unchecked batches require no enabled Docling service or credentials;
+Docling is required only when the batch selects attachments for text extraction.
+
 ### Document Conversion
 
 The current source supports PDF, DOCX, XLSX, PPTX, UTF-8 TXT, Markdown and CSV.

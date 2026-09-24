@@ -3,12 +3,11 @@ from __future__ import annotations
 import base64
 import io
 import json
-from typing import cast
 from unittest.mock import AsyncMock, patch
 
 import pytest
 from PIL import Image
-from pydantic import ValidationError
+from pydantic import SecretStr, ValidationError
 
 from agentgateway_extproc.config.settings import DoclingSettings, Settings
 from agentgateway_extproc.lib.docling import DoclingClient
@@ -19,7 +18,7 @@ from agentgateway_extproc.models.destination import ModelDestinationPolicy
 from agentgateway_extproc.models.engine import EngineAttachmentPart
 
 from .conftest import MODEL_POLICY, body_request, header_request
-from .test_documents import _upload
+from .test_documents import _document, _upload
 from .test_images import image_part
 
 
@@ -161,13 +160,8 @@ async def test_v4_unchecked_image_is_ocr_face_and_pii_free(engine_client):
         ],
     }
 
-    class NormalizingBatch:
-        async def convert_selected(self, parts, selected, *, images):
-            assert selected == set()
-            preflight(parts, DoclingSettings(), images)
-            return {}
-
-    handler = StreamHandler(engine_client, Settings(), cast(DoclingClient, NormalizingBatch()))
+    docling = DoclingClient(DoclingSettings())
+    handler = StreamHandler(engine_client, Settings(), docling)
     uri = source_part["image_url"]["url"]
     source = base64.b64decode(uri.split(",")[1])
     canonical = normalize(source, "PNG", policy_version=4)
@@ -179,16 +173,21 @@ async def test_v4_unchecked_image_is_ocr_face_and_pii_free(engine_client):
         return type("Result", (), {"returncode": 0, "stdout": output})()
 
     with (
+        patch.object(docling, "_http", new_callable=AsyncMock) as http,
         patch.object(engine_client, "analyze_request", new_callable=AsyncMock) as analyze,
         patch(
             "agentgateway_extproc.lib.documents.subprocess.run", side_effect=normalization_only
         ) as run,
     ):
-        await handler.handle(header_request(policy=_v4_policy()))
-        response = await handler.handle(
-            body_request(json.dumps(original).encode(), policy=_v4_policy())
-        )
+        try:
+            await handler.handle(header_request(policy=_v4_policy()))
+            response = await handler.handle(
+                body_request(json.dumps(original).encode(), policy=_v4_policy())
+            )
+        finally:
+            await docling.close()
 
+    http.assert_not_awaited()
     analyze.assert_not_awaited()
     run.assert_called_once()
     assert response is not None and response.HasField("request_body")
@@ -201,46 +200,66 @@ async def test_v4_unchecked_image_is_ocr_face_and_pii_free(engine_client):
     assert b"DO-NOT-FORWARD" not in base64.b64decode(uri.partition(",")[2])
 
 
-async def test_v4_mixed_documents_convert_while_unchecked_images_keep_position(engine_client):
-    canonical = "data:image/png;base64," + base64.b64encode(b"normalized-png").decode()
-
-    class FakeDocling:
-        async def convert_selected(self, parts, selected, *, images):
-            assert len(parts) == 2 and selected == {0}
-            assert images.protect_faces is False and images.policy_version == 4
-            images.images[1] = canonical
-            return {0: "Document: report.txt\nchecked text"}
-
+@pytest.mark.parametrize("family", ["chat", "responses"])
+async def test_v4_mixed_documents_convert_while_unchecked_images_keep_position(
+    engine_client, family
+):
+    source_part = image_part()
+    uri = source_part["image_url"]["url"]
+    png = normalize(base64.b64decode(uri.partition(",")[2]), "PNG", policy_version=4)
+    canonical = "data:image/png;base64," + base64.b64encode(png).decode()
     policy = _v4_policy(
-        models={"test": False},
         document_modes={"test": "extract-text"},
+    )
+    chat = family == "chat"
+    parts = (
+        [source_part, {"type": "file", "file": _upload("xlsx")}]
+        if chat
+        else [{"type": "input_image", "image_url": uri}, {"type": "input_file", **_upload("xlsx")}]
     )
     original = {
         "model": "test",
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "file", "file": _upload()},
-                    image_part(),
-                ],
-            }
-        ],
+        "messages" if chat else "input": [{"role": "user", "content": parts}],
     }
-    handler = StreamHandler(engine_client, Settings(), cast(DoclingClient, FakeDocling()))
-    with patch.object(engine_client, "analyze_request", new_callable=AsyncMock) as analyze:
-        await handler.handle(header_request(policy=policy))
-        response = await handler.handle(body_request(json.dumps(original).encode(), policy=policy))
+    docling = DoclingClient(DoclingSettings(enabled=True, api_key=SecretStr("test-only")))
+    handler = StreamHandler(engine_client, Settings(), docling)
+    converted_formats = []
 
+    async def extract(upload, abandoned):
+        converted_formats.append(upload.format)
+        return _document()
+
+    with (
+        patch.object(engine_client, "analyze_request", new_callable=AsyncMock) as analyze,
+        patch.object(docling, "_convert_one", side_effect=extract),
+        patch(
+            "agentgateway_extproc.lib.documents._normalize_image", return_value=(png, 0)
+        ) as image,
+    ):
+        try:
+            await handler.handle(header_request(policy=policy))
+            response = await handler.handle(
+                body_request(json.dumps(original).encode(), policy=policy)
+            )
+        finally:
+            await docling.close()
+
+    assert converted_formats == ["xlsx"]
+    assert image.call_args.args[2:] == (False, 4)
     analyze.assert_not_awaited()
     assert response is not None and response.HasField("request_body")
-    content = json.loads(response.request_body.response.body_mutation.body)["messages"][0][
-        "content"
-    ]
-    assert content == [
-        {"type": "text", "text": "Document: report.txt\nchecked text"},
-        {"type": "image_url", "image_url": {"url": canonical}},
-    ]
+    content = json.loads(response.request_body.response.body_mutation.body)[
+        "messages" if chat else "input"
+    ][0]["content"]
+    assert len(content) == 2
+    assert content[0] == (
+        {"type": "image_url", "image_url": {"url": canonical}}
+        if chat
+        else {"type": "input_image", "image_url": canonical}
+    )
+    assert content[1]["type"] == ("text" if chat else "input_text")
+    assert "Jane Doe" in content[1]["text"]
+    assert "file_data" not in content[1]
 
 
 async def test_v4_blocked_part_rejects_whole_batch_before_side_effects(engine_client):
