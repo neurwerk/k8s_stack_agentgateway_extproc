@@ -242,13 +242,15 @@ The existing PII Engine Notice/table reports FACE counts without claiming maskin
 Face-only requests do not enable text scanning, guard injection or response
 reversal, and omit `x-presidio-code` rather than claim clean text with `P00`.
 Normal JSON/SSE notice placement and structured-output/MCP suppression remain.
-Blocks stay HTTP 403 with a short `error.message`, a table when suitable and a
-bounded `pii_report`. The `0.10.1` no-text correction changes only this case:
+Blocks stay HTTP 403 with a short plain-text `error.message` and a bounded
+structured `pii_report`. Image-policy errors never append the PII Engine Notice
+or Markdown table; successful replies retain their existing notice/table.
+The no-text case retains its existing behavior:
 when face policy selects `text-only` but an image has no
 readable text, the 403 instead uses code `image_text_unavailable` and a short
 plain-language message without the Markdown table. Its structured report retains
 FACE `text-only` and the original counts, with `decision: block` and
-`reason: no_readable_text`. Other image denials retain their existing reporting.
+`reason: no_readable_text`. Other image denials retain their structured reporting.
 The pinned LibreChat error display is plain text and may truncate this message,
 so it cannot reliably display the full Markdown table. This is not hidden by
 returning a fake HTTP 200, and a zero face count never proves text PII is absent.

@@ -788,9 +788,9 @@ async def test_v3_image_dispatch(  # noqa: C901
         else:
             assert error["error"]["message"].startswith("neurwerk:")
             assert error["error"]["code"] == error["pii_report"]["reason"]
-        assert ("PII Engine Notice" in error["error"]["message"]) is (
-            not structured and not no_text
-        )
+        assert "PII Engine Notice" not in error["error"]["message"]
+        assert "\n" not in error["error"]["message"]
+        assert "|" not in error["error"]["message"]
         assert error["pii_report"]["decision"] == "block"
         face_rows = [row for row in error["pii_report"]["rows"] if row["entity_type"] == "FACE"]
         assert face_rows == (
@@ -806,11 +806,6 @@ async def test_v3_image_dispatch(  # noqa: C901
             if face_action
             else []
         )
-        if face_action and not structured and not no_text:
-            assert f"| Face | `{face_action}`: 3 detected;" in error["error"]["message"]
-            assert "images blocked" in error["error"]["message"] or (
-                "not forwarded (request blocked)" in error["error"]["message"]
-            )
         assert "forwarded to" not in blocked.body and "forwarded without" not in blocked.body
         assert "Effective route" not in blocked.body
         return
