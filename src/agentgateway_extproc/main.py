@@ -17,6 +17,7 @@ from agentgateway_extproc.controllers.health import create_http_app
 from agentgateway_extproc.gen import ext_proc_pb2_grpc
 from agentgateway_extproc.lib.docling import DoclingClient
 from agentgateway_extproc.lib.engine.client import EngineClient
+from agentgateway_extproc.lib.image_inspection import ImageInspectionClient
 
 
 def main() -> None:
@@ -35,7 +36,8 @@ def main() -> None:
 async def _run(settings: Settings) -> None:
     """Create clients and serve gRPC plus HTTP endpoints."""
     client = EngineClient(settings.engine)
-    docling = DoclingClient(settings.docling)
+    image_inspection = ImageInspectionClient(settings.image_inspection)
+    docling = DoclingClient(settings.docling, image_inspection=image_inspection)
     server = create_grpc_server(settings, client, docling)
     server.add_insecure_port("[::]:9000")
     await server.start()
@@ -52,6 +54,7 @@ async def _run(settings: Settings) -> None:
         try:
             await server.stop(grace=settings.shutdown_grace_seconds)
             await docling.close()
+            await image_inspection.close()
             await client.close()
         finally:
             for sig, handler in handlers.items():

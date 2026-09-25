@@ -28,7 +28,7 @@ class DestinationModel(BaseModel):
 class ModelDestinationPolicy(DestinationModel):
     """Select independent PII and attachment behavior from a trusted model catalog."""
 
-    contract_version: Literal[1, 2, 3, 4]
+    contract_version: Literal[1, 2, 3, 4, "4.1"]
     destination_kind: Literal["model"]
     principal_id: str
     models: dict[ModelId, bool] = Field(min_length=1, max_length=256)
@@ -47,6 +47,12 @@ class ModelDestinationPolicy(DestinationModel):
     face_protection: dict[ModelId, bool] = Field(default_factory=dict, max_length=256)
     local_models: dict[ModelId, bool] = Field(default_factory=dict, max_length=256)
     image_models: dict[ModelId, bool] = Field(default_factory=dict, max_length=256)
+    image_inspection: dict[ModelId, Literal["document-only", "document-and-vision"]] = Field(
+        default_factory=dict, max_length=256
+    )
+    image_textless: dict[ModelId, Literal["block", "allow-if-inspected"]] = Field(
+        default_factory=dict, max_length=256
+    )
     image_reroutes: dict[ModelId, Annotated[dict[ModelId, ModelId], Field(max_length=256)]] = Field(
         default_factory=dict, max_length=256
     )
@@ -65,11 +71,24 @@ class ModelDestinationPolicy(DestinationModel):
             {"document_modes", "image_modes"} & value.keys()
         ):
             raise ValueError("typed attachment modes require contract version four")  # noqa: TRY003
-        if value.get("contract_version") == 4:
+        if value.get("contract_version") in {1, 2, 3, 4} and (
+            {"image_inspection", "image_textless"} & value.keys()
+        ):
+            raise ValueError("image inspection policy requires contract version 4.1")  # noqa: TRY003
+        if value.get("contract_version") in {4, "4.1"}:
             if "attachment_modes" in value:
                 raise ValueError("legacy attachment modes are invalid in contract version four")  # noqa: TRY003
             if not {"document_modes", "image_modes"} <= value.keys():
                 raise ValueError("contract version four requires typed attachment mode maps")  # noqa: TRY003
+        if (
+            value.get("contract_version") == "4.1"
+            and not {
+                "image_inspection",
+                "image_textless",
+            }
+            <= value.keys()
+        ):
+            raise ValueError("contract version 4.1 requires image inspection policy maps")  # noqa: TRY003
         modes = value.get("attachment_modes")
         if value.get("contract_version") == 1 and (
             {"image_forwarding", "face_protection", "local_models"} & value.keys()
@@ -84,13 +103,13 @@ class ModelDestinationPolicy(DestinationModel):
 
     def document_mode(self, model: str) -> str:
         """Return the version-specific document mode with a fail-closed default."""
-        if self.contract_version == 4:
+        if self.contract_version in {4, "4.1"}:
             return self.document_modes.get(model, "block")
         return self.attachment_modes.get(model, "block")
 
     def image_mode(self, model: str) -> str:
         """Return the version-specific image mode with a fail-closed default."""
-        if self.contract_version == 4:
+        if self.contract_version in {4, "4.1"}:
             return self.image_modes.get(model, "block")
         return self.attachment_modes.get(model, "block")
 
@@ -113,11 +132,13 @@ class ModelDestinationPolicy(DestinationModel):
                 self.face_protection,
                 self.local_models,
                 self.image_models,
+                self.image_inspection,
+                self.image_textless,
                 self.image_reroutes,
             )
         ):
             raise ValueError("attachment modes require known model IDs")  # noqa: TRY003
-        if self.contract_version == 4 and any(
+        if self.contract_version in {4, "4.1"} and any(
             mapping.keys() != self.models.keys()
             for mapping in (
                 self.document_modes,
@@ -133,8 +154,8 @@ class ModelDestinationPolicy(DestinationModel):
             mode = self.attachment_modes.get(model, "block")
             forwarding = self.image_forwarding.get(model, "none")
             face = self.protects_faces(model)
-            if self.contract_version == 4:
-                image_mode = self.image_modes.get(model, "block")
+            image_mode = self.image_modes.get(model, "block")
+            if self.contract_version in {4, "4.1"}:
                 document_mode = self.document_modes.get(model, "block")
                 if image_mode == "forward-normalized" and forwarding == "none":
                     raise ValueError("normalized image forwarding requires a forwarding policy")  # noqa: TRY003
@@ -153,18 +174,39 @@ class ModelDestinationPolicy(DestinationModel):
                 raise ValueError("image forwarding requires processing")  # noqa: TRY003
             if forwarding == "pii-unchecked" and (face or not self.local_models.get(model, False)):
                 raise ValueError("unchecked images require an unprotected concrete local route")  # noqa: TRY003
-            if self.contract_version == 4 and forwarding == "pii-unchecked" and pii:
+            if self.contract_version in {4, "4.1"} and forwarding == "pii-unchecked" and pii:
                 raise ValueError("unchecked images require text PII to be disabled")  # noqa: TRY003
             if (
-                self.contract_version >= 3
+                self.contract_version in {3, 4, "4.1"}
                 and forwarding == "pii-unchecked"
                 and not self.image_models.get(model, False)
             ):
                 raise ValueError("unchecked images require a proven local image model")  # noqa: TRY003
-            if forwarding == "if-policy-allows" and self.contract_version not in {3, 4}:
+            if forwarding == "if-policy-allows" and self.contract_version not in {3, 4, "4.1"}:
                 raise ValueError("policy-aware images require contract version three")  # noqa: TRY003
             if forwarding in {"if-no-pii-detected", "if-policy-allows"} and not (pii and face):
                 raise ValueError("conditional images require PII and face protection")  # noqa: TRY003
+            if self.contract_version == "4.1":
+                inspection = self.image_inspection.get(model)
+                textless = self.image_textless.get(model)
+                if inspection is None or textless is None:
+                    raise ValueError("version 4.1 policy maps must cover every model")  # noqa: TRY003
+                if (
+                    inspection == "document-and-vision"
+                    and image_mode == "forward-normalized"
+                    and forwarding == "pii-unchecked"
+                ):
+                    raise ValueError(  # noqa: TRY003
+                        "vision-inspected forwarding requires checked image policy"
+                    )
+                if textless == "allow-if-inspected" and (
+                    inspection != "document-and-vision"
+                    or image_mode != "forward-normalized"
+                    or forwarding not in {"if-no-pii-detected", "if-policy-allows"}
+                ):
+                    raise ValueError(  # noqa: TRY003
+                        "textless images require vision inspection and checked forwarding"
+                    )
         return self
 
 

@@ -163,7 +163,7 @@ async def process_request(
         attachment_mode = policy.attachment_modes.get(request.model, "block")
         image_forwarding = policy.image_forwarding.get(request.model, "none")
         unchecked_without_documents = False
-        if attachments and policy.contract_version == 4:
+        if attachments and policy.contract_version in {4, "4.1"}:
             document_indexes = {
                 index
                 for index, part in enumerate(attachments)
@@ -192,9 +192,16 @@ async def process_request(
                 ):
                     raise DocumentError(403, reason="attachments_disabled")  # noqa: TRY301
                 unchecked = bool(image_indexes) and image_forwarding == "pii-unchecked"
+                inspect_images = (
+                    image_indexes
+                    if policy.contract_version == "4.1"
+                    and policy.image_inspection[request.model] == "document-and-vision"
+                    else set()
+                )
                 images = (
                     ImageBatch(
                         protect_faces=not unchecked and policy.protects_faces(request.model),
+                        defer_face_inspection=bool(inspect_images),
                         policy_version=4,
                     )
                     if image_indexes
@@ -205,8 +212,12 @@ async def process_request(
                     if handler.docling is None:
                         raise DocumentError(reason="extraction_unavailable")  # noqa: TRY301
                     texts_by_index = await handler.docling.convert_selected(
-                        attachments, document_indexes, images=images
+                        attachments,
+                        document_indexes,
+                        images=images,
+                        inspect_images=inspect_images,
                     )
+                    _validate_image_inspections(images, inspect_images)
                     request, body, unchecked_image_locations = _converted_unchecked_request(
                         payload, texts_by_index, images, opaque_reasoning
                     )
@@ -214,16 +225,27 @@ async def process_request(
                 else:
                     if handler.docling is None:
                         raise DocumentError(reason="extraction_unavailable")  # noqa: TRY301
-                    texts = await handler.docling.convert(attachments, images=images)
+                    texts = await handler.docling.convert(
+                        attachments,
+                        images=images,
+                        inspect_images=inspect_images,
+                    )
                     if images is not None:
+                        _validate_image_inspections(images, inspect_images)
                         visual_findings = _visual_findings(attachments, images)
                         if image_forwarding != "none":
                             image_locations = _image_locations(payload, images)
                     request, body = _converted_request(payload, texts, opaque_reasoning)
             except DocumentError as exc:
+                if policy.contract_version == "4.1" and exc.reason.startswith(
+                    ("extraction_", "image_analysis_", "image_inspection_")
+                ):
+                    return _image_policy_block(handler, exc)
                 _clear_request(handler)
                 handler.record_dispatch(
-                    "policy_block" if exc.reason == "attachments_disabled" else "transport_failure"
+                    "policy_block"
+                    if exc.reason in {"attachments_disabled", "image_inspection_unreadable"}
+                    else "transport_failure"
                 )
                 return immediate_response(exc.status, json.dumps({"error": exc.message}))
             converted = True
@@ -232,7 +254,7 @@ async def process_request(
             payload = None
         elif attachments and attachment_mode != "passthrough":
             allowed = {"file", "input_file"}
-            if policy.contract_version >= 2:
+            if isinstance(policy.contract_version, int) and policy.contract_version >= 2:
                 allowed |= {"image_url", "input_image"}
             if attachment_mode not in {"extract", "process"}:
                 _clear_request(handler)
@@ -254,10 +276,10 @@ async def process_request(
                     images = ImageBatch(
                         protect_faces=(policy.contract_version == 3 or image_forwarding != "none")
                         and policy.protects_faces(request.model),
-                        policy_version=policy.contract_version,
+                        policy_version=cast(int, policy.contract_version),
                     )
                     texts = await handler.docling.convert(attachments, images=images)
-                    if policy.contract_version >= 3:
+                    if isinstance(policy.contract_version, int) and policy.contract_version >= 3:
                         visual_findings = _visual_findings(attachments, images)
                     if image_forwarding != "none":
                         image_locations = _image_locations(payload, images)
@@ -278,11 +300,17 @@ async def process_request(
         ):
             if (
                 images is not None
-                and policy.contract_version >= 3
+                and policy.contract_version in {3, 4, "4.1"}
                 and not unchecked_without_documents
             ):
                 try:
-                    image_output(policy, request.model, images, None)
+                    image_output(
+                        policy,
+                        request.model,
+                        images,
+                        None,
+                        allow_textless=_allow_inspected_textless(policy, request.model, images),
+                    )
                 except DocumentError as exc:
                     return _image_policy_block(handler, exc)
             if image_locations:
@@ -441,10 +469,16 @@ async def process_request(
         images is not None
         and isinstance(policy, ModelDestinationPolicy)
         and isinstance(request, EngineChatRequest | EngineResponsesRequest)
-        and policy.contract_version >= 3
+        and policy.contract_version in {3, 4, "4.1"}
     ):
         try:
-            output = image_output(policy, request.model, images, reply)
+            output = image_output(
+                policy,
+                request.model,
+                images,
+                reply,
+                allow_textless=_allow_inspected_textless(policy, request.model, images),
+            )
             handler.request_stats.images_forwarded = output.forward_pixels
             if not output.forward_pixels:
                 image_locations.clear()
@@ -530,12 +564,35 @@ def _visual_findings(attachments: list[EngineAttachmentPart], images: ImageBatch
     )
 
 
+def _validate_image_inspections(images: ImageBatch, expected: set[int]) -> None:
+    """Reject missing, extra or failed inspection results before central analysis."""
+    if images.inspections.keys() != expected or any(
+        result.outcome == "failed" for result in images.inspections.values()
+    ):
+        raise DocumentError(reason="image_inspection_failed")
+
+
+def _allow_inspected_textless(
+    policy: ModelDestinationPolicy, model: str, images: ImageBatch
+) -> bool:
+    """Allow textless pixels only after the explicit v4.1 inspection completed."""
+    if policy.contract_version != "4.1" or policy.image_textless[model] != "allow-if-inspected":
+        return False
+    textless = {index for index, present in images.text_present.items() if not present}
+    return bool(textless) and all(
+        images.inspections.get(index) is not None
+        and images.inspections[index].outcome == "no_text_detected"
+        for index in textless
+    )
+
+
 def _image_policy_block(
     handler: StreamHandler, error: DocumentError | None = None
 ) -> ext_proc_pb2.ProcessingResponse:
     """Report the actual rejection reason without rewriting the engine's FACE action."""
     _clear_request(handler)
-    handler.record_dispatch("policy_block")
+    dispatch = "policy_block" if error is None or error.status == 403 else "transport_failure"
+    handler.record_dispatch(dispatch)
     if error is None:
         blocked_entities = (
             {row.entity_type for row in handler.request_stats.report.rows if row.action == "block"}

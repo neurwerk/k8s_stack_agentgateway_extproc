@@ -12,10 +12,11 @@ from pydantic import SecretStr, ValidationError
 from agentgateway_extproc.config.settings import DoclingSettings, Settings
 from agentgateway_extproc.lib.docling import DoclingClient
 from agentgateway_extproc.lib.documents import DocumentError, ImageBatch, preflight
+from agentgateway_extproc.lib.image_inspection import ImageInspectionResult
 from agentgateway_extproc.lib.image_probe import COUNT_HEADER, normalize
 from agentgateway_extproc.lib.pipeline.stream_handler import StreamHandler
 from agentgateway_extproc.models.destination import ModelDestinationPolicy
-from agentgateway_extproc.models.engine import EngineAttachmentPart
+from agentgateway_extproc.models.engine import EngineAttachmentPart, EngineReply
 
 from .conftest import MODEL_POLICY, body_request, header_request
 from .test_documents import _document, _upload
@@ -51,6 +52,52 @@ def _typed_policy(**extra: object) -> dict[str, object]:
     }
 
 
+def _v41_policy(**extra: object) -> dict[str, object]:
+    return {
+        **_typed_policy(
+            contract_version="4.1",
+            models={"test": True},
+            image_modes={"test": "forward-normalized"},
+            image_forwarding={"test": "if-no-pii-detected"},
+            face_protection={"test": True},
+            image_models={"test": True},
+        ),
+        "image_inspection": {"test": "document-and-vision"},
+        "image_textless": {"test": "block"},
+        **extra,
+    }
+
+
+def _pass_reply(request, visual_findings) -> EngineReply:
+    return EngineReply.model_validate(
+        {
+            "api_version": "v1",
+            "decision": "pass",
+            "entities": [],
+            "entity_counts": {},
+            "applied_actions": [],
+            "remote_allowed": True,
+            "route_class": None,
+            "request": request.model_dump(mode="json", by_alias=True, exclude_none=True),
+            "analysis": {
+                "source": "current_request",
+                "scan_performed": True,
+                "duration_ms": 1,
+                "overlap_count": 0,
+                "overlap_resolution": "strictest_action",
+                "policy_version": "test",
+                "text_leaf_count": 1,
+                "cached_decision_applied": False,
+            },
+            "notices": {"request": [], "response": []},
+            "report": {"rows": []},
+            "visual_findings": visual_findings.model_dump(mode="json"),
+            "reversal": {},
+        },
+        strict=True,
+    )
+
+
 @pytest.mark.parametrize("version", [1, 2, 3])
 @pytest.mark.parametrize("field", ["document_modes", "image_modes"])
 def test_v1_v3_reject_v4_maps_even_when_empty(version, field):
@@ -77,6 +124,32 @@ def test_v4_rejects_legacy_or_incomplete_typed_modes():
         del payload[missing]
         with pytest.raises(ValidationError):
             ModelDestinationPolicy.model_validate(payload, strict=True)
+
+
+def test_v41_requires_exact_string_and_dense_typed_inspection_modes():
+    policy = ModelDestinationPolicy.model_validate(_v41_policy(), strict=True)
+    assert policy.contract_version == "4.1"
+    for field in ("image_inspection", "image_textless"):
+        payload = _v41_policy()
+        del payload[field]
+        with pytest.raises(ValidationError):
+            ModelDestinationPolicy.model_validate(payload, strict=True)
+    with pytest.raises(ValidationError):
+        ModelDestinationPolicy.model_validate(
+            _v41_policy(image_inspection={"test": True}), strict=True
+        )
+    with pytest.raises(ValidationError):
+        ModelDestinationPolicy.model_validate(_v41_policy(contract_version=4), strict=True)
+    with pytest.raises(ValidationError):
+        ModelDestinationPolicy.model_validate(
+            _v41_policy(
+                models={"test": False},
+                image_forwarding={"test": "pii-unchecked"},
+                face_protection={"test": False},
+                local_models={"test": True},
+            ),
+            strict=True,
+        )
 
 
 @pytest.mark.parametrize(
@@ -295,6 +368,240 @@ async def test_v4_blocked_part_rejects_whole_batch_before_side_effects(engine_cl
     run.assert_not_called()
     assert response is not None
     assert response.immediate_response.status.code == 403
+
+
+async def test_v41_inspects_canonical_image_and_combines_transcription_for_one_pii_call(
+    engine_client,
+):
+    source_part = image_part()
+    png = normalize(
+        base64.b64decode(source_part["image_url"]["url"].partition(",")[2]),
+        "PNG",
+        policy_version=4,
+    )
+    inspector = AsyncMock()
+    docling = DoclingClient(
+        DoclingSettings(enabled=True, api_key=SecretStr("test-only")),
+        image_inspection=inspector,
+    )
+    handler = StreamHandler(engine_client, Settings(), docling)
+    analyzed = []
+    calls = []
+    inspector.inspect.side_effect = lambda _png: (
+        calls.append("inspection")
+        or (ImageInspectionResult(outcome="text_extracted", transcription="Reader Secret"))
+    )
+
+    async def analyze(request, _session_key, **kwargs):
+        analyzed.append(request)
+        return _pass_reply(request, kwargs["visual_findings"])
+
+    with (
+        patch.object(engine_client, "analyze_request", side_effect=analyze) as pii,
+        patch.object(
+            docling,
+            "_convert_one",
+            side_effect=lambda *_args: calls.append("docling") or _document(),
+        ),
+        patch(
+            "agentgateway_extproc.lib.documents._normalize_image",
+            side_effect=lambda _data, _mime, faces, _version: (
+                calls.append("faces" if faces else "normalize") or png,
+                0,
+            ),
+        ),
+    ):
+        try:
+            policy = _v41_policy()
+            await handler.handle(header_request(policy=policy))
+            response = await handler.handle(
+                body_request(
+                    json.dumps(
+                        {
+                            "model": "test",
+                            "messages": [{"role": "user", "content": [source_part]}],
+                        }
+                    ).encode(),
+                    policy=policy,
+                )
+            )
+        finally:
+            await docling.close()
+
+    inspector.inspect.assert_awaited_once_with(png)
+    assert calls == ["normalize", "docling", "inspection", "faces"]
+    pii.assert_awaited_once()
+    assert len(analyzed) == 1
+    converted = analyzed[0].messages[0].content[0].text
+    assert "Jane Doe" in converted and "Reader Secret" in converted
+    assert response is not None and response.HasField("request_body")
+
+
+async def test_v41_incomplete_docling_image_stops_before_inspection_and_pii(engine_client):
+    inspector = AsyncMock()
+    docling = DoclingClient(
+        DoclingSettings(enabled=True, api_key=SecretStr("test-only")),
+        image_inspection=inspector,
+    )
+    handler = StreamHandler(engine_client, Settings(), docling)
+    incomplete = {**_document(), "pages": {}}
+    with (
+        patch.object(engine_client, "analyze_request", new_callable=AsyncMock) as pii,
+        patch.object(docling, "_convert_one", return_value=incomplete),
+        patch(
+            "agentgateway_extproc.lib.documents._normalize_image",
+            return_value=(b"\x89PNG\r\n\x1a\ncanonical", 0),
+        ),
+    ):
+        try:
+            policy = _v41_policy()
+            await handler.handle(header_request(policy=policy))
+            response = await handler.handle(
+                body_request(
+                    json.dumps(
+                        {
+                            "model": "test",
+                            "messages": [{"role": "user", "content": [image_part()]}],
+                        }
+                    ).encode(),
+                    policy=policy,
+                )
+            )
+        finally:
+            await docling.close()
+
+    inspector.inspect.assert_not_awaited()
+    pii.assert_not_awaited()
+    assert response is not None and response.immediate_response.status.code == 503
+    assert json.loads(response.immediate_response.body)["error"] == {
+        "message": "neurwerk: text extraction could not be completed.",
+        "type": "processing_error",
+        "code": "extraction_failed",
+    }
+
+
+@pytest.mark.parametrize(
+    ("outcome", "status", "code", "message"),
+    [
+        (
+            "unreadable",
+            403,
+            "image_inspection_unreadable",
+            "neurwerk: text was detected in an image but could not be read reliably.",
+        ),
+        (
+            "failed",
+            503,
+            "image_inspection_failed",
+            "neurwerk: required image inspection could not be completed.",
+        ),
+    ],
+)
+async def test_v41_inspection_failure_stops_after_docling_before_pii_and_dispatch(
+    engine_client, outcome, status, code, message
+):
+    calls = []
+    inspector = AsyncMock()
+    inspector.inspect.side_effect = lambda _png: (
+        calls.append("inspection") or ImageInspectionResult(outcome=outcome)
+    )
+    docling = DoclingClient(
+        DoclingSettings(enabled=True, api_key=SecretStr("test-only")),
+        image_inspection=inspector,
+    )
+    handler = StreamHandler(engine_client, Settings(), docling)
+    source_part = image_part()
+    with (
+        patch.object(engine_client, "analyze_request", new_callable=AsyncMock) as pii,
+        patch.object(
+            docling,
+            "_convert_one",
+            new_callable=AsyncMock,
+            side_effect=lambda *_args: calls.append("docling") or _document(),
+        ) as reader,
+        patch(
+            "agentgateway_extproc.lib.documents._normalize_image",
+            return_value=(b"\x89PNG\r\n\x1a\ncanonical", 0),
+        ),
+    ):
+        try:
+            policy = _v41_policy()
+            await handler.handle(header_request(policy=policy))
+            response = await handler.handle(
+                body_request(
+                    json.dumps(
+                        {
+                            "model": "test",
+                            "messages": [{"role": "user", "content": [source_part]}],
+                        }
+                    ).encode(),
+                    policy=policy,
+                )
+            )
+        finally:
+            await docling.close()
+
+    reader.assert_awaited_once()
+    assert calls == ["docling", "inspection"]
+    pii.assert_not_awaited()
+    assert response is not None and response.immediate_response.status.code == status
+    error = json.loads(response.immediate_response.body)["error"]
+    assert error["code"] == code and error["message"] == message
+
+
+@pytest.mark.parametrize("textless_mode", ["block", "allow-if-inspected"])
+async def test_v41_textless_forwarding_requires_explicit_inspected_policy(
+    engine_client, textless_mode
+):
+    inspector = AsyncMock()
+    inspector.inspect.return_value = ImageInspectionResult(outcome="no_text_detected")
+    docling = DoclingClient(
+        DoclingSettings(enabled=True, api_key=SecretStr("test-only")),
+        image_inspection=inspector,
+    )
+    handler = StreamHandler(engine_client, Settings(), docling)
+    source_part = image_part()
+
+    async def analyze(request, _session_key, **kwargs):
+        return _pass_reply(request, kwargs["visual_findings"])
+
+    with (
+        patch.object(engine_client, "analyze_request", side_effect=analyze) as pii,
+        patch.object(docling, "_convert_one", return_value=_document()),
+        patch("agentgateway_extproc.lib.docling.project_document", return_value=("", 1)),
+        patch(
+            "agentgateway_extproc.lib.documents._normalize_image",
+            return_value=(b"\x89PNG\r\n\x1a\ncanonical", 0),
+        ),
+    ):
+        try:
+            policy = _v41_policy(image_textless={"test": textless_mode})
+            await handler.handle(header_request(policy=policy))
+            response = await handler.handle(
+                body_request(
+                    json.dumps(
+                        {
+                            "model": "test",
+                            "messages": [{"role": "user", "content": [source_part]}],
+                        }
+                    ).encode(),
+                    policy=policy,
+                )
+            )
+        finally:
+            await docling.close()
+
+    pii.assert_awaited_once()
+    assert response is not None
+    if textless_mode == "block":
+        assert response.immediate_response.status.code == 403
+        assert json.loads(response.immediate_response.body)["error"] == {
+            "message": "neurwerk: this model does not allow images with no detected text.",
+            "type": "policy_error",
+            "code": "image_textless_blocked",
+        }
+    else:
+        assert response.HasField("request_body")
 
 
 def _webp_part(*, animated: bool = False) -> EngineAttachmentPart:
