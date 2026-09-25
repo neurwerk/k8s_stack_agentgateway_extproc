@@ -604,7 +604,29 @@ def _image_policy_block(
             reason=("face_policy_blocked" if blocked_entities == {"FACE"} else "policy_blocked"),
         )
     message = error.message
-    payload: dict[str, object] = {}
+    stage = (
+        "extraction"
+        if error.reason.startswith("extraction_")
+        else "image_inspection"
+        if error.reason.startswith("image_inspection_")
+        else "pii_analysis"
+        if error.reason.startswith("image_analysis_")
+        else "policy"
+    )
+    _logger.log(
+        logging.INFO if error.status == 403 else logging.WARNING,
+        "attachment processing stopped stage=%s status=%d reason=%s",
+        stage,
+        error.status,
+        error.reason,
+    )
+    payload: dict[str, object] = {
+        "attachment_report": {
+            "stage": stage,
+            "status": error.status,
+            "reason": error.reason,
+        }
+    }
     if stats := handler.request_stats:
         stats.decision = "block"
         stats.route_class = None

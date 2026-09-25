@@ -13,6 +13,7 @@ from agentgateway_extproc.config.settings import DoclingSettings, Settings
 from agentgateway_extproc.lib.docling import DoclingClient
 from agentgateway_extproc.lib.documents import DocumentError, ImageBatch, preflight
 from agentgateway_extproc.lib.image_inspection import ImageInspectionResult
+from agentgateway_extproc.lib.image_policy import _text_fallback
 from agentgateway_extproc.lib.image_probe import COUNT_HEADER, normalize
 from agentgateway_extproc.lib.pipeline.stream_handler import StreamHandler
 from agentgateway_extproc.models.destination import ModelDestinationPolicy
@@ -545,8 +546,14 @@ async def test_v41_inspection_failure_stops_after_docling_before_pii_and_dispatc
     assert calls == ["docling", "inspection"]
     pii.assert_not_awaited()
     assert response is not None and response.immediate_response.status.code == status
-    error = json.loads(response.immediate_response.body)["error"]
+    payload = json.loads(response.immediate_response.body)
+    error = payload["error"]
     assert error["code"] == code and error["message"] == message
+    assert payload["attachment_report"] == {
+        "stage": "image_inspection",
+        "status": status,
+        "reason": code,
+    }
 
 
 @pytest.mark.parametrize("textless_mode", ["block", "allow-if-inspected"])
@@ -602,6 +609,16 @@ async def test_v41_textless_forwarding_requires_explicit_inspected_policy(
         }
     else:
         assert response.HasField("request_body")
+
+
+def test_v41_textless_image_cannot_satisfy_text_only_delivery():
+    with pytest.raises(DocumentError) as failure:
+        _text_fallback(False, allow_textless=True)
+
+    assert failure.value.reason == "image_text_only_unavailable"
+    assert failure.value.message == (
+        "neurwerk: policy requires text-only delivery, but no image text is available."
+    )
 
 
 def _webp_part(*, animated: bool = False) -> EngineAttachmentPart:
