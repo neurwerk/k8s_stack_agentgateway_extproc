@@ -73,6 +73,37 @@ class DoclingSettings(BaseModel):
         return self
 
 
+class ImageInspectionSettings(BaseModel):
+    """Configure the private OpenAI-compatible image inspection endpoint."""
+
+    enabled: bool = False
+    base_url: str = "https://image-inspection.invalid"
+    allow_http: bool = False
+    ca_cert: str | None = None
+    api_key: SecretStr | None = None
+    model: str = ""
+    timeout: float = Field(default=90, gt=0, le=600)
+
+    @model_validator(mode="after")
+    def validate_service(self) -> ImageInspectionSettings:
+        """Require a fixed private HTTPS destination and credential when enabled."""
+        url = urlsplit(self.base_url)
+        if self.enabled and (
+            url.scheme not in ({"https", "http"} if self.allow_http else {"https"})
+            or not url.hostname
+            or url.username is not None
+            or url.password is not None
+            or url.query
+            or url.fragment
+            or url.path not in {"", "/"}
+            or not self.api_key
+            or not self.api_key.get_secret_value()
+            or not self.model
+        ):
+            raise ValueError("image inspection requires an HTTPS origin, API key and model")  # noqa: TRY003
+        return self
+
+
 class Settings(BaseSettings):
     """Load adapter configuration from ``EXTPROC_`` environment variables."""
 
@@ -80,6 +111,7 @@ class Settings(BaseSettings):
 
     engine: EngineSettings = Field(default_factory=EngineSettings)
     docling: DoclingSettings = Field(default_factory=DoclingSettings)
+    image_inspection: ImageInspectionSettings = Field(default_factory=ImageInspectionSettings)
     debug: bool = False
     max_request_bytes: int = Field(default=MAX_REQUEST_BYTES, ge=1_024, le=MAX_UPLOAD_REQUEST_BYTES)
     max_response_bytes: int = Field(default=MAX_RESPONSE_BYTES, ge=1_024, le=MAX_RESPONSE_BYTES)

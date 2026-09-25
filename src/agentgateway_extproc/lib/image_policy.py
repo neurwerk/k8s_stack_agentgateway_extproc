@@ -18,7 +18,12 @@ class ImageOutput:
 
 
 def image_output(
-    policy: ModelDestinationPolicy, model: str, images: ImageBatch, reply: EngineReply | None
+    policy: ModelDestinationPolicy,
+    model: str,
+    images: ImageBatch,
+    reply: EngineReply | None,
+    *,
+    allow_textless: bool = False,
 ) -> ImageOutput:
     """Apply terminal and face policy first, then the model's forwarding mode."""
     forwarding = policy.image_forwarding.get(model, "none")
@@ -32,6 +37,8 @@ def image_output(
         raise DocumentError(
             403, reason=("face_policy_blocked" if face_action == "block" else "policy_blocked")
         )
+    if policy.contract_version == "4.1" and not has_text and not allow_textless:
+        raise DocumentError(403, reason="image_textless_blocked")
     if face_action == "text-only":
         if not has_text:
             raise DocumentError(403, reason="face_text_unavailable")
@@ -50,7 +57,7 @@ def image_output(
         ):
             raise DocumentError(403)
         return ImageOutput(True)
-    return _conditional_output(forwarding, has_text, reply)
+    return _conditional_output(forwarding, has_text, reply, allow_textless=allow_textless)
 
 
 def _face_reroute_output(
@@ -74,9 +81,15 @@ def _face_reroute_output(
     return ImageOutput(True)
 
 
-def _conditional_output(forwarding: str, has_text: bool, reply: EngineReply | None) -> ImageOutput:
+def _conditional_output(
+    forwarding: str,
+    has_text: bool,
+    reply: EngineReply | None,
+    *,
+    allow_textless: bool = False,
+) -> ImageOutput:
     """Require fresh text analysis before applying strict or policy-aware forwarding."""
-    if not has_text:
+    if not has_text and not allow_textless:
         raise DocumentError(403, reason="image_analysis_text_unavailable")
     if (
         reply is None

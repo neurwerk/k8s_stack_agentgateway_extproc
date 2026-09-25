@@ -86,6 +86,16 @@ All attachment paths share one batch admission, deadline and cancellation lifecy
 Image-only unchecked batches require no enabled Docling service or credentials;
 Docling is required only when the batch selects attachments for text extraction.
 
+Contract version `"4.1"` keeps v4 typed attachment behavior and adds dense
+`image_inspection` (`document-only` or `document-and-vision`) and
+`image_textless` (`block` or `allow-if-inspected`) maps. The latter is valid only
+with private vision inspection and existing checked normalized-image forwarding.
+The private OpenAI-compatible inspector receives canonical PNGs with fixed request
+settings. Its transcription is combined with document-reader text for the single
+existing PII call. Every selected image is inspected even when Docling found text;
+unreadable images return 403, and failed or incomplete inspection returns 503
+(timeouts may return 504), before PII or model dispatch.
+
 ### Document Conversion
 
 The current source supports PDF, DOCX, XLSX, PPTX, UTF-8 TXT, Markdown and CSV.
@@ -392,6 +402,12 @@ Document settings use `EXTPROC_DOCLING__` plus these names (byte units are bytes
 | `COUNT` | `5` | 1 through 20 |
 | `PAGES` | `200` | Aggregate, 1 through 1000 |
 | `MAX_RESPONSE_BYTES` | `16777216` | 1024 through 16777216 |
+
+V4.1 private inspection uses `EXTPROC_IMAGE_INSPECTION__ENABLED`, `BASE_URL`,
+`ALLOW_HTTP`, `CA_CERT`, `API_KEY`, `MODEL`, and `TIMEOUT` (90 seconds by default,
+at most 600). When enabled, the origin must be credential-free HTTPS unless HTTP
+is explicitly allowed, and the API key and model are required. The client always
+calls its fixed `/v1/chat/completions` contract.
 
 Docling HTTP calls have a fixed 30-second bound; task status replies are capped at
 64 KiB. All files share the Docling batch deadline. `EXTPROC_ENGINE__TIMEOUT` bounds

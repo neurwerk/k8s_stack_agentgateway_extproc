@@ -17,7 +17,7 @@ import unicodedata
 import zipfile
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
-from typing import cast
+from typing import TYPE_CHECKING, cast
 from xml.parsers import expat
 
 from agentgateway_extproc.config.settings import MEBIBYTE, DoclingSettings
@@ -28,6 +28,9 @@ from agentgateway_extproc.lib.image_probe import (
     MAX_SOURCE_BYTES,
 )
 from agentgateway_extproc.models.engine import EngineAttachmentPart
+
+if TYPE_CHECKING:
+    from agentgateway_extproc.lib.image_inspection import ImageInspectionResult
 
 MAX_TEXT = 4_000_000
 MAX_NODES = 20_000
@@ -79,6 +82,12 @@ class DocumentError(Exception):
                 "extraction_failed": "text extraction could not be completed.",
                 "extraction_timeout": "text extraction timed out.",
                 "image_analysis_failed": "required image safety analysis could not be completed.",
+                "image_inspection_failed": "required image inspection could not be completed.",
+                "image_inspection_timeout": "image inspection timed out. Please retry.",
+                "image_inspection_unreadable": (
+                    "text was detected in an image but could not be read reliably."
+                ),
+                "image_textless_blocked": "this model does not allow images with no detected text.",
                 "image_processing_unavailable": (
                     "configured extraction mode does not support images."
                 ),
@@ -130,11 +139,13 @@ class ImageBatch:
     """Retain only normalized images under the existing batch admission slot."""
 
     protect_faces: bool = True
+    defer_face_inspection: bool = False
     images: dict[int, str] = dataclass_field(default_factory=dict)
     policy_version: int = 2
     face_count: int = 0
     scan_status: str = "not_scanned"
     text_present: dict[int, bool] = dataclass_field(default_factory=dict)
+    inspections: dict[int, ImageInspectionResult] = dataclass_field(default_factory=dict)
 
 
 def preflight(  # noqa: C901 - publish scan provenance only after the complete batch passes
@@ -195,11 +206,23 @@ def _decode_image(
     limit = min(settings.file_bytes, MAX_SOURCE_BYTES if modern else MAX_IMAGE_BYTES)
     mime, data = _image_data(part, limit, policy_version=images.policy_version)
     _check_preflight(abandoned, deadline)
-    normalized, count = _normalize_image(data, mime, images.protect_faces, images.policy_version)
+    normalized, count = _normalize_image(
+        data,
+        mime,
+        images.protect_faces and not images.defer_face_inspection,
+        images.policy_version,
+    )
     if len(normalized) > min(settings.file_bytes, MAX_IMAGE_BYTES):
         raise DocumentError(413)
     images.face_count += count
     return Upload("image.png", "img", normalized, pages=1, source_bytes=len(data))
+
+
+def inspect_canonical_faces(images: ImageBatch, index: int, png: bytes) -> None:
+    """Run deferred face inspection and retain only its canonical output and count."""
+    normalized, count = _normalize_image(png, "png", True, images.policy_version)
+    images.images[index] = "data:image/png;base64," + base64.b64encode(normalized).decode()
+    images.face_count += count
 
 
 def _image_data(

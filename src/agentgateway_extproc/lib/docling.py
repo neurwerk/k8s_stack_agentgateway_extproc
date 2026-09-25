@@ -18,8 +18,13 @@ from agentgateway_extproc.lib.documents import (
     DocumentError,
     ImageBatch,
     Upload,
+    inspect_canonical_faces,
     preflight,
     project_document,
+)
+from agentgateway_extproc.lib.image_inspection import (
+    ImageInspectionClient,
+    ImageInspectionTimeoutError,
 )
 from agentgateway_extproc.lib.pipeline.mcp import strict_json_loads
 from agentgateway_extproc.models.engine import EngineAttachmentPart
@@ -33,7 +38,12 @@ _logger = logging.getLogger(__name__)
 class DoclingClient:
     """Admit one batch until all local work and its native job have stopped."""
 
-    def __init__(self, settings: DoclingSettings, client: httpx.AsyncClient | None = None) -> None:
+    def __init__(
+        self,
+        settings: DoclingSettings,
+        client: httpx.AsyncClient | None = None,
+        image_inspection: ImageInspectionClient | None = None,
+    ) -> None:
         """Own one verified HTTP client; an injected transport is for local tests."""
         self.settings = settings
         self._client = client
@@ -50,15 +60,23 @@ class DoclingClient:
         self._abandoned = threading.Event()
         self._poisoned = False
         self._closed = False
+        self._active_stage = "extraction"
+        self.image_inspection = image_inspection
 
     async def convert(
         self,
         parts: list[EngineAttachmentPart],
         *,
         images: ImageBatch | None = None,
+        inspect_images: set[int] | None = None,
     ) -> list[str]:
         """Extract every attachment, preserving the legacy ordered result."""
-        texts = await self.convert_selected(parts, set(range(len(parts))), images=images)
+        texts = await self.convert_selected(
+            parts,
+            set(range(len(parts))),
+            images=images,
+            inspect_images=inspect_images,
+        )
         return list(texts.values())
 
     async def convert_selected(
@@ -67,6 +85,7 @@ class DoclingClient:
         selected: set[int],
         *,
         images: ImageBatch | None = None,
+        inspect_images: set[int] | None = None,
     ) -> dict[int, str]:
         """Admit one batch; an empty selection normalizes images without Docling."""
         if (
@@ -78,8 +97,11 @@ class DoclingClient:
             raise DocumentError(reason="extraction_unavailable")
         abandoned = threading.Event()
         self._abandoned = abandoned
+        self._active_stage = "extraction"
         deadline = time.monotonic() + self.settings.timeout
-        task = asyncio.create_task(self._batch(parts, selected, abandoned, deadline, images))
+        task = asyncio.create_task(
+            self._batch(parts, selected, abandoned, deadline, images, inspect_images or set())
+        )
         self._task = task
         task.add_done_callback(self._finished)
         try:
@@ -87,7 +109,12 @@ class DoclingClient:
                 return await asyncio.shield(task)
         except TimeoutError:
             abandoned.set()
-            raise DocumentError(504) from None
+            reason = (
+                "image_inspection_timeout"
+                if self._active_stage == "image_inspection"
+                else "extraction_timeout"
+            )
+            raise DocumentError(504, reason=reason) from None
         except asyncio.CancelledError:
             abandoned.set()
             raise
@@ -107,13 +134,14 @@ class DoclingClient:
         if self._owns_client and self._client is not None:
             await self._client.aclose()
 
-    async def _batch(
+    async def _batch(  # noqa: C901
         self,
         parts: list[EngineAttachmentPart],
         selected: set[int],
         abandoned: threading.Event,
         deadline: float,
         images: ImageBatch | None = None,
+        inspect_images: set[int] | None = None,
     ) -> dict[int, str]:
         """Validate every part before extracting the selected uploads in order."""
         try:
@@ -136,7 +164,13 @@ class DoclingClient:
             if abandoned.is_set():
                 break
             if time.monotonic() >= deadline:
-                raise DocumentError(504)
+                raise DocumentError(504, reason="extraction_timeout")
+            canonical_image = (
+                upload.data
+                if index in (inspect_images or set()) and upload.format == "img"
+                else None
+            )
+            self._active_stage = "extraction"
             document = await self._convert_one(upload, abandoned)
             upload.data = b""
             if abandoned.is_set():
@@ -149,7 +183,31 @@ class DoclingClient:
                 allow_empty_image=images is not None and images.policy_version >= 3,
             )
             if images is not None and upload.format == "img":
-                images.text_present[index] = bool(text)
+                if index in (inspect_images or set()):
+                    if canonical_image is None:
+                        raise DocumentError(reason="image_inspection_failed")
+                    self._active_stage = "image_inspection"
+                    await self._inspect_image(index, canonical_image, images, abandoned, deadline)
+                    if images.protect_faces and images.defer_face_inspection:
+                        if abandoned.is_set() or time.monotonic() >= deadline:
+                            raise DocumentError(504, reason="image_inspection_timeout")
+                        self._active_stage = "image_analysis"
+                        await asyncio.to_thread(
+                            inspect_canonical_faces, images, index, canonical_image
+                        )
+                inspection = images.inspections.get(index)
+                transcription = (
+                    inspection.transcription
+                    if inspection is not None and inspection.outcome == "text_extracted"
+                    else None
+                )
+                images.text_present[index] = bool(text.strip() or transcription)
+                if transcription is not None:
+                    text = (
+                        f"{text}\n\n[Image inspection transcription]\n{transcription}"
+                        if text
+                        else transcription
+                    )
                 text = text or "[Image: no text extracted]"
             document = None
             pages += count
@@ -158,6 +216,35 @@ class DoclingClient:
                 raise DocumentError(413)
             output[index] = text
         return output
+
+    async def _inspect_image(
+        self,
+        index: int,
+        png: bytes,
+        images: ImageBatch,
+        abandoned: threading.Event,
+        deadline: float,
+    ) -> None:
+        """Inspect one canonical image after its complete Docling projection."""
+        if abandoned.is_set():
+            return
+        if time.monotonic() >= deadline:
+            raise DocumentError(504, reason="image_inspection_timeout")
+        inspector = self.image_inspection
+        if inspector is None:
+            raise DocumentError(reason="image_inspection_failed")
+        try:
+            async with asyncio.timeout(deadline - time.monotonic()):
+                result = await inspector.inspect(png)
+        except (TimeoutError, ImageInspectionTimeoutError):
+            raise DocumentError(504, reason="image_inspection_timeout") from None
+        if abandoned.is_set() or time.monotonic() >= deadline:
+            raise DocumentError(504, reason="image_inspection_timeout")
+        images.inspections[index] = result
+        if result.outcome == "unreadable":
+            raise DocumentError(403, reason="image_inspection_unreadable")
+        if result.outcome == "failed":
+            raise DocumentError(reason="image_inspection_failed")
 
     async def _convert_one(self, upload: Upload, abandoned: threading.Event) -> object:
         terminal = False
