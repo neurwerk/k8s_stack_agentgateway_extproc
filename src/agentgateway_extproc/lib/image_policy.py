@@ -41,7 +41,12 @@ def image_output(
         raise DocumentError(403, reason="image_textless_blocked")
     if face_action == "text-only":
         if not has_text:
-            raise DocumentError(403, reason="face_text_unavailable")
+            raise DocumentError(
+                403,
+                reason=(
+                    "image_text_only_unavailable" if allow_textless else "face_text_unavailable"
+                ),
+            )
         return ImageOutput(
             False, "neurwerk: face policy requires text-only processing; images not forwarded."
         )
@@ -107,7 +112,7 @@ def _conditional_output(
         if reply.decision in {"apply_actions", "reroute"}:
             # Text-triggered reroutes retain the engine route but never infer image
             # capability from its name. Only the FACE branch has a pixel binding.
-            return _text_fallback(has_text)
+            return _text_fallback(has_text, allow_textless=allow_textless)
         raise DocumentError(403)
     if reply.entities or reply.report.rows:
         raise DocumentError(403, reason="image_pii_detected")
@@ -116,9 +121,16 @@ def _conditional_output(
     return ImageOutput(True)
 
 
-def _text_fallback(has_text: bool) -> ImageOutput:
+def _text_fallback(has_text: bool, *, allow_textless: bool = False) -> ImageOutput:
     if not has_text:
-        raise DocumentError(403, reason="image_analysis_text_unavailable")
+        raise DocumentError(
+            403,
+            reason=(
+                "image_text_only_unavailable"
+                if allow_textless
+                else "image_analysis_text_unavailable"
+            ),
+        )
     return ImageOutput(
         False, "neurwerk: PII policy applied; extracted text forwarded without images."
     )
