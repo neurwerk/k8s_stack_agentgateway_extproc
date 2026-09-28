@@ -88,6 +88,9 @@ class DocumentError(Exception):
                     "text was detected in an image but could not be read reliably."
                 ),
                 "image_textless_blocked": "this model does not allow images with no detected text.",
+                "image_text_only_unavailable": (
+                    "policy requires text-only delivery, but no image text is available."
+                ),
                 "image_processing_unavailable": (
                     "configured extraction mode does not support images."
                 ),
