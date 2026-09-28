@@ -51,7 +51,7 @@ def image_output(
             False, "neurwerk: face policy requires text-only processing; images not forwarded."
         )
     if face_action == "reroute":
-        return _face_reroute_output(policy, model, has_text, reply)
+        return _face_reroute_output(policy, model, has_text, reply, allow_textless=allow_textless)
     if forwarding == "none":
         if not has_text:
             raise DocumentError(403, reason="image_text_unavailable")
@@ -66,7 +66,12 @@ def image_output(
 
 
 def _face_reroute_output(
-    policy: ModelDestinationPolicy, model: str, has_text: bool, reply: EngineReply | None
+    policy: ModelDestinationPolicy,
+    model: str,
+    has_text: bool,
+    reply: EngineReply | None,
+    *,
+    allow_textless: bool = False,
 ) -> ImageOutput:
     """Require the exact local vision binding, preserving any text transformations."""
     forwarding = policy.image_forwarding.get(model, "none")
@@ -81,7 +86,7 @@ def _face_reroute_output(
         row.entity_type != "FACE" and row.transformed_count for row in reply.report.rows
     )
     if forwarding == "if-policy-allows" and text_transformed:
-        return _text_fallback(has_text)
+        return _text_fallback(has_text, allow_textless=allow_textless)
     # Approved local vision routes can receive images even when OCR found no text.
     return ImageOutput(True)
 

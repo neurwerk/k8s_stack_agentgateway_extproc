@@ -3,6 +3,8 @@ from __future__ import annotations
 import base64
 import io
 import json
+from types import SimpleNamespace
+from typing import cast
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -13,7 +15,7 @@ from agentgateway_extproc.config.settings import DoclingSettings, Settings
 from agentgateway_extproc.lib.docling import DoclingClient
 from agentgateway_extproc.lib.documents import DocumentError, ImageBatch, preflight
 from agentgateway_extproc.lib.image_inspection import ImageInspectionResult
-from agentgateway_extproc.lib.image_policy import _text_fallback
+from agentgateway_extproc.lib.image_policy import image_output
 from agentgateway_extproc.lib.image_probe import COUNT_HEADER, normalize
 from agentgateway_extproc.lib.pipeline.stream_handler import StreamHandler
 from agentgateway_extproc.models.destination import ModelDestinationPolicy
@@ -612,8 +614,35 @@ async def test_v41_textless_forwarding_requires_explicit_inspected_policy(
 
 
 def test_v41_textless_image_cannot_satisfy_text_only_delivery():
+    policy = cast(
+        ModelDestinationPolicy,
+        SimpleNamespace(
+            contract_version="4.1",
+            image_forwarding={"test": "if-policy-allows"},
+            image_reroutes={"test": {"safe": "local"}},
+        ),
+    )
+    reply = cast(
+        EngineReply,
+        SimpleNamespace(
+            decision="reroute",
+            route_class="safe",
+            report=SimpleNamespace(
+                rows=[
+                    SimpleNamespace(entity_type="FACE", action="reroute", transformed_count=0),
+                    SimpleNamespace(entity_type="PERSON", action="replace", transformed_count=1),
+                ]
+            ),
+        ),
+    )
     with pytest.raises(DocumentError) as failure:
-        _text_fallback(False, allow_textless=True)
+        image_output(
+            policy,
+            "test",
+            ImageBatch(text_present={0: False}),
+            reply,
+            allow_textless=True,
+        )
 
     assert failure.value.reason == "image_text_only_unavailable"
     assert failure.value.message == (
