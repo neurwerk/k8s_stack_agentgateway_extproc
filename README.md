@@ -90,11 +90,13 @@ Contract version `"4.1"` keeps v4 typed attachment behavior and adds dense
 `image_inspection` (`document-only` or `document-and-vision`) and
 `image_textless` (`block` or `allow-if-inspected`) maps. The latter is valid only
 with private vision inspection and existing checked normalized-image forwarding.
-The private OpenAI-compatible inspector receives canonical PNGs with fixed request
-settings. Its transcription is combined with document-reader text for the single
-existing PII call. Every selected image is inspected even when Docling found text;
-unreadable images return 403, and failed or incomplete inspection returns 503
-(timeouts may return 504), before PII or model dispatch.
+The private OpenAI-compatible inspector receives canonical PNGs with fixed native-OCR
+request settings. Complete text becomes `text_extracted`, a marker-only image result
+becomes `no_text_detected`, and output-limit exhaustion becomes `unreadable`; malformed,
+empty or otherwise incomplete responses fail closed. Its transcription is combined
+with document-reader text for the single existing PII call. Every selected image is
+inspected even when Docling found text; unreadable images return 403, and failed
+inspection returns 503 (timeouts may return 504), before PII or model dispatch.
 
 ### Document Conversion
 

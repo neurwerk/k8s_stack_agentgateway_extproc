@@ -22,11 +22,7 @@ async def test_client_uses_fixed_request_and_accepts_only_bounded_result():
                 "choices": [
                     {
                         "finish_reason": "stop",
-                        "message": {
-                            "content": json.dumps(
-                                {"outcome": "text_extracted", "transcription": "Jane Doe"}
-                            )
-                        },
+                        "message": {"content": "Jane Doe"},
                     }
                 ]
             },
@@ -48,37 +44,40 @@ async def test_client_uses_fixed_request_and_accepts_only_bounded_result():
 
     assert result.outcome == "text_extracted" and result.transcription == "Jane Doe"
     assert seen["model"] == "private-reader"
-    assert seen["temperature"] == 0 and seen["stream"] is False
+    assert seen["temperature"] == 0.2 and seen["top_p"] == 0.9
+    assert seen["stream"] is False and "response_format" not in seen
     messages = seen["messages"]
     assert isinstance(messages, list)
-    user = messages[1]
+    assert len(messages) == 1
+    user = messages[0]
     assert isinstance(user, dict)
     content = user["content"]
     assert isinstance(content, list)
-    image_part = content[1]
+    assert len(content) == 1
+    image_part = content[0]
     assert isinstance(image_part, dict)
     image = image_part["image_url"]
     assert isinstance(image, dict)
-    assert image["url"].startswith("data:image/png;base64,") and image["detail"] == "high"
+    assert image["url"].startswith("data:image/png;base64,")
 
 
 @pytest.mark.parametrize(
-    "content",
+    ("finish_reason", "content", "expected"),
     [
-        '{"outcome":"text_extracted","transcription":""}',
-        '{"outcome":"no_text_detected","transcription":" "}',
-        '{"outcome":"unreadable","transcription":"description"}',
-        '{"outcome":"no_text_detected"',
+        ("stop", "![image](image_1.png)", ImageInspectionResult(outcome="no_text_detected")),
+        ("length", "repeated output", ImageInspectionResult(outcome="unreadable")),
+        ("stop", "", ImageInspectionResult(outcome="failed")),
+        ("content_filter", "text", ImageInspectionResult(outcome="failed")),
     ],
 )
-async def test_client_rejects_incomplete_or_inconsistent_results(content):
+async def test_client_maps_native_ocr_outcomes(finish_reason, content, expected):
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
             json={
                 "choices": [
                     {
-                        "finish_reason": "stop",
+                        "finish_reason": finish_reason,
                         "message": {"content": content},
                     }
                 ]
@@ -95,4 +94,4 @@ async def test_client_rejects_incomplete_or_inconsistent_results(content):
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
         result = await ImageInspectionClient(settings, http).inspect(b"canonical-png")
 
-    assert result == ImageInspectionResult(outcome="failed")
+    assert result == expected
