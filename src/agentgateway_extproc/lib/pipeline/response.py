@@ -412,16 +412,33 @@ def _responses_json_notice_target(
 
 
 def _notice_configured(handler: StreamHandler) -> bool:
-    return handler.request_stats is not None or any(
-        message.strip() for message in handler.notice_messages
-    )
+    return bool(_render_handler_notice(handler))
 
 
 def _render_handler_notice(handler: StreamHandler) -> str:
     if not handler.response_notice_allowed:
         return ""
     report = ""
+    messages = handler.notice_messages
     if stats := handler.request_stats:
+        preferences = handler.notice_preferences
+        # Engine prose describes the whole decision and cannot safely be split into
+        # categories. Keep visual safety and adapter image notices independently.
+        visible = (
+            not stats.report.rows and stats.decision == "pass" and preferences.show_no_pii
+        ) or (
+            bool(stats.report.rows)
+            and all(
+                row.entity_type == "FACE"
+                or (row.action == "pass" and preferences.show_pass)
+                or (row.action == "reroute" and preferences.show_reroutes)
+                or (row.action not in {"pass", "reroute"} and preferences.show_changes)
+                for row in stats.report.rows
+            )
+            and (stats.decision != "reroute" or preferences.show_reroutes)
+        )
+        if not visible:
+            messages = []
         report = render_report(
             stats.report,
             stats.analysis,
@@ -431,8 +448,9 @@ def _render_handler_notice(handler: StreamHandler) -> str:
             visual_findings=stats.visual_findings,
             text_pii_enabled=handler.text_pii_enabled,
             images_forwarded=stats.images_forwarded,
+            preferences=preferences,
         )
-    return render_notice(handler.notice_messages, report)
+    return render_notice([*messages, *handler.safety_notice_messages], report)
 
 
 class SseResponseProcessor:
@@ -1079,6 +1097,7 @@ def process_response_chunk(
     if end_of_stream:
         handler.reversal_map.clear()
         handler.notice_messages.clear()
+        handler.safety_notice_messages.clear()
     return _streamed(transformed, end_of_stream)
 
 

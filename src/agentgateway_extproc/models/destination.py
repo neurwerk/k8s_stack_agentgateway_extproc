@@ -31,6 +31,9 @@ class ModelDestinationPolicy(DestinationModel):
     contract_version: Literal[1, 2, 3, 4, "4.1"]
     destination_kind: Literal["model"]
     principal_id: str
+    credential_context_version: Literal["1"] | None = None
+    credential_id: str | None = None
+    credential_kind: Literal["personal", "managed"] | None = None
     models: dict[ModelId, bool] = Field(min_length=1, max_length=256)
     attachment_modes: dict[ModelId, Literal["block", "extract", "process", "passthrough"]] = Field(
         default_factory=dict, max_length=256
@@ -118,6 +121,21 @@ class ModelDestinationPolicy(DestinationModel):
     def validate_principal(cls, value: str) -> str:
         """Require a bounded printable opaque principal."""
         return _validated_principal(value)
+
+    @field_validator("credential_id")
+    @classmethod
+    def validate_credential(cls, value: str | None) -> str | None:
+        """Accept only bounded, printable trusted credential identifiers."""
+        return _validated_principal(value) if value is not None else None
+
+    @model_validator(mode="after")
+    def validate_credential_binding(self) -> ModelDestinationPolicy:
+        """Never interpret an unpaired ID or kind as a personal credential."""
+        if (self.credential_id is None) != (self.credential_kind is None) or (
+            self.credential_context_version is None
+        ) != (self.credential_id is None):
+            raise ValueError("credential ID and kind must be supplied together")  # noqa: TRY003
+        return self
 
     @model_validator(mode="after")
     def validate_attachment_modes(self) -> ModelDestinationPolicy:  # noqa: C901

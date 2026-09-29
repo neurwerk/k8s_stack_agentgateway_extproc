@@ -483,7 +483,7 @@ async def process_request(
             if not output.forward_pixels:
                 image_locations.clear()
             if output.notice:
-                handler.notice_messages.append(output.notice)
+                handler.safety_notice_messages.append(output.notice)
         except DocumentError as exc:
             return _image_policy_block(handler, exc)
     transformed = reply.request
