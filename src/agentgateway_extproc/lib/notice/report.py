@@ -25,14 +25,14 @@ def render_report(
     preferences: NoticePreferences = DEFAULT_PREFERENCES,
 ) -> str:
     """Render provenance and per-entity counts without including literal PII."""
+    if not preferences.notices_enabled:
+        return ""
     lines: list[str] = []
     if preferences.show_timing and (operational := render_analysis_notice(analysis)):
         lines.append(operational)
     if visual_findings is not None:
         faces = visual_findings.faces
-        show_face_status = (
-            (faces.count or 0) > 0 or faces.scan_status == "failed" or preferences.show_no_pii
-        )
+        show_face_status = face_status_visible(faces.scan_status, faces.count, preferences)
         if not text_pii_enabled and show_face_status:
             lines.append("Text PII analysis was disabled.")
         if show_face_status:
@@ -43,14 +43,7 @@ def render_report(
                 if faces.scan_status == "not_scanned"
                 else "Face scan failed."
             )
-    rows = [
-        row
-        for row in report.rows
-        if row.entity_type == "FACE"
-        or (row.action == "pass" and preferences.show_pass)
-        or (row.action == "reroute" and preferences.show_reroutes)
-        or (row.action not in {"pass", "reroute"} and preferences.show_changes)
-    ]
+    rows = [row for row in report.rows if row_visible(row, preferences)]
     show_result = bool(rows) or (not report.rows and decision == "pass" and preferences.show_no_pii)
     if show_result and analysis.source == "cached_decision":
         lines.append(
@@ -80,6 +73,26 @@ def render_report(
             ]
         )
     return "\n".join(lines)
+
+
+def row_visible(row: PIIReportRow, preferences: NoticePreferences) -> bool:
+    """Show face counts only with both face and action visibility enabled."""
+    if row.entity_type == "FACE" and not preferences.show_detected_faces:
+        return False
+    if row.action == "pass":
+        return preferences.show_pass
+    if row.action == "reroute":
+        return preferences.show_reroutes
+    return preferences.show_changes
+
+
+def face_status_visible(status: str, count: int | None, preferences: NoticePreferences) -> bool:
+    """Keep a skipped scan distinct from a completed zero-count scan."""
+    if status == "complete":
+        return preferences.show_detected_faces if count else preferences.show_no_faces
+    if status == "not_scanned":
+        return preferences.show_unscanned_faces
+    return True  # A failed scan is a safety warning, never a clean result.
 
 
 def _render_row(

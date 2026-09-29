@@ -25,11 +25,15 @@ class NoticePreferences(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
+    notices_enabled: bool = True
     show_no_pii: bool = True
     show_pass: bool = True
     show_changes: bool = True
     show_reroutes: bool = True
     show_timing: bool = True
+    show_no_faces: bool = True
+    show_detected_faces: bool = True
+    show_unscanned_faces: bool = True
 
 
 DEFAULT_PREFERENCES = NoticePreferences()
@@ -88,11 +92,20 @@ class NoticePreferencesClient:
                         if len(content) + len(chunk) > _MAX_BYTES:
                             return DEFAULT_PREFERENCES
                         content.extend(chunk)
-                # Reject absent fields, strings masquerading as booleans, and extra data.
+                # Accept the old five-field Studio contract during rollout, but not
+                # partial replies or unknown fields in either version.
                 payload = json.loads(content)
-                if not isinstance(payload, dict) or set(payload) != set(
-                    NoticePreferences.model_fields
-                ):
+                legacy = {
+                    "show_no_pii",
+                    "show_pass",
+                    "show_changes",
+                    "show_reroutes",
+                    "show_timing",
+                }
+                if not isinstance(payload, dict) or set(payload) not in {
+                    frozenset(legacy),
+                    frozenset(NoticePreferences.model_fields),
+                }:
                     return DEFAULT_PREFERENCES
                 preferences = NoticePreferences.model_validate(payload, strict=True)
         except (TimeoutError, httpx.HTTPError, ValueError):
