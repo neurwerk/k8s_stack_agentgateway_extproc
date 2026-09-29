@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from agentgateway_extproc.lib.notice.analysis import render_analysis_notice
+from agentgateway_extproc.lib.notice.preferences import DEFAULT_PREFERENCES, NoticePreferences
 from agentgateway_extproc.models.engine import (
     AnalysisMetadata,
     PIIReport,
@@ -21,34 +22,41 @@ def render_report(
     visual_findings: VisualFindings | None = None,
     text_pii_enabled: bool = True,
     images_forwarded: bool | None = None,
+    preferences: NoticePreferences = DEFAULT_PREFERENCES,
 ) -> str:
     """Render provenance and per-entity counts without including literal PII."""
+    if not preferences.notices_enabled:
+        return ""
     lines: list[str] = []
-    if operational := render_analysis_notice(analysis):
+    if preferences.show_timing and (operational := render_analysis_notice(analysis)):
         lines.append(operational)
     if visual_findings is not None:
         faces = visual_findings.faces
-        if not text_pii_enabled:
+        show_face_status = face_status_visible(faces.scan_status, faces.count, preferences)
+        if not text_pii_enabled and show_face_status:
             lines.append("Text PII analysis was disabled.")
-        lines.append(
-            f"Face scan completed: {faces.count} detected."
-            if faces.scan_status == "complete"
-            else "Faces were not scanned."
-            if faces.scan_status == "not_scanned"
-            else "Face scan failed."
-        )
-    if analysis.source == "cached_decision":
+        if show_face_status:
+            lines.append(
+                f"Face scan completed: {faces.count} detected."
+                if faces.scan_status == "complete"
+                else "Faces were not scanned."
+                if faces.scan_status == "not_scanned"
+                else "Face scan failed."
+            )
+    rows = [row for row in report.rows if row_visible(row, preferences)]
+    show_result = bool(rows) or (not report.rows and decision == "pass" and preferences.show_no_pii)
+    if show_result and analysis.source == "cached_decision":
         lines.append(
             "Entity rows describe the cached policy decision; current-request PII analysis "
             "was skipped."
         )
-    elif analysis.cached_decision_applied:
+    elif show_result and analysis.cached_decision_applied and preferences.show_reroutes:
         lines.append(
             "Routing includes a cached policy decision; entity rows describe the current request."
         )
-    if decision == "reroute" and route_class:
+    if decision == "reroute" and route_class and preferences.show_reroutes:
         lines.append(f"Effective route: `{route_class}`.")
-    if report.rows:
+    if rows:
         lines.extend(
             [
                 "| Entity | Request | Response |",
@@ -60,11 +68,31 @@ def render_report(
                         decision=decision,
                         images_forwarded=images_forwarded,
                     )
-                    for row in report.rows
+                    for row in rows
                 ],
             ]
         )
     return "\n".join(lines)
+
+
+def row_visible(row: PIIReportRow, preferences: NoticePreferences) -> bool:
+    """Show face counts only with both face and action visibility enabled."""
+    if row.entity_type == "FACE" and not preferences.show_detected_faces:
+        return False
+    if row.action == "pass":
+        return preferences.show_pass
+    if row.action == "reroute":
+        return preferences.show_reroutes
+    return preferences.show_changes
+
+
+def face_status_visible(status: str, count: int | None, preferences: NoticePreferences) -> bool:
+    """Keep a skipped scan distinct from a completed zero-count scan."""
+    if status == "complete":
+        return preferences.show_detected_faces if count else preferences.show_no_faces
+    if status == "not_scanned":
+        return preferences.show_unscanned_faces
+    return True  # A failed scan is a safety warning, never a clean result.
 
 
 def _render_row(

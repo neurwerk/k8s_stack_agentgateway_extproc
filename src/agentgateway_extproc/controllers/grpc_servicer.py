@@ -18,6 +18,7 @@ from agentgateway_extproc.config.settings import Settings
 from agentgateway_extproc.gen import ext_proc_pb2, ext_proc_pb2_grpc
 from agentgateway_extproc.lib.docling import DoclingClient
 from agentgateway_extproc.lib.engine.client import EngineClient
+from agentgateway_extproc.lib.notice.preferences import NoticePreferencesClient
 from agentgateway_extproc.lib.pipeline.mcp import McpProtocolError
 from agentgateway_extproc.lib.pipeline.request import immediate_response
 from agentgateway_extproc.lib.pipeline.stream_handler import StreamHandler
@@ -61,11 +62,13 @@ class ExtProcServicer(ext_proc_pb2_grpc.ExternalProcessorServicer):
         client: EngineClient,
         settings: Settings | None = None,
         docling: DoclingClient | None = None,
+        preferences_client: NoticePreferencesClient | None = None,
     ) -> None:
         """Store the shared engine client used by all streams."""
         self._client = client
         self._settings = settings or Settings()
         self._docling = docling
+        self._preferences_client = preferences_client
         self._active = 0
         self._buffered_bytes = 0
 
@@ -98,7 +101,9 @@ class ExtProcServicer(ext_proc_pb2_grpc.ExternalProcessorServicer):
         self, request_iterator: AsyncIterator[ext_proc_pb2.ProcessingRequest], context: object
     ) -> AsyncGenerator[ext_proc_pb2.ProcessingResponse, None]:
         active_streams.inc()
-        handler = StreamHandler(self._client, self._settings, self._docling)
+        handler = StreamHandler(
+            self._client, self._settings, self._docling, self._preferences_client
+        )
         phase = StreamPhase()
         buffered_bytes = 0
         try:

@@ -12,6 +12,11 @@ from agentgateway_extproc.config.settings import Settings
 from agentgateway_extproc.gen import ext_proc_pb2
 from agentgateway_extproc.lib.docling import DoclingClient
 from agentgateway_extproc.lib.engine.client import EngineClient
+from agentgateway_extproc.lib.notice.preferences import (
+    DEFAULT_PREFERENCES,
+    NoticePreferences,
+    NoticePreferencesClient,
+)
 from agentgateway_extproc.lib.pipeline.mcp import (
     McpHeaderContext,
     McpMessageContext,
@@ -72,11 +77,14 @@ class StreamHandler:
         client: EngineClient,
         settings: Settings | None = None,
         docling: DoclingClient | None = None,
+        preferences_client: NoticePreferencesClient | None = None,
     ) -> None:
         """Initialize state for one HTTP request/response stream."""
         limits = settings or Settings()
         self.client = client
         self.docling = docling
+        self.preferences_client = preferences_client
+        self.notice_preferences: NoticePreferences = DEFAULT_PREFERENCES
         self.reversal_map: dict[str, str] = {}
         self.reversal_entity_prefixes: tuple[tuple[str, str], ...] = ()
         self.request_headers: dict[str, str] = {}
@@ -91,6 +99,7 @@ class StreamHandler:
         self.response_body_chunks: list[bytes] = []
         self.response_passthrough_chunks: list[bytes] = []
         self.notice_messages: list[str] = []
+        self.safety_notice_messages: list[str] = []
         self.response_notice_allowed = True
         self.response_structured_json = False
         self.presidio_code: str | None = None
@@ -131,6 +140,7 @@ class StreamHandler:
         self.request_headers.clear()
         self.request_body_chunks.clear()
         self.notice_messages.clear()
+        self.safety_notice_messages.clear()
         self.request_stats = None
         self.restored_counts.clear()
         self.reversal_misses = 0
@@ -165,7 +175,7 @@ class StreamHandler:
         self.validate_destination_policy(request)
         kind = request.WhichOneof("request")
         if kind == "request_headers":
-            return self._request_headers(request)
+            return await self._request_headers(request)
         if kind == "request_body":
             return await self._request_body(request)
         if kind == "response_headers":
@@ -215,7 +225,7 @@ class StreamHandler:
             and DESTINATION_POLICY_NAMESPACE not in request.metadata_context.filter_metadata
         )
 
-    def _request_headers(
+    async def _request_headers(  # noqa: C901
         self, request: ext_proc_pb2.ProcessingRequest
     ) -> ext_proc_pb2.ProcessingResponse:
         """Remove adapter-owned headers before forwarding the request upstream."""
@@ -282,6 +292,8 @@ class StreamHandler:
                 self.record_dispatch("protocol_failure")
                 return immediate_response(400, '{"error":"MCP request body required"}')
             return _request_headers_response(removed)
+        if self.preferences_client is not None:
+            self.notice_preferences = await self.preferences_client.get(policy)
         if request.request_headers.end_of_stream:
             self.request_processed = True
             return immediate_response(400, '{"error":"request body required"}')

@@ -104,6 +104,34 @@ class ImageInspectionSettings(BaseModel):
         return self
 
 
+class NoticePreferencesSettings(BaseModel):
+    """Optional private Studio preferences lookup."""
+
+    enabled: bool = False
+    base_url: str = "https://studio-api.studio.svc"
+    ca_cert: str | None = None
+    client_cert: str | None = None
+    client_key: str | None = None
+    timeout: float = Field(default=0.5, gt=0, le=2)
+
+    @model_validator(mode="after")
+    def validate_service(self) -> NoticePreferencesSettings:
+        """Require a private HTTPS listener and all TLS files when enabled."""
+        url = urlsplit(self.base_url)
+        if self.enabled and (
+            url.scheme != "https"
+            or not url.hostname
+            or url.username is not None
+            or url.password is not None
+            or url.query
+            or url.fragment
+            or url.path not in {"", "/"}
+            or not all((self.ca_cert, self.client_cert, self.client_key))
+        ):
+            raise ValueError("notice preferences require an HTTPS origin and mTLS files")  # noqa: TRY003
+        return self
+
+
 class Settings(BaseSettings):
     """Load adapter configuration from ``EXTPROC_`` environment variables."""
 
@@ -112,6 +140,7 @@ class Settings(BaseSettings):
     engine: EngineSettings = Field(default_factory=EngineSettings)
     docling: DoclingSettings = Field(default_factory=DoclingSettings)
     image_inspection: ImageInspectionSettings = Field(default_factory=ImageInspectionSettings)
+    notice_preferences: NoticePreferencesSettings = Field(default_factory=NoticePreferencesSettings)
     debug: bool = False
     max_request_bytes: int = Field(default=MAX_REQUEST_BYTES, ge=1_024, le=MAX_UPLOAD_REQUEST_BYTES)
     max_response_bytes: int = Field(default=MAX_RESPONSE_BYTES, ge=1_024, le=MAX_RESPONSE_BYTES)

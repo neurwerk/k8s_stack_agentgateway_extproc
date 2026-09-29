@@ -287,6 +287,16 @@ The existing PII Engine Notice/table reports FACE counts without claiming maskin
 Face-only requests do not enable text scanning, guard injection or response
 reversal, and omit `x-presidio-code` rather than claim clean text with `P00`.
 Normal JSON/SSE notice placement and structured-output/MCP suppression remain.
+Studio notice preferences use nine strict booleans: `notices_enabled`,
+`show_no_pii`, `show_pass`, `show_changes`, `show_reroutes`, `show_timing`,
+`show_no_faces`, `show_detected_faces`, and `show_unscanned_faces`. All default
+to true. The master switch hides the entire optional response footer, including
+timing and image safety messages; it does not change analysis, routing, response
+reversal, result headers, or terminal errors. Face rows need both detected-face
+visibility and visibility for their action. A completed zero-face scan and a
+skipped scan have separate switches. For a transition, the old exact five-field
+Studio reply is accepted with the four new switches defaulting to true; partial,
+non-boolean and extra-field replies fall back to all-on defaults.
 Blocks stay HTTP 403 with a short plain-text `error.message` and a bounded
 structured `pii_report`. Image-policy errors never append the PII Engine Notice
 or Markdown table; successful replies retain their existing notice/table.

@@ -18,6 +18,7 @@ from agentgateway_extproc.gen import ext_proc_pb2_grpc
 from agentgateway_extproc.lib.docling import DoclingClient
 from agentgateway_extproc.lib.engine.client import EngineClient
 from agentgateway_extproc.lib.image_inspection import ImageInspectionClient
+from agentgateway_extproc.lib.notice.preferences import NoticePreferencesClient
 
 
 def main() -> None:
@@ -38,7 +39,8 @@ async def _run(settings: Settings) -> None:
     client = EngineClient(settings.engine)
     image_inspection = ImageInspectionClient(settings.image_inspection)
     docling = DoclingClient(settings.docling, image_inspection=image_inspection)
-    server = create_grpc_server(settings, client, docling)
+    preferences = NoticePreferencesClient(settings.notice_preferences)
+    server = create_grpc_server(settings, client, docling, preferences)
     server.add_insecure_port("[::]:9000")
     await server.start()
     http_server = uvicorn.Server(uvicorn.Config(create_http_app(client), host="0.0.0.0", port=8000))
@@ -56,13 +58,17 @@ async def _run(settings: Settings) -> None:
             await docling.close()
             await image_inspection.close()
             await client.close()
+            await preferences.close()
         finally:
             for sig, handler in handlers.items():
                 signal.signal(sig, handler)
 
 
 def create_grpc_server(
-    settings: Settings, client: EngineClient, docling: DoclingClient | None = None
+    settings: Settings,
+    client: EngineClient,
+    docling: DoclingClient | None = None,
+    preferences: NoticePreferencesClient | None = None,
 ) -> grpc.aio.Server:
     """Create the extProc server with an explicit finite receive-message limit."""
     server = cast(
@@ -75,7 +81,7 @@ def create_grpc_server(
         ),
     )
     ext_proc_pb2_grpc.add_ExternalProcessorServicer_to_server(
-        ExtProcServicer(client, settings, docling), server
+        ExtProcServicer(client, settings, docling, preferences), server
     )
     return server
 

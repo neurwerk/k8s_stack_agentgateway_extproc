@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any
 from agentgateway_extproc.gen import ext_proc_pb2
 from agentgateway_extproc.lib.masking.reversal import PlaceholderStreamRewriter
 from agentgateway_extproc.lib.notice.inject import render_notice
-from agentgateway_extproc.lib.notice.report import render_report
+from agentgateway_extproc.lib.notice.report import face_status_visible, render_report, row_visible
 from agentgateway_extproc.lib.pipeline.guard import GuardStreamStripper, strip_guard_instruction
 from agentgateway_extproc.lib.pipeline.mcp import (
     McpSseResponseProcessor,
@@ -412,16 +412,30 @@ def _responses_json_notice_target(
 
 
 def _notice_configured(handler: StreamHandler) -> bool:
-    return handler.request_stats is not None or any(
-        message.strip() for message in handler.notice_messages
-    )
+    return bool(_render_handler_notice(handler))
 
 
 def _render_handler_notice(handler: StreamHandler) -> str:
-    if not handler.response_notice_allowed:
+    if not handler.response_notice_allowed or not handler.notice_preferences.notices_enabled:
         return ""
     report = ""
+    messages = handler.notice_messages
     if stats := handler.request_stats:
+        preferences = handler.notice_preferences
+        # Engine prose describes the whole decision and cannot safely be split into
+        # categories. Only include it when every reported category is visible.
+        visible = (
+            not stats.report.rows and stats.decision == "pass" and preferences.show_no_pii
+        ) or (
+            bool(stats.report.rows)
+            and all(row_visible(row, preferences) for row in stats.report.rows)
+            and (stats.decision != "reroute" or preferences.show_reroutes)
+        )
+        if stats.visual_findings is not None:
+            faces = stats.visual_findings.faces
+            visible = visible and face_status_visible(faces.scan_status, faces.count, preferences)
+        if not visible:
+            messages = []
         report = render_report(
             stats.report,
             stats.analysis,
@@ -431,8 +445,33 @@ def _render_handler_notice(handler: StreamHandler) -> str:
             visual_findings=stats.visual_findings,
             text_pii_enabled=handler.text_pii_enabled,
             images_forwarded=stats.images_forwarded,
+            preferences=preferences,
         )
-    return render_notice(handler.notice_messages, report)
+    # Image-policy notices describe a successful decision to withhold pixels.
+    # Use the validated report and scan facts, not the wording of the notice,
+    # to decide whether that action and its face category may be displayed.
+    safety_messages = handler.safety_notice_messages
+    if safety_messages and not _image_notice_visible(handler):
+        safety_messages = []
+    return render_notice([*messages, *safety_messages], report)
+
+
+def _image_notice_visible(handler: StreamHandler) -> bool:
+    stats = handler.request_stats
+    if stats is None or stats.images_forwarded is not False:
+        return False
+    preferences = handler.notice_preferences
+    if not preferences.show_changes or (
+        stats.decision == "reroute" and not preferences.show_reroutes
+    ):
+        return False
+    if stats.visual_findings is not None:
+        faces = stats.visual_findings.faces
+        if not face_status_visible(faces.scan_status, faces.count, preferences):
+            return False
+    return all(
+        row_visible(row, preferences) for row in stats.report.rows if row.entity_type == "FACE"
+    )
 
 
 class SseResponseProcessor:
@@ -1079,6 +1118,7 @@ def process_response_chunk(
     if end_of_stream:
         handler.reversal_map.clear()
         handler.notice_messages.clear()
+        handler.safety_notice_messages.clear()
     return _streamed(transformed, end_of_stream)
 
 
