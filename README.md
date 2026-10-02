@@ -396,7 +396,7 @@ into these categories:
 - Request and response bounds: `MAX_REQUEST_BYTES`, `MAX_RESPONSE_BYTES`,
   `MAX_TRANSFORMED_REQUEST_BYTES`, `GRPC_MAX_RECEIVE_MESSAGE_BYTES`, and
   `ENGINE__MAX_RESPONSE_BYTES`
-- Diagnostics: `DEBUG`
+- Diagnostics: `LOG_LEVEL` accepts `DEBUG`, `INFO`, `WARNING` (default), or `ERROR`; routine HTTP access logs are disabled.
 
 Document settings use `EXTPROC_DOCLING__` plus these names (byte units are bytes):
 
