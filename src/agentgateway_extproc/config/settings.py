@@ -141,7 +141,7 @@ class Settings(BaseSettings):
     docling: DoclingSettings = Field(default_factory=DoclingSettings)
     image_inspection: ImageInspectionSettings = Field(default_factory=ImageInspectionSettings)
     notice_preferences: NoticePreferencesSettings = Field(default_factory=NoticePreferencesSettings)
-    debug: bool = False
+    log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "WARNING"
     max_request_bytes: int = Field(default=MAX_REQUEST_BYTES, ge=1_024, le=MAX_UPLOAD_REQUEST_BYTES)
     max_response_bytes: int = Field(default=MAX_RESPONSE_BYTES, ge=1_024, le=MAX_RESPONSE_BYTES)
     max_transformed_request_bytes: int = Field(

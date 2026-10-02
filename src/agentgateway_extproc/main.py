@@ -26,7 +26,7 @@ def main() -> None:
     settings = get_settings()
     logging.basicConfig(
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
-        level=logging.DEBUG if settings.debug else logging.INFO,
+        level=settings.log_level,
     )
     try:
         asyncio.run(_run(settings))
@@ -43,7 +43,16 @@ async def _run(settings: Settings) -> None:
     server = create_grpc_server(settings, client, docling, preferences)
     server.add_insecure_port("[::]:9000")
     await server.start()
-    http_server = uvicorn.Server(uvicorn.Config(create_http_app(client), host="0.0.0.0", port=8000))
+    http_server = uvicorn.Server(
+        uvicorn.Config(
+            create_http_app(client),
+            host="0.0.0.0",
+            port=8000,
+            log_config=None,
+            log_level=settings.log_level.lower(),
+            access_log=False,
+        )
+    )
     # Uvicorn re-raises captured signals after its HTTP shutdown. Keep those
     # signals graceful until the gRPC drain and client cleanup have completed.
     handlers = {
