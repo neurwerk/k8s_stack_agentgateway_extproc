@@ -14,7 +14,7 @@ from pydantic import ValidationError
 from agentgateway_extproc.config.settings import EngineSettings, Settings
 from agentgateway_extproc.lib.engine.client import EngineClient
 from agentgateway_extproc.lib.pipeline.guard import GUARD_INSTRUCTION
-from agentgateway_extproc.lib.pipeline.request import _log_model_validation_failure
+from agentgateway_extproc.lib.pipeline.request_validation import log_model_validation_failure
 from agentgateway_extproc.lib.pipeline.stream_handler import StreamHandler
 from agentgateway_extproc.models.engine import EngineReply
 from agentgateway_extproc.models.exceptions import (
@@ -277,7 +277,7 @@ def test_model_validation_log_does_not_materialize_errors_above_the_cap(caplog) 
         def errors(self, **_kwargs: object) -> list[object]:
             raise AssertionError("detailed errors must not be materialized")
 
-    _log_model_validation_failure(
+    log_model_validation_failure(
         {"model": "test", "messages": []},
         cast(ValidationError, ExcessiveValidationErrors()),
     )

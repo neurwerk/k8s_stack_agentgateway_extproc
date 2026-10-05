@@ -13,7 +13,7 @@ from agentgateway_extproc.lib.pipeline.guard import (
     inject_guard_instruction,
     strip_guard_instruction,
 )
-from agentgateway_extproc.lib.pipeline.request import _restore_reversal_leaves
+from agentgateway_extproc.lib.pipeline.reply_validation import _restore_reversal_leaves
 from agentgateway_extproc.lib.session import make_session_key
 from agentgateway_extproc.models.destination import ModelDestinationPolicy
 from agentgateway_extproc.models.engine import (

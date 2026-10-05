@@ -6,9 +6,7 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import secrets
-from collections.abc import Mapping
 from dataclasses import replace
 from typing import TYPE_CHECKING, cast
 
@@ -27,6 +25,14 @@ from agentgateway_extproc.lib.pipeline.mcp import (
     McpProtocolError,
     parse_mcp_message,
     strict_json_loads,
+)
+from agentgateway_extproc.lib.pipeline.reply_validation import (
+    validate_request_mutation,
+    validate_reversal,
+)
+from agentgateway_extproc.lib.pipeline.request_validation import (
+    log_model_validation_failure,
+    model_request_family,
 )
 from agentgateway_extproc.lib.request_segments import extract_request
 from agentgateway_extproc.lib.session import make_session_key
@@ -53,21 +59,15 @@ from agentgateway_extproc.models.types import (
     PRESIDIO_PII_DETECTED,
     PRESIDIO_PII_TRANSFORMED,
     PRESIDIO_REROUTED,
-    RESERVED_PLACEHOLDER_PREFIX_RE,
-    REVERSIBLE_CANDIDATE_RE,
-    REVERSIBLE_TOKEN_RE,
     RequestStats,
 )
 
 if TYPE_CHECKING:
     from agentgateway_extproc.lib.pipeline.stream_handler import StreamHandler
 
-type PathPart = str | int
-type TextLeaves = dict[tuple[PathPart, ...], str]
 type OpaqueReasoning = dict[int, dict[str, object]]
 
 _OPAQUE_REQUEST_REASONING_FIELDS = ("reasoning_content", "reasoning_signature")
-_MAX_VALIDATION_ERROR_COUNT = 100
 _UNCHECKED_IMAGE_MARKER = "[Image forwarded without privacy inspection]"
 _logger = logging.getLogger(__name__)
 
@@ -170,7 +170,7 @@ async def process_request(
         except UnsupportedFeatureError as exc:
             _logger.warning(
                 "model request validation failed family=%s reason=%s scope=%s count=%d",
-                _model_request_family(payload),
+                model_request_family(payload),
                 "extra_forbidden",
                 {
                     "stream_options": "stream_options",
@@ -187,13 +187,13 @@ async def process_request(
                 '"message":"This request contains an unsupported feature."}}',
             )
         except ValidationError as exc:
-            _log_model_validation_failure(payload, exc)
+            log_model_validation_failure(payload, exc)
             handler.record_dispatch("protocol_failure")
             return immediate_response(400, '{"error":"invalid model request"}')
         except (TypeError, ValueError):
             _logger.warning(
                 "model request validation failed family=%s reason=%s scope=%s count=%d",
-                _model_request_family(payload),
+                model_request_family(payload),
                 "invalid_value",
                 "top_level",
                 1,
@@ -427,9 +427,9 @@ async def process_request(
             reply = await client.analyze_request(
                 request, session_key, correlation_id=handler.correlation_id
             )
-        _validate_request_mutation(request, reply)
+        validate_request_mutation(request, reply)
         if handler.text_pii_enabled:
-            _validate_reversal(request, reply)
+            validate_reversal(request, reply)
     except (EngineUnavailableError, InvalidEngineReplyError):
         if images is None:
             raise
@@ -830,7 +830,7 @@ def _raise_output_limit(measured: int, maximum: int) -> None:
 
 def _check_converted_text_limit(request: EngineRequest) -> None:
     """Count all independent converted text leaves without approximating wire size."""
-    measured = sum(len(text) for text in _mutable_text_leaves(request).values())
+    measured = sum(len(segment.text) for segment in extract_request(request).segments)
     if measured > MAX_TEXT:
         raise EnginePolicyError(
             "request_too_large",
@@ -930,118 +930,6 @@ def _model_attachments(
     ]
 
 
-def _log_model_validation_failure(payload: object, exc: ValidationError) -> None:
-    """Log only allowlisted aggregate facts about an invalid model request."""
-    family = _model_request_family(payload)
-    error_count = exc.error_count()
-    if error_count > _MAX_VALIDATION_ERROR_COUNT:
-        _logger.warning(
-            "model request validation failed family=%s reason=%s scope=%s count=%d",
-            family,
-            "other",
-            "other",
-            _MAX_VALIDATION_ERROR_COUNT,
-        )
-        return
-    family_model = {
-        "chat": "EngineChatRequest",
-        "responses": "EngineResponsesRequest",
-    }.get(family)
-    errors = exc.errors(include_url=False, include_context=False, include_input=False)
-    if family_model is not None:
-        selected = [
-            error for error in errors if _validation_error_matches_model(error, family_model)
-        ]
-        if selected:
-            errors = selected
-    reasons = {_validation_reason(str(error.get("type", ""))) for error in errors}
-    scopes = {_validation_scope(error.get("loc")) for error in errors}
-    reason = next(iter(reasons)) if len(reasons) == 1 else "other"
-    scope = next(iter(scopes)) if len(scopes) == 1 else "other"
-    _logger.warning(
-        "model request validation failed family=%s reason=%s scope=%s count=%d",
-        family,
-        reason,
-        scope,
-        len(errors),
-    )
-
-
-def _validation_error_matches_model(error: Mapping[str, object], marker: str) -> bool:
-    """Recognize a union branch, including Pydantic's model-validator wrapper."""
-    location = error.get("loc")
-    if not isinstance(location, tuple) or not location:
-        return False
-    return _validation_model_branch(location[0], marker)
-
-
-def _validation_model_branch(branch: object, marker: str) -> bool:
-    """Return whether a location part identifies the expected model branch."""
-    return branch == marker or (
-        isinstance(branch, str)
-        and branch.startswith("function-after[")
-        and branch.endswith(f", {marker}]")
-    )
-
-
-def _model_request_family(payload: object) -> str:
-    """Classify a request using only fixed protocol field probes."""
-    if not isinstance(payload, dict):
-        return "unknown"
-    has_messages = "messages" in payload
-    has_input = "input" in payload
-    if has_messages and has_input:
-        return "unknown"
-    if has_messages:
-        return "chat"
-    if has_input:
-        return "responses"
-    return "unknown"
-
-
-def _validation_reason(error_type: str) -> str:
-    """Collapse Pydantic error types into a fixed diagnostic category."""
-    if error_type == "extra_forbidden":
-        return "extra_forbidden"
-    if error_type == "missing":
-        return "missing"
-    if error_type.endswith("_type") or error_type in {
-        "bool_parsing",
-        "dict_type",
-        "float_parsing",
-        "int_parsing",
-        "list_type",
-        "string_type",
-    }:
-        return "invalid_type"
-    if error_type in {"assertion_error", "literal_error", "value_error"}:
-        return "invalid_value"
-    return "other"
-
-
-def _validation_scope(location: object) -> str:
-    """Classify only known schema locations without exposing rejected field names."""
-    if not isinstance(location, tuple):
-        return "other"
-    schema_location = location
-    if location and any(
-        _validation_model_branch(location[0], marker)
-        for marker in (
-            "EngineChatRequest",
-            "EngineResponsesRequest",
-            "EngineMcpRequest",
-        )
-    ):
-        schema_location = location[1:]
-    if "stream_options" in schema_location:
-        return "stream_options"
-    if "messages" in schema_location:
-        return "messages"
-    if "tools" in schema_location:
-        return "tools"
-    return "top_level" if len(schema_location) <= 1 else "other"
-
-
 def _clear_request(handler: StreamHandler) -> None:
     """Discard caller body and headers after request dispatch is complete."""
     handler.request_body_chunks.clear()
@@ -1126,139 +1014,6 @@ def _presidio_code(reply: EngineReply) -> str:
     if reply.entities:
         return PRESIDIO_PII_DETECTED
     return PRESIDIO_NO_PII
-
-
-def _validate_reversal(original: EngineRequest, reply: EngineReply) -> None:
-    """Restore reversible leaves once and require exact request provenance."""
-    transformed_request = reply.request
-    if RESERVED_PLACEHOLDER_PREFIX_RE.search(original.model_dump_json(exclude_none=True)):
-        raise InvalidEngineReplyError(  # noqa: TRY003
-            "reversal placeholder already existed in request"
-        )
-    if transformed_request is None:
-        if reply.reversal:
-            raise InvalidEngineReplyError(  # noqa: TRY003
-                "transformed request and reversal entries differ"
-            )
-        return
-    original_leaves = _mutable_text_leaves(original)
-    transformed_leaves = _mutable_text_leaves(transformed_request)
-    entities_by_placeholder = _reversal_entities(reply)
-    seen, restored_by_entity = _restore_reversal_leaves(
-        original_leaves,
-        transformed_leaves,
-        reply.reversal,
-        entities_by_placeholder,
-    )
-    if seen != set(reply.reversal):
-        raise InvalidEngineReplyError(  # noqa: TRY003
-            "transformed request and reversal entries differ"
-        )
-    if restored_by_entity != _expected_reversal_counts(reply):
-        raise InvalidEngineReplyError(  # noqa: TRY003
-            "reversal occurrence counts disagree with the current request report"
-        )
-
-
-def _restore_reversal_leaves(
-    original_leaves: TextLeaves,
-    transformed_leaves: TextLeaves,
-    reversal: dict[str, str],
-    entities_by_placeholder: dict[str, str],
-) -> tuple[set[str], dict[str, int]]:
-    """Scan candidate tokens once and validate plaintext against its source leaf."""
-    seen: set[str] = set()
-    restored_by_entity: dict[str, int] = {}
-    consumed: dict[tuple[tuple[PathPart, ...], str], int] = {}
-    current_path: tuple[PathPart, ...] = ()
-
-    def restore(match: re.Match[str]) -> str:
-        placeholder = match.group(0)
-        plaintext = reversal.get(placeholder)
-        if plaintext is None:
-            raise InvalidEngineReplyError(  # noqa: TRY003
-                "transformed request and reversal entries differ"
-            )
-        seen.add(placeholder)
-        entity_type = entities_by_placeholder[placeholder]
-        restored_by_entity[entity_type] = restored_by_entity.get(entity_type, 0) + 1
-        key = (current_path, plaintext)
-        consumed[key] = consumed.get(key, 0) + 1
-        return plaintext
-
-    for path, transformed_text in transformed_leaves.items():
-        current_path = path
-        REVERSIBLE_CANDIDATE_RE.sub(restore, transformed_text)
-    for (path, plaintext), count in consumed.items():
-        if original_leaves.get(path, "").count(plaintext) < count:
-            raise InvalidEngineReplyError(  # noqa: TRY003
-                "reversal plaintext does not match its original text leaf"
-            )
-    return seen, restored_by_entity
-
-
-def _reversal_entities(reply: EngineReply) -> dict[str, str]:
-    """Validate reversal keys against the current report in one linear pass."""
-    if reply.analysis.source != "current_request":
-        if reply.reversal:
-            raise InvalidEngineReplyError(  # noqa: TRY003
-                "reversal entries require a current request report"
-            )
-        return {}
-    rows = {row.entity_type: row for row in reply.report.rows}
-    entities: dict[str, str] = {}
-    for placeholder in reply.reversal:
-        token = REVERSIBLE_TOKEN_RE.fullmatch(placeholder)
-        if token is None:
-            raise InvalidEngineReplyError(  # noqa: TRY003
-                "reversal contains an invalid placeholder"
-            )
-        entity_type = cast(str, token.group(2))
-        row = rows.get(entity_type)
-        if row is None or row.action not in {"encrypt", "reversible_replace"}:
-            raise InvalidEngineReplyError(  # noqa: TRY003
-                "reversal entries disagree with the current request report"
-            )
-        if not row.transformed_count:
-            raise InvalidEngineReplyError(  # noqa: TRY003
-                "reversal entries require a transformed report row"
-            )
-        entities[placeholder] = entity_type
-    return entities
-
-
-def _expected_reversal_counts(reply: EngineReply) -> dict[str, int]:
-    """Return placeholder counts required by current-request analysis."""
-    if reply.analysis.source == "cached_decision":
-        return {}
-    return {
-        row.entity_type: row.transformed_count
-        for row in reply.report.rows
-        if row.action in {"encrypt", "reversible_replace"} and row.transformed_count
-    }
-
-
-def _validate_request_mutation(original: EngineRequest, reply: EngineReply) -> None:
-    """Reject engine mutations outside schema-designated model-visible text leaves."""
-    if reply.request is None:
-        return
-    if type(reply.request) is not type(original) or _control_shape(reply.request) != _control_shape(
-        original
-    ):
-        raise InvalidEngineReplyError(  # noqa: TRY003
-            "engine reply changed request protocol controls"
-        )
-
-
-def _control_shape(request: EngineRequest) -> dict[str, object]:
-    """Replace only mutable text leaves while retaining every protocol control."""
-    return extract_request(request).control_shape()
-
-
-def _mutable_text_leaves(request: EngineRequest) -> TextLeaves:
-    """Return schema-designated model-visible strings keyed by structural path."""
-    extracted = extract_request(request)
-    return {extracted.diagnostic_path(segment.id): segment.text for segment in extracted.segments}
 
 
 def _dict_list(value: object) -> list[dict[str, object]]:
