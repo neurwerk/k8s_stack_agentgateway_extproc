@@ -1,0 +1,16 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "neurwerk-request-segments"
+version = "0.1.0"
+description = "Shared supported-request extraction and lossless text reconstruction"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+dependencies = ["pydantic>=2.12,<3"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/neurwerk_request_segments"]

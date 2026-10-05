@@ -97,7 +97,14 @@ async def test_grpc_servicer_propagates_valid_typed_engine_errors(
     responses = [response async for response in servicer.Process(requests(), object())]
     immediate = responses[-1].immediate_response
     assert immediate.status.code == status
-    assert json.loads(immediate.body) == {
+    payload = json.loads(immediate.body)
+    request_id = payload["error"].pop("request_id")
+    assert len(request_id) == 32
+    assert any(
+        item.header.key == "x-request-id" and item.header.value == request_id
+        for item in immediate.headers.set_headers
+    )
+    assert payload == {
         "error": {
             "message": message,
             "type": "pii_engine_error",
@@ -132,7 +139,8 @@ async def test_grpc_servicer_does_not_forward_invalid_engine_error_body(caplog) 
     responses = [response async for response in servicer.Process(requests(), object())]
     immediate = responses[-1].immediate_response
     assert immediate.status.code == 503
-    assert immediate.body == '{"error":"internal processing error"}'
+    assert json.loads(immediate.body)["error"]["code"] == "processing_failed"
+    assert json.loads(immediate.body)["error"]["message"] == "internal processing error"
     assert upstream_text not in caplog.text
 
 

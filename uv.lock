@@ -10,6 +10,7 @@ dependencies = [
     { name = "fastapi" },
     { name = "grpcio" },
     { name = "httpx" },
+    { name = "neurwerk-request-segments" },
     { name = "opencv-python-headless" },
     { name = "pi-heif" },
     { name = "pillow" },
@@ -38,6 +39,7 @@ requires-dist = [
     { name = "grpcio", specifier = ">=1.68" },
     { name = "grpcio-tools", marker = "extra == 'dev'", specifier = ">=1.68" },
     { name = "httpx", specifier = ">=0.27" },
+    { name = "neurwerk-request-segments", editable = "packages/request_segments" },
     { name = "opencv-python-headless", specifier = "==4.13.0.92" },
     { name = "pi-heif", specifier = "==1.4.0" },
     { name = "pillow", specifier = "==12.2.0" },
@@ -270,6 +272,17 @@ sdist = { url = "https://files.pythonhosted.org/packages/72/34/14ca021ce8e5dfedc
 wheels = [
     { url = "https://files.pythonhosted.org/packages/cb/b1/3846dd7f199d53cb17f49cba7e651e9ce294d8497c8c150530ed11865bb8/iniconfig-2.3.0-py3-none-any.whl", hash = "sha256:f631c04d2c48c52b84d0d0549c99ff3859c98df65b3101406327ecc7d53fbf12", size = 7484, upload-time = "2025-10-18T21:55:41.639Z" },
 ]
+
+[[package]]
+name = "neurwerk-request-segments"
+version = "0.1.0"
+source = { editable = "packages/request_segments" }
+dependencies = [
+    { name = "pydantic" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "pydantic", specifier = ">=2.12,<3" }]
 
 [[package]]
 name = "numpy"

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import re
 
+from agentgateway_extproc.models.exceptions import LimitDetail
+
 MAX_JSON_DEPTH = 64
 MAX_JSON_TOKENS = 200_000
 # Possessive string runs avoid both per-character objects and regex backtracking
@@ -13,6 +15,11 @@ _TOKENS = re.compile(r'"(?:[^"\\]++|\\.)*+"|[{}\[\]]|[^ \t\r\n{}\[\]",:]+|[ \t\r
 
 class JsonBudgetError(ValueError):
     """Reject structural expansion independently of the wire-byte limit."""
+
+    def __init__(self, *, limit: LimitDetail | None = None) -> None:
+        """Retain the observed prefix count when scanning stops early."""
+        super().__init__()
+        self.limit = limit
 
 
 def bounded_json_text(value: str | bytes) -> str:
@@ -32,11 +39,29 @@ def bounded_json_text(value: str | bytes) -> str:
             continue
         count += 1
         if count > MAX_JSON_TOKENS:
-            raise JsonBudgetError
+            raise JsonBudgetError(
+                limit=LimitDetail(
+                    stage="json",
+                    reason="tokens",
+                    measured=count,
+                    maximum=MAX_JSON_TOKENS,
+                    unit="items",
+                    exact=False,
+                )
+            )
         if char in "{[":
             stack.append(char)
             if len(stack) > MAX_JSON_DEPTH:
-                raise JsonBudgetError
+                raise JsonBudgetError(
+                    limit=LimitDetail(
+                        stage="json",
+                        reason="depth",
+                        measured=len(stack),
+                        maximum=MAX_JSON_DEPTH,
+                        unit="levels",
+                        exact=False,
+                    )
+                )
         elif char in "}]" and (not stack or stack.pop() != {"}": "{", "]": "["}[char]):
             raise ValueError("invalid JSON structure")  # noqa: TRY003
     return text

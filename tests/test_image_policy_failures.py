@@ -91,8 +91,10 @@ async def test_image_failure_reasons_never_forward_or_claim_empty_extraction(
         if case == "engine-unavailable":
             raise httpx.ConnectError("PRIVATE-UPSTREAM-DETAIL")
         sent = json.loads(request.content)
+        engine_reply.pop("request", None)
         engine_reply.update(
-            request=sent["request"],
+            api_version="v2",
+            segments=sent["segments"],
             visual_findings=sent["visual_findings"],
             decision="pass",
             entities=[],

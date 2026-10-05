@@ -11,6 +11,7 @@ from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import aclosing
 from dataclasses import dataclass
 from typing import NoReturn, Protocol, cast, override
+from uuid import uuid4
 
 import grpc
 
@@ -22,6 +23,8 @@ from agentgateway_extproc.lib.notice.preferences import NoticePreferencesClient
 from agentgateway_extproc.lib.pipeline.mcp import McpProtocolError
 from agentgateway_extproc.lib.pipeline.request import immediate_response
 from agentgateway_extproc.lib.pipeline.stream_handler import StreamHandler
+from agentgateway_extproc.lib.rejection_capture import RejectionCapture, RejectionCaptureConfig
+from agentgateway_extproc.lib.rejections import annotate_rejection, log_limit_rejection
 from agentgateway_extproc.metrics import active_streams, errors_total, response_failures_total
 from agentgateway_extproc.models.exceptions import (
     EnginePolicyError,
@@ -69,6 +72,9 @@ class ExtProcServicer(ext_proc_pb2_grpc.ExternalProcessorServicer):
         self._settings = settings or Settings()
         self._docling = docling
         self._preferences_client = preferences_client
+        self._capture = RejectionCapture(
+            RejectionCaptureConfig(**self._settings.rejection_capture.model_dump())
+        )
         self._active = 0
         self._buffered_bytes = 0
 
@@ -97,6 +103,14 @@ class ExtProcServicer(ext_proc_pb2_grpc.ExternalProcessorServicer):
         self._buffered_bytes += size
         return size
 
+    def _capture_input(self, request: ext_proc_pb2.ProcessingRequest) -> tuple[bytes, int, bool]:
+        if not request.HasField("request_body") or not self._capture.config.enabled:
+            return b"", 0, False
+        inbound = request.request_body.body
+        original = inbound[: self._capture.config.max_file_bytes]
+        complete = request.request_body.end_of_stream and len(original) == len(inbound)
+        return original, len(inbound), complete
+
     async def _process(
         self, request_iterator: AsyncIterator[ext_proc_pb2.ProcessingRequest], context: object
     ) -> AsyncGenerator[ext_proc_pb2.ProcessingResponse, None]:
@@ -106,12 +120,16 @@ class ExtProcServicer(ext_proc_pb2_grpc.ExternalProcessorServicer):
         )
         phase = StreamPhase()
         buffered_bytes = 0
+        original_body = b""
+        observed_bytes = 0
+        body_complete = False
         try:
             async for request in request_iterator:
                 kind = request.WhichOneof("request") or "unknown"
+                original_body, observed_bytes, body_complete = self._capture_input(request)
                 size = self._reserve_body(request)
                 if size is None:
-                    yield _overloaded()
+                    yield _overloaded(handler.correlation_id)
                     return
                 buffered_bytes += size
                 try:
@@ -120,36 +138,106 @@ class ExtProcServicer(ext_proc_pb2_grpc.ExternalProcessorServicer):
                         self._buffered_bytes -= buffered_bytes
                         buffered_bytes = 0
                     for output in outputs:
+                        await self._annotate_rejection(
+                            handler, output, original_body, observed_bytes, body_complete
+                        )
                         phase.observe(output)
                         yield output
+                    original_body = b""
                 except asyncio.CancelledError:
                     # The peer can no longer receive an immediate response.
                     # Teardown still clears the stream-local reversal state.
                     raise
                 except Exception as exc:
                     _record_dispatch_failure(handler, exc)
-                    yield await _failure_for_phase(context, phase, kind, exc)
+                    _log_committed_limit(handler, phase, exc)
+                    output = await _failure_for_phase(context, phase, kind, exc)
+                    await self._annotate_rejection(
+                        handler, output, original_body, observed_bytes, body_complete, exc
+                    )
+                    yield output
                     return
                 if outputs and outputs[-1].HasField("immediate_response"):
                     return
             try:
                 outputs = _finish_stream(handler)
                 for output in outputs:
+                    await self._annotate_rejection(handler, output, b"", 0, False)
                     phase.observe(output)
                     yield output
             except Exception as exc:
                 _record_dispatch_failure(handler, exc)
-                yield await _failure_for_phase(context, phase, "response_eof", exc)
+                _log_committed_limit(handler, phase, exc)
+                output = await _failure_for_phase(context, phase, "response_eof", exc)
+                await self._annotate_rejection(handler, output, b"", 0, False, exc)
+                yield output
         finally:
             handler.clear_sensitive_state()
             self._buffered_bytes -= buffered_bytes
             active_streams.dec()
 
+    async def _annotate_rejection(
+        self,
+        handler: StreamHandler,
+        response: ext_proc_pb2.ProcessingResponse,
+        original_body: bytes,
+        observed_bytes: int,
+        complete: bool,
+        error: Exception | None = None,
+    ) -> None:
+        if not response.HasField("immediate_response"):
+            return
+        limit = (
+            error.limit if isinstance(error, (EnginePolicyError, InvalidEngineReplyError)) else None
+        )
+        if (
+            handler.destination_policy is not None
+            and handler.destination_policy.destination_kind == "model"
+        ):
+            annotate_rejection(response, handler.correlation_id, limit=limit)
+        status = response.immediate_response.status.code
+        if status not in {400, 413} or not self._capture.config.enabled:
+            return
+        declared = handler.request_headers.get("content-length", "")
+        declared_bytes = (
+            int(declared)
+            if declared.isascii() and declared.isdecimal() and len(declared) <= 20
+            else None
+        )
+        reference = await self._capture.capture_rejection(
+            original_body,
+            correlation_id=handler.correlation_id,
+            reason_code=limit.reason if limit is not None else "invalid_request",
+            complete=complete,
+            declared_bytes=declared_bytes,
+            observed_bytes=observed_bytes,
+        )
+        _logger.warning(
+            "rejection capture request_id=%s reference=%s observed_bytes=%d input_complete=%s",
+            handler.correlation_id,
+            reference or "unavailable",
+            observed_bytes,
+            complete,
+        )
 
-def _overloaded() -> ext_proc_pb2.ProcessingResponse:
+
+def _log_committed_limit(handler: StreamHandler, phase: StreamPhase, exc: Exception) -> None:
+    if (
+        phase.response_headers_committed
+        and isinstance(exc, (EnginePolicyError, InvalidEngineReplyError))
+        and exc.limit is not None
+    ):
+        log_limit_rejection(handler.correlation_id, exc.limit)
+
+
+def _overloaded(correlation_id: str | None = None) -> ext_proc_pb2.ProcessingResponse:
     """Reject before forwarding any request or unprocessed response content."""
     errors_total.labels(type="overloaded").inc()
-    response = immediate_response(503, '{"error":"processor busy","retryable":true}')
+    response = immediate_response(
+        503,
+        '{"error":{"message":"processor busy","code":"capacity_unavailable","retryable":true}}',
+    )
+    annotate_rejection(response, correlation_id or uuid4().hex)
     response.immediate_response.headers.set_headers.add(
         header={"key": "retry-after", "value": "1"}, append_action=2
     )

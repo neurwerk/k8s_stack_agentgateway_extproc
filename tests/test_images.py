@@ -403,7 +403,7 @@ async def test_image_dispatch(engine_reply, api, case):  # noqa: C901
 
     def engine(request):
         engine_calls.append(request)
-        assert request.url.path == "/v1/adapter/analyze-document-request"
+        assert request.url.path == "/v2/adapter/analyze-segments"
         assert b"base64" not in request.content and b"image_url" not in request.content
         if case == "unchecked-error":
             return httpx.Response(500, text="DO-NOT-FORWARD")
@@ -411,9 +411,11 @@ async def test_image_dispatch(engine_reply, api, case):  # noqa: C901
         if v3:
             assert sent["text_pii_enabled"] is True
             engine_reply["visual_findings"] = sent["visual_findings"]
-            sent = sent["request"]
+        assert sent["scope"] == "request"
+        engine_reply.pop("request", None)
         engine_reply.update(
-            request=copy.deepcopy(sent),
+            api_version="v2",
+            segments=copy.deepcopy(sent["segments"]),
             decision="pass",
             entities=[],
             entity_counts={},
@@ -456,11 +458,10 @@ async def test_image_dispatch(engine_reply, api, case):  # noqa: C901
                 ]
             }
             if action == "mask":
-                for message in engine_reply["request"][field]:
-                    for part in message["content"]:
-                        part["text"] = part["text"].replace("Jane Doe", "***")
+                for segment in engine_reply["segments"]:
+                    segment["text"] = segment["text"].replace("Jane Doe", "***")
             if action == "block":
-                engine_reply.update(request=None, remote_allowed=False)
+                engine_reply.update(segments=None, remote_allowed=False)
         return httpx.Response(200, json=engine_reply)
 
     async with (
@@ -656,10 +657,19 @@ async def test_v3_image_dispatch(  # noqa: C901
     def engine(request):
         engine_calls.append(request)
         assert not bypass
-        assert request.url.path == "/v1/adapter/analyze-document-request"
+        assert request.url.path == "/v2/adapter/analyze-segments"
         sent = json.loads(request.content)
-        assert set(sent) == {"api_version", "request", "text_pii_enabled", "visual_findings"}
-        assert sent["api_version"] == "v1" and sent["text_pii_enabled"] is pii
+        assert set(sent) == {
+            "api_version",
+            "request_kind",
+            "scope",
+            "segments",
+            "attachments_present",
+            "text_pii_enabled",
+            "visual_findings",
+        }
+        assert sent["api_version"] == "v2" and sent["text_pii_enabled"] is pii
+        assert sent["scope"] == "request"
         assert sent["visual_findings"] == {"faces": faces}
         assert b"base64" not in request.content and b"image_url" not in request.content
         rows = []
@@ -694,13 +704,15 @@ async def test_v3_image_dispatch(  # noqa: C901
                 else "pass"
             )
         )
-        processed = copy.deepcopy(sent["request"])
+        processed = copy.deepcopy(sent["segments"])
         if transformed:
-            processed[field][0]["content"][0]["text"] = (
+            processed[0]["text"] = (
                 REVERSIBLE_TOKEN if text_action == "reversible_replace" else "***"
             )
+        engine_reply.pop("request", None)
         engine_reply.update(
-            request=None if decision == "block" else processed,
+            api_version="v2",
+            segments=None if decision == "block" else processed,
             visual_findings=sent["visual_findings"],
             entities=[row["entity_type"] for row in rows],
             entity_counts={row["entity_type"]: row["detected_count"] for row in rows},
@@ -777,10 +789,12 @@ async def test_v3_image_dispatch(  # noqa: C901
                 else "neurwerk: image forwarding requires extracted text for PII analysis; "
                 "no text extracted from an image."
             )
+            assert len(error["error"].pop("request_id")) == 32
             assert error["error"] == {
                 "message": expected_message,
                 "type": "policy_error",
                 "code": "image_text_unavailable",
+                "param": None,
             }
             assert error["pii_report"]["reason"] == "no_readable_text"
             assert error["pii_report"]["visual_findings"] == {"faces": faces}

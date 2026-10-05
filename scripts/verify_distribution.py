@@ -113,17 +113,27 @@ def verify_sdist(sdist_path: Path) -> None:
                 raise DistributionVerificationError.irregular_metadata_file()
             _verify_asset(name, member.read())
         for relative_path in LICENSE_FILES:
-            suffix = f"/{relative_path.as_posix()}"
-            archive_name = _only(
-                (Path(name) for name in names if name.endswith(suffix)),
-                f"sdist {relative_path} file",
-            ).as_posix()
+            archive_name = metadata_name.removesuffix("PKG-INFO") + relative_path.as_posix()
             archived_file = archive.extractfile(archive_name)
             if (
                 archived_file is None
                 or archived_file.read() != (PROJECT_ROOT / relative_path).read_bytes()
             ):
                 raise DistributionVerificationError.different_license_file("sdist", relative_path)
+        package_root = PROJECT_ROOT / "packages/request_segments"
+        for relative_path in (
+            Path("pyproject.toml"),
+            Path("src/neurwerk_request_segments/__init__.py"),
+        ):
+            member = archive.extractfile(
+                metadata_name.removesuffix("PKG-INFO")
+                + "packages/request_segments/"
+                + relative_path.as_posix()
+            )
+            if member is None or member.read() != (package_root / relative_path).read_bytes():
+                raise DistributionVerificationError.different_license_file(
+                    "shared-package", relative_path
+                )
 
 
 def verify_distribution_directory(directory: Path) -> None:

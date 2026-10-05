@@ -6,8 +6,8 @@ check-lock:
 	uv lock --check
 
 check-ruff:
-	uv run --extra dev ruff check src tests scripts
-	uv run --extra dev ruff format --check src tests scripts
+	uv run --extra dev ruff check src tests scripts packages
+	uv run --extra dev ruff format --check src tests scripts packages
 
 check-ty:
 	uv run --extra dev ty check
@@ -26,6 +26,7 @@ check-package:
 	@tmp=$$(mktemp -d); \
 	trap 'rm -rf "$$tmp"' EXIT; \
 	uv build --out-dir "$$tmp"; \
+	uv build packages/request_segments --out-dir "$$tmp/shared"; \
 	uv run python scripts/verify_distribution.py "$$tmp"
 
 test: check-test

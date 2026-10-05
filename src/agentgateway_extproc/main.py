@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import signal
+from contextlib import suppress
 from typing import cast
 
 import grpc
@@ -19,6 +20,7 @@ from agentgateway_extproc.lib.docling import DoclingClient
 from agentgateway_extproc.lib.engine.client import EngineClient
 from agentgateway_extproc.lib.image_inspection import ImageInspectionClient
 from agentgateway_extproc.lib.notice.preferences import NoticePreferencesClient
+from agentgateway_extproc.lib.rejection_capture import RejectionCapture, RejectionCaptureConfig
 
 
 def main() -> None:
@@ -40,9 +42,11 @@ async def _run(settings: Settings) -> None:
     image_inspection = ImageInspectionClient(settings.image_inspection)
     docling = DoclingClient(settings.docling, image_inspection=image_inspection)
     preferences = NoticePreferencesClient(settings.notice_preferences)
+    capture = RejectionCapture(RejectionCaptureConfig(**settings.rejection_capture.model_dump()))
     server = create_grpc_server(settings, client, docling, preferences)
     server.add_insecure_port("[::]:9000")
     await server.start()
+    capture_cleanup = asyncio.create_task(capture.run_cleanup())
     http_server = uvicorn.Server(
         uvicorn.Config(
             create_http_app(client),
@@ -62,6 +66,9 @@ async def _run(settings: Settings) -> None:
     try:
         await http_server.serve()
     finally:
+        capture_cleanup.cancel()
+        with suppress(asyncio.CancelledError):
+            await capture_cleanup
         try:
             await server.stop(grace=settings.shutdown_grace_seconds)
             await docling.close()

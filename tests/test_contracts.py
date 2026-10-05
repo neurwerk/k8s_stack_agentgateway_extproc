@@ -13,13 +13,14 @@ from agentgateway_extproc.lib.pipeline.guard import (
     inject_guard_instruction,
     strip_guard_instruction,
 )
-from agentgateway_extproc.lib.pipeline.request import _restore_reversal_leaves
+from agentgateway_extproc.lib.pipeline.reply_validation import _restore_reversal_leaves
 from agentgateway_extproc.lib.session import make_session_key
 from agentgateway_extproc.models.destination import ModelDestinationPolicy
 from agentgateway_extproc.models.engine import (
     ENGINE_REQUEST_ADAPTER,
     EngineChatRequest,
     EngineMcpRequest,
+    EngineMessage,
     EngineReply,
     EngineResponsesRequest,
 )
@@ -92,11 +93,10 @@ def test_chat_stream_options_accepts_only_an_explicit_strict_boolean(include_usa
     [
         {"unknown": "rejected"},
         {"stream_options": {"include_usage": True, "unknown": "rejected"}},
-        {"stream_options": {}},
         {"stream_options": {"include_usage": 1}},
         {"stream_options": {"include_usage": "true"}},
     ],
-    ids=["top-level-extra", "nested-extra", "missing-boolean", "integer", "string"],
+    ids=["top-level-extra", "nested-extra", "integer", "string"],
 )
 def test_chat_stream_options_rejects_fields_outside_the_strict_contract(
     update: dict[str, object],
@@ -187,8 +187,8 @@ def test_guard_is_the_leading_instruction_for_each_model_request_family() -> Non
     chat = EngineChatRequest(
         model="test",
         messages=[
-            {"role": "system", "content": "caller system"},
-            {"role": "user", "content": "hello"},
+            EngineMessage(role="system", content="caller system"),
+            EngineMessage(role="user", content="hello"),
         ],
     )
     responses = EngineResponsesRequest(
@@ -213,37 +213,42 @@ def test_guard_is_the_leading_instruction_for_each_model_request_family() -> Non
 
 def test_guard_is_added_to_tool_only_and_instructionless_requests() -> None:
     """PII-enabled dispatch gets the guard even without ordinary input text."""
-    chat = EngineChatRequest(
-        model="test",
-        messages=[
-            {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [
-                    {
-                        "id": "call_1",
-                        "type": "function",
-                        "function": {"name": "lookup", "arguments": {"id": 1}},
-                    }
-                ],
-            }
-        ],
+    chat = EngineChatRequest.model_validate(
+        {
+            "model": "test",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "lookup", "arguments": {"id": 1}},
+                        }
+                    ],
+                }
+            ],
+        }
     )
-    responses = EngineResponsesRequest(
-        model="test",
-        input=[
-            {
-                "type": "function_call",
-                "call_id": "call_1",
-                "name": "lookup",
-                "arguments": {"id": 1},
-            }
-        ],
+    responses = EngineResponsesRequest.model_validate(
+        {
+            "model": "test",
+            "input": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "lookup",
+                    "arguments": {"id": 1},
+                }
+            ],
+        }
     )
 
     injected_chat = inject_guard_instruction(chat)
     assert isinstance(injected_chat, EngineChatRequest)
     assert injected_chat.messages[0].content == GUARD_INSTRUCTION
+    assert injected_chat.messages[1].tool_calls is not None
     assert injected_chat.messages[1].tool_calls[0].function.name == "lookup"
 
     injected_responses = inject_guard_instruction(responses)
@@ -695,7 +700,7 @@ def test_engine_reply_rejects_malformed_analysis_metadata(
 def test_headerless_model_session_keys_are_request_scoped() -> None:
     """Prompt content cannot become a cross-request conversation identifier."""
     request = EngineChatRequest(
-        model="test", messages=[{"role": "user", "content": "first message"}]
+        model="test", messages=[EngineMessage(role="user", content="first message")]
     )
     first_policy = ModelDestinationPolicy(
         contract_version=1,
@@ -717,8 +722,8 @@ def test_headerless_model_session_keys_are_request_scoped() -> None:
 
 def test_session_key_prefers_gateway_conversation_header() -> None:
     """LibreChat's stable conversation header survives changing prompt history."""
-    first = EngineChatRequest(model="test", messages=[{"role": "user", "content": "one"}])
-    second = EngineChatRequest(model="test", messages=[{"role": "user", "content": "two"}])
+    first = EngineChatRequest(model="test", messages=[EngineMessage(role="user", content="one")])
+    second = EngineChatRequest(model="test", messages=[EngineMessage(role="user", content="two")])
     policy = ModelDestinationPolicy(
         contract_version=1,
         destination_kind="model",

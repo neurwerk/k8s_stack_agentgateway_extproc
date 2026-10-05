@@ -5,7 +5,7 @@ from __future__ import annotations
 import gzip
 import json
 from typing import cast
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
@@ -14,9 +14,14 @@ from pydantic import ValidationError
 from agentgateway_extproc.config.settings import EngineSettings, Settings
 from agentgateway_extproc.lib.engine.client import EngineClient
 from agentgateway_extproc.lib.pipeline.guard import GUARD_INSTRUCTION
-from agentgateway_extproc.lib.pipeline.request import _log_model_validation_failure
+from agentgateway_extproc.lib.pipeline.request_validation import log_model_validation_failure
 from agentgateway_extproc.lib.pipeline.stream_handler import StreamHandler
-from agentgateway_extproc.models.exceptions import InvalidEngineReplyError, InvalidReversalError
+from agentgateway_extproc.models.engine import EngineReply
+from agentgateway_extproc.models.exceptions import (
+    EnginePolicyError,
+    InvalidEngineReplyError,
+    InvalidReversalError,
+)
 
 from .conftest import (
     REVERSIBLE_TOKEN,
@@ -27,6 +32,7 @@ from .conftest import (
     request_json,
     response_body,
     response_headers,
+    segment_reply,
 )
 
 SPECIAL_PLAINTEXT = 'quoted "path\\file" café\nnext line'
@@ -160,7 +166,7 @@ async def test_chat_stream_options_survives_engine_and_provider_dispatch(
 
     def transport(request: httpx.Request) -> httpx.Response:
         captured.update(json.loads(request.content))
-        return httpx.Response(200, json=engine_reply, request=request)
+        return httpx.Response(200, json=segment_reply(engine_reply), request=request)
 
     client = EngineClient(
         EngineSettings(base_url="https://pii-engine.test"),
@@ -173,7 +179,7 @@ async def test_chat_stream_options_survives_engine_and_provider_dispatch(
 
     response = await handler.handle(body_request(json.dumps(original).encode()))
 
-    assert captured["stream_options"] == {"include_usage": include_usage}
+    assert "stream_options" not in captured and "request" not in captured
     assert response is not None and not response.HasField("immediate_response")
     forwarded = json.loads(response.request_body.response.body_mutation.body)
     assert forwarded["stream_options"] == {"include_usage": include_usage}
@@ -235,9 +241,9 @@ async def test_model_validation_log_contains_only_bounded_safe_metadata(
                     }
                 ],
             },
-            "other",
-            "other",
-            100,
+            "extra_forbidden",
+            "messages",
+            1,
         ),
     ]
 
@@ -271,7 +277,7 @@ def test_model_validation_log_does_not_materialize_errors_above_the_cap(caplog) 
         def errors(self, **_kwargs: object) -> list[object]:
             raise AssertionError("detailed errors must not be materialized")
 
-    _log_model_validation_failure(
+    log_model_validation_failure(
         {"model": "test", "messages": []},
         cast(ValidationError, ExcessiveValidationErrors()),
     )
@@ -569,12 +575,13 @@ async def test_gzip_decoding_is_bounded_before_allocation(engine_client) -> None
     handler = StreamHandler(engine_client, Settings(max_response_bytes=1_024))
     await handler.handle(response_headers("text/event-stream", "gzip"))
     compressed = gzip.compress(b"x" * 1_025)
-    try:
+    with pytest.raises(InvalidEngineReplyError) as failure:
         await handler.handle(response_body(compressed))
-    except ValueError as error:
-        assert str(error) == "response body too large"
-    else:
-        raise AssertionError("oversized gzip response was accepted")
+    assert failure.value.limit is not None
+    assert failure.value.limit.reason == "decoded_bytes"
+    assert failure.value.limit.measured == 1_025
+    assert failure.value.limit.maximum == 1_024
+    assert failure.value.limit.exact is False
 
 
 @pytest.mark.parametrize(
@@ -635,10 +642,12 @@ async def test_request_rejects_five_mibibytes_plus_one_in_buffered_phase(
     body = _request_body_of_size(MAX_REQUEST_BYTES + 1)
     handler = StreamHandler(engine_client)
     await handler.handle(header_request())
-    response = await handler.handle(body_request(body, end_of_stream=False))
-
-    assert response is not None
-    assert response.immediate_response.status.code == 413
+    with pytest.raises(EnginePolicyError) as failure:
+        await handler.handle(body_request(body, end_of_stream=False))
+    assert failure.value.status_code == 413
+    assert failure.value.limit is not None
+    assert failure.value.limit.measured == MAX_REQUEST_BYTES + 1
+    assert failure.value.limit.exact is False
 
 
 async def test_provider_input_accepts_exact_ten_mibibytes_across_chunks(engine_client) -> None:
@@ -663,8 +672,12 @@ async def test_provider_input_rejects_ten_mibibytes_plus_one_across_chunks(
     await handler.handle(response_headers("text/plain"))
     await handler.handle(response_body(body[:6_000_000], end_of_stream=False))
 
-    with pytest.raises(ValueError, match="response body too large"):
+    with pytest.raises(InvalidEngineReplyError) as failure:
         await handler.handle(response_body(body[6_000_000:]))
+    assert failure.value.limit is not None
+    assert failure.value.limit.measured == MAX_RESPONSE_BYTES + 1
+    assert failure.value.limit.reason == "encoded_bytes"
+    assert failure.value.limit.exact is True
 
 
 async def test_transformed_request_body_is_bounded_after_serialization(
@@ -695,13 +708,18 @@ async def test_transformed_request_body_is_bounded_after_serialization(
     handler = StreamHandler(engine_client, Settings(max_transformed_request_bytes=1_024))
     await handler.handle(header_request())
 
-    with pytest.raises(ValueError, match="transformed request body too large"):
+    with pytest.raises(EnginePolicyError) as failure:
         await handler.handle(body_request(request_json()))
+    assert failure.value.limit is not None
+    assert failure.value.limit.reason == "transformed_bytes"
+    assert failure.value.limit.maximum == 1_024
+    assert failure.value.limit.measured > 1_024
 
 
 async def test_engine_cannot_mutate_request_protocol_controls(engine_client, engine_reply) -> None:
     """A schema-valid reply cannot switch the requested model or request family."""
     engine_reply["request"]["model"] = "other-model"
+    engine_client.analyze_request = AsyncMock(return_value=EngineReply.model_validate(engine_reply))
     handler = StreamHandler(engine_client)
     await handler.handle(header_request())
     with pytest.raises(InvalidEngineReplyError, match="protocol controls"):
@@ -852,7 +870,7 @@ async def test_tool_only_model_request_receives_the_fixed_guard(
     assert not response.HasField("immediate_response")
     forwarded = json.loads(response.request_body.response.body_mutation.body)
     assert forwarded["messages"][0]["content"] == GUARD_INSTRUCTION
-    assert "content" not in forwarded["messages"][1]
+    assert forwarded["messages"][1]["content"] is None
     assert forwarded["messages"][1]["tool_calls"][0]["function"]["name"] == "lookup"
     assert "Request protected" not in json.dumps(forwarded)
 
@@ -919,7 +937,7 @@ async def test_assistant_reasoning_bypasses_analysis_and_replays_unchanged(
     forwarded = json.loads(response.request_body.response.body_mutation.body)
     assert forwarded["messages"][0]["content"] == GUARD_INSTRUCTION
     assistant = forwarded["messages"][2]
-    assert "content" not in assistant
+    assert assistant["content"] is None
     assert "reasoning_content" in assistant and assistant["reasoning_content"] is None
     assert assistant["reasoning_signature"] == signature
     second_assistant = forwarded["messages"][4]
@@ -946,7 +964,12 @@ async def test_request_reasoning_contract_rejects_unsupported_locations(
 
     assert response is not None
     assert response.immediate_response.status.code == 400
-    assert response.immediate_response.body == '{"error":"invalid model request"}'
+    if "reasoning" in message:
+        assert (
+            json.loads(response.immediate_response.body)["error"]["code"] == "unsupported_feature"
+        )
+    else:
+        assert response.immediate_response.body == '{"error":"invalid model request"}'
 
 
 async def test_mcp_mutates_only_arguments_and_reverses_only_result_text(
@@ -1337,6 +1360,7 @@ async def test_engine_cannot_mutate_responses_text_format_controls(
         }
     )
     engine_reply["request"]["text"]["format"]["name"] = "changed"
+    engine_client.analyze_request = AsyncMock(return_value=EngineReply.model_validate(engine_reply))
     handler = StreamHandler(engine_client)
     await handler.handle(header_request())
     with pytest.raises(InvalidEngineReplyError, match="protocol controls"):

@@ -6,6 +6,7 @@ import json
 
 import httpx
 import pytest
+from neurwerk_request_segments import extract_request, parse_request
 
 from agentgateway_extproc.config.settings import EngineSettings
 from agentgateway_extproc.gen import ext_proc_pb2, shared_envoy_pb2
@@ -19,6 +20,18 @@ MODEL_POLICY: dict[str, object] = {
     "principal_id": "principal-1",
     "models": {"test": True},
 }
+
+
+def segment_reply(reply: dict[str, object]) -> dict[str, object]:
+    """Serialize internal pipeline fixtures as the actual v2 segment contract."""
+    result = {**reply, "api_version": "v2"}
+    request = result.pop("request", None)
+    result["segments"] = (
+        [segment.model_dump() for segment in extract_request(parse_request(request)).segments]
+        if request is not None
+        else None
+    )
+    return result
 
 
 def mcp_policy(destination_id: str = "brave", *, pii_enabled: bool = True) -> dict[str, object]:
@@ -78,7 +91,7 @@ def engine_client(engine_reply: dict[str, object]) -> EngineClient:
     """Build a mocked HTTP engine client."""
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json=engine_reply, request=request)
+        return httpx.Response(200, json=segment_reply(engine_reply), request=request)
 
     return EngineClient(
         EngineSettings(base_url="https://pii-engine.test"),

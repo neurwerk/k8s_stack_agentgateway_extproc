@@ -81,7 +81,7 @@ def _pass_reply(request, visual_findings) -> EngineReply:
             "applied_actions": [],
             "remote_allowed": True,
             "route_class": None,
-            "request": request.model_dump(mode="json", by_alias=True, exclude_none=True),
+            "request": request,
             "analysis": {
                 "source": "current_request",
                 "scan_performed": True,

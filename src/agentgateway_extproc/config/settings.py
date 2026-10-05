@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
 
+from neurwerk_request_segments import CompatibilitySettings
 from pydantic import BaseModel, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -132,15 +134,35 @@ class NoticePreferencesSettings(BaseModel):
         return self
 
 
+class RejectionCaptureSettings(BaseModel):
+    """Bound optional original-body captures in a private diagnostic directory."""
+
+    enabled: bool = False
+    directory: Path = Path("/var/run/extproc-diagnostics/captures")
+    max_file_bytes: int = Field(default=6 * MEBIBYTE, ge=1024, le=65 * MEBIBYTE)
+    max_total_bytes: int = Field(default=30 * MEBIBYTE, ge=1024, le=256 * MEBIBYTE)
+    max_files: int = Field(default=20, ge=1, le=100)
+    retention_seconds: int = Field(default=3600, ge=60, le=86400)
+
+    @model_validator(mode="after")
+    def validate_storage(self) -> RejectionCaptureSettings:
+        """Reject inconsistent capture budgets and relative diagnostic paths."""
+        if self.max_total_bytes < self.max_file_bytes or not self.directory.is_absolute():
+            raise ValueError("capture requires an absolute directory and total >= file limit")  # noqa: TRY003
+        return self
+
+
 class Settings(BaseSettings):
     """Load adapter configuration from ``EXTPROC_`` environment variables."""
 
     model_config = SettingsConfigDict(env_prefix="EXTPROC_", env_nested_delimiter="__")
 
     engine: EngineSettings = Field(default_factory=EngineSettings)
+    compatibility: CompatibilitySettings = Field(default_factory=CompatibilitySettings)
     docling: DoclingSettings = Field(default_factory=DoclingSettings)
     image_inspection: ImageInspectionSettings = Field(default_factory=ImageInspectionSettings)
     notice_preferences: NoticePreferencesSettings = Field(default_factory=NoticePreferencesSettings)
+    rejection_capture: RejectionCaptureSettings = Field(default_factory=RejectionCaptureSettings)
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "WARNING"
     max_request_bytes: int = Field(default=MAX_REQUEST_BYTES, ge=1_024, le=MAX_UPLOAD_REQUEST_BYTES)
     max_response_bytes: int = Field(default=MAX_RESPONSE_BYTES, ge=1_024, le=MAX_RESPONSE_BYTES)
