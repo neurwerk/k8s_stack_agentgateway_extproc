@@ -4,6 +4,60 @@ from __future__ import annotations
 
 from typing import Final, Literal
 
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+
+class LimitDetail(BaseModel):
+    """Carry content-free measurements from the boundary that rejected work."""
+
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    component: Literal["pii_engine", "extproc", "request_segments"] = "extproc"
+    stage: Literal[
+        "admission",
+        "json",
+        "inspection",
+        "engine_request",
+        "engine_response",
+        "provider_response",
+        "output",
+    ]
+    reason: Literal[
+        "bytes",
+        "declared_bytes",
+        "encoded_bytes",
+        "decoded_bytes",
+        "transformed_bytes",
+        "depth",
+        "tokens",
+        "nodes",
+        "text_characters",
+        "segments",
+        "text_leaves",
+        "empty_chunks",
+    ]
+    measured: int = Field(ge=0)
+    maximum: int = Field(ge=0)
+    unit: Literal["bytes", "characters", "items", "levels"]
+    exact: bool
+
+    @model_validator(mode="after")
+    def validate_measurement(self) -> LimitDetail:
+        """Reject contradictory units or a measurement that did not exceed its limit."""
+        expected_unit = {
+            "bytes": "bytes",
+            "declared_bytes": "bytes",
+            "encoded_bytes": "bytes",
+            "decoded_bytes": "bytes",
+            "transformed_bytes": "bytes",
+            "depth": "levels",
+            "text_characters": "characters",
+        }.get(self.reason, "items")
+        if self.measured <= self.maximum or self.unit != expected_unit:
+            raise ValueError("invalid limit measurement")  # noqa: TRY003
+        return self
+
+
 type EngineErrorCode = Literal[
     "invalid_request",
     "request_too_large",
@@ -39,13 +93,31 @@ class EngineUnavailableError(Exception):
 class InvalidEngineReplyError(Exception):
     """Indicate that an engine reply did not match the strict adapter contract."""
 
+    def __init__(
+        self,
+        message: str = "",
+        *,
+        limit: LimitDetail | None = None,
+        correlation_id: str | None = None,
+    ) -> None:
+        """Retain measured response limits while preserving rejection behavior."""
+        super().__init__(message)
+        self.limit = limit
+        self.correlation_id = correlation_id
+
 
 class EnginePolicyError(Exception):
     """Carry one validated and status-bound PII Engine rejection."""
 
-    __slots__ = ("code", "message", "retryable", "status_code")
+    __slots__ = ("code", "correlation_id", "limit", "message", "retryable", "status_code")
 
-    def __init__(self, code: EngineErrorCode) -> None:
+    def __init__(
+        self,
+        code: EngineErrorCode,
+        *,
+        limit: LimitDetail | None = None,
+        correlation_id: str | None = None,
+    ) -> None:
         """Derive every client-visible field from one recognized error code."""
         contract = ENGINE_ERROR_CONTRACT.get(code)
         if contract is None:
@@ -53,6 +125,8 @@ class EnginePolicyError(Exception):
         super().__init__()
         self.status_code, self.message, self.retryable = contract
         self.code = code
+        self.limit = limit
+        self.correlation_id = correlation_id
 
 
 class InvalidReversalError(Exception):

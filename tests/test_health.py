@@ -29,8 +29,8 @@ def test_ready_endpoint_checks_engine_readiness() -> None:
 
 def _engine_client(status: int) -> EngineClient:
     def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/v1/adapter/ready"
-        return httpx.Response(status, request=request)
+        assert request.url.path == "/v2/adapter/ready"
+        return httpx.Response(status, json={"api_version": "v2", "status": "ok"}, request=request)
 
     return EngineClient(
         EngineSettings(base_url="https://pii-engine.test"),

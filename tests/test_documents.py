@@ -385,26 +385,27 @@ async def test_document_dispatch(engine_reply, api, pii, mode, extension, case, 
 
     def engine(request):
         engine_calls.append(request)
-        assert request.url.path == "/v1/adapter/analyze-document-request"
+        assert request.url.path == "/v2/adapter/analyze-segments"
         sent = json.loads(request.content)
         assert "file_data" not in request.content.decode()
         if case == "pii-json-nodes":
             return httpx.Response(200, content=excessive_json)
-        transformed = copy.deepcopy(sent)
-        for message in transformed[field]:
-            for part in message["content"]:
-                part["text"] = part["text"].replace("Jane Doe", REVERSIBLE_TOKEN)
-        engine_reply["request"] = transformed
+        assert sent["scope"] == "request"
+        transformed = copy.deepcopy(sent["segments"])
+        for segment in transformed:
+            segment["text"] = segment["text"].replace("Jane Doe", REVERSIBLE_TOKEN)
+        engine_reply.pop("request", None)
+        engine_reply.update(api_version="v2", segments=transformed)
         engine_reply["entity_counts"] = {"PERSON": 2}
         engine_reply["report"]["rows"][0].update(detected_count=2, transformed_count=2)
         if case == "pii-control":
-            transformed["temperature"] = 1.0
+            engine_reply["request"] = {"temperature": 1.0}
         if case == "pii-reversal":
             engine_reply["reversal"][REVERSIBLE_TOKEN] = "not in converted document"
         if case == "pii-block":
             engine_reply.update(
                 decision="block",
-                request=None,
+                segments=None,
                 reversal={},
                 applied_actions=["block"],
                 remote_allowed=False,
@@ -416,7 +417,7 @@ async def test_document_dispatch(engine_reply, api, pii, mode, extension, case, 
             decision = case.removeprefix("pii-")
             engine_reply.update(
                 decision=decision,
-                request=sent,
+                segments=sent["segments"],
                 reversal={},
                 applied_actions=[decision],
                 route_class="local" if decision == "reroute" else None,

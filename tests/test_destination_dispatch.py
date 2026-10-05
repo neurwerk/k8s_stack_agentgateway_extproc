@@ -310,9 +310,10 @@ async def test_model_attachments_stop_before_engine_or_upstream(
         "immediate_response",
     ]
     assert responses[-1].immediate_response.status.code == 403
-    assert json.loads(responses[-1].immediate_response.body) == {
-        "error": "neurwerk: attachments are disabled for this model."
-    }
+    error = json.loads(responses[-1].immediate_response.body)["error"]
+    assert error["message"] == "neurwerk: attachments are disabled for this model."
+    assert error["code"] == "policy_blocked"
+    assert len(error["request_id"]) == 32
 
 
 @pytest.mark.parametrize("role", ["user", "tool"])
@@ -1670,11 +1671,13 @@ async def test_mcp_buffered_body_and_trailers_receive_one_matching_response_each
 
 
 def test_session_keys_scope_principal_destination_and_mcp_session() -> None:
-    request = EngineMcpRequest(
-        jsonrpc="2.0",
-        id=1,
-        method="tools/call",
-        params={"name": "search", "arguments": {"query": "safe"}},
+    request = EngineMcpRequest.model_validate(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "search", "arguments": {"query": "safe"}},
+        }
     )
     brave = McpDestinationPolicy(
         contract_version=1,

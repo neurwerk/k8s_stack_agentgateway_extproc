@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
+from neurwerk_request_segments import parse_request
 from pydantic import ValidationError
 
 from agentgateway_extproc.config.settings import EngineSettings
@@ -22,9 +23,16 @@ from agentgateway_extproc.models.exceptions import (
     EngineUnavailableError,
     InvalidEngineReplyError,
 )
+from tests.conftest import segment_reply
 
 ERROR_CASES = tuple((code, *contract) for code, contract in ENGINE_ERROR_CONTRACT.items())
 MAX_ENGINE_RESPONSE_BYTES = 10_485_760
+
+
+def _chat(text: str = "hello") -> EngineChatRequest:
+    return EngineChatRequest.model_validate(
+        {"model": "test", "messages": [{"role": "user", "content": text}]}
+    )
 
 
 class ChunkedResponseStream(httpx.AsyncByteStream):
@@ -76,6 +84,8 @@ def _client_streaming(status: int, content: bytes) -> EngineClient:
 
 
 def _padded_json(payload: dict[str, object], size: int) -> bytes:
+    if "request" in payload:
+        payload = segment_reply(payload)
     content = json.dumps(payload, separators=(",", ":")).encode()
     assert len(content) <= size
     return content + b" " * (size - len(content))
@@ -113,10 +123,61 @@ def test_engine_client_loads_mtls_identity_into_verification_context() -> None:
 async def test_engine_client_posts_typed_request(engine_client: EngineClient) -> None:
     """A valid engine response is parsed into the typed reply model."""
     result = await engine_client.analyze_request(
-        EngineChatRequest(model="test", messages=[{"role": "user", "content": "hello"}]),
+        _chat(),
         "a" * 64,
     )
     assert next(iter(result.reversal.values())) == "Jane Doe"
+
+
+@pytest.mark.parametrize("document", [False, True])
+async def test_segment_wire_excludes_provider_controls_and_preserves_them_locally(
+    engine_reply, document
+):
+    payload = {
+        "model": "test",
+        "messages": [{"role": "user", "content": "Jane Doe"}],
+        "store": False,
+        "max_tokens": None,
+        "metadata": {"opaque": "local-only"},
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v2/adapter/analyze-segments"
+        assert json.loads(request.content) == {
+            "api_version": "v2",
+            "request_kind": "chat",
+            "scope": "request" if document else "session",
+            "segments": [{"id": "s0", "text": "Jane Doe"}],
+            "text_pii_enabled": True,
+            "attachments_present": False,
+        }
+        return httpx.Response(200, json=segment_reply(engine_reply))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = EngineClient(EngineSettings(base_url="https://pii-engine.test"), http)
+        reply = await client.analyze_request(parse_request(payload), "a" * 64, document=document)
+    assert reply.request is not None
+    wire = reply.request.model_dump(exclude_unset=True)
+    assert wire["store"] is False and wire["max_tokens"] is None
+    assert wire["metadata"] == payload["metadata"]
+    assert "stream" not in wire
+
+
+@pytest.mark.parametrize(
+    "segments",
+    [
+        None,
+        [],
+        [{"id": "s1", "text": "MASK"}],
+        [{"id": "s0", "text": "MASK"}, {"id": "s0", "text": "MASK"}],
+    ],
+)
+async def test_segment_reply_requires_exact_identity_sequence(engine_reply, segments):
+    wire = {**segment_reply(engine_reply), "segments": segments}
+    with pytest.raises(InvalidEngineReplyError):
+        await _client_returning(200, json.dumps(wire).encode()).analyze_request(
+            parse_request({"model": "test", "input": "Jane Doe"}), "a" * 64
+        )
 
 
 @pytest.mark.parametrize(
@@ -137,7 +198,7 @@ async def test_engine_client_posts_typed_request(engine_client: EngineClient) ->
     ],
 )
 async def test_document_findings_require_exact_fresh_echo_and_honest_text_scan(engine_reply, case):
-    request = EngineChatRequest(model="test", messages=[{"role": "user", "content": "image text"}])
+    request = _chat("image text")
     findings = VisualFindings.model_validate({"faces": {"scan_status": "complete", "count": 3}})
     engine_reply.update(
         request=request.model_dump(exclude_none=True),
@@ -185,7 +246,7 @@ async def test_document_findings_require_exact_fresh_echo_and_honest_text_scan(e
         engine_reply["request"]["messages"][0]["content"] = "silently changed"
     elif case == "cached":
         engine_reply["analysis"]["cached_decision_applied"] = True
-    client = _client_returning(200, json.dumps(engine_reply).encode())
+    client = _client_returning(200, json.dumps(segment_reply(engine_reply)).encode())
     if case == "valid":
         reply = await client.analyze_request(
             request, "a" * 64, document=True, text_pii_enabled=False, visual_findings=findings
@@ -216,7 +277,7 @@ async def test_engine_client_maps_valid_typed_errors(
 
     with pytest.raises(EnginePolicyError) as raised:
         await _client_returning(status, content).analyze_request(
-            EngineChatRequest(model="test", messages=[{"role": "user", "content": "hello"}]),
+            _chat(),
             "a" * 64,
         )
 
@@ -241,7 +302,7 @@ async def test_engine_client_rejects_obsolete_overlap_error() -> None:
 
     with pytest.raises(InvalidEngineReplyError):
         await _client_returning(422, content).analyze_request(
-            EngineChatRequest(model="test", messages=[{"role": "user", "content": "hello"}]),
+            _chat(),
             "a" * 64,
         )
 
@@ -302,7 +363,7 @@ async def test_engine_client_rejects_unrecognized_error_contracts(
 
     with pytest.raises(InvalidEngineReplyError):
         await client.analyze_request(
-            EngineChatRequest(model="test", messages=[{"role": "user", "content": "hello"}]),
+            _chat(),
             "a" * 64,
         )
 
@@ -332,7 +393,7 @@ async def test_engine_client_rejects_unsafe_error_messages(message: str) -> None
 
     with pytest.raises(InvalidEngineReplyError):
         await _client_returning(400, content).analyze_request(
-            EngineChatRequest(model="test", messages=[{"role": "user", "content": "hello"}]),
+            _chat(),
             "a" * 64,
         )
 
@@ -341,7 +402,7 @@ async def test_engine_client_rejects_malformed_error_json() -> None:
     """A non-JSON engine failure remains an invalid engine reply."""
     with pytest.raises(InvalidEngineReplyError):
         await _client_returning(400, b'{"api_version":').analyze_request(
-            EngineChatRequest(model="test", messages=[{"role": "user", "content": "hello"}]),
+            _chat(),
             "a" * 64,
         )
 
@@ -355,7 +416,7 @@ async def test_engine_client_rejects_duplicate_error_keys() -> None:
 
     with pytest.raises(InvalidEngineReplyError):
         await _client_returning(400, content).analyze_request(
-            EngineChatRequest(model="test", messages=[{"role": "user", "content": "hello"}]),
+            _chat(),
             "a" * 64,
         )
 
@@ -375,7 +436,7 @@ async def test_engine_client_rejects_error_status_mismatch() -> None:
 
     with pytest.raises(InvalidEngineReplyError):
         await _client_returning(503, content).analyze_request(
-            EngineChatRequest(model="test", messages=[{"role": "user", "content": "hello"}]),
+            _chat(),
             "a" * 64,
         )
 
@@ -398,7 +459,7 @@ async def test_engine_client_rejects_error_contract_field_mismatch(
 
     with pytest.raises(InvalidEngineReplyError):
         await _client_returning(400, content).analyze_request(
-            EngineChatRequest(model="test", messages=[{"role": "user", "content": "hello"}]),
+            _chat(),
             "a" * 64,
         )
 
@@ -432,9 +493,7 @@ async def test_engine_readiness_has_a_separate_overall_deadline(engine_reply, op
                 await client.check_ready()
             else:
                 await client.analyze_request(
-                    EngineChatRequest(
-                        model="test", messages=[{"role": "user", "content": "hello"}]
-                    ),
+                    _chat(),
                     "a" * 64,
                     document=operation == "document-body",
                 )
@@ -451,7 +510,7 @@ async def test_engine_client_sends_only_opaque_session_key(engine_reply: dict[st
 
     def handler(request: httpx.Request) -> httpx.Response:
         captured["session"] = request.headers["x-pii-session-key"]
-        return httpx.Response(200, json=engine_reply, request=request)
+        return httpx.Response(200, json=segment_reply(engine_reply), request=request)
 
     client = EngineClient(
         EngineSettings(base_url="https://pii-engine.test"),
@@ -460,7 +519,7 @@ async def test_engine_client_sends_only_opaque_session_key(engine_reply: dict[st
         ),
     )
     await client.analyze_request(
-        EngineChatRequest(model="test", messages=[{"role": "user", "content": "hello"}]),
+        _chat(),
         "f" * 64,
     )
     assert captured == {"session": "f" * 64}
@@ -471,7 +530,7 @@ async def test_engine_client_rejects_unknown_reply_fields(engine_reply: dict[str
     engine_reply["unexpected"] = True
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json=engine_reply, request=request)
+        return httpx.Response(200, json=segment_reply(engine_reply), request=request)
 
     client = EngineClient(
         EngineSettings(base_url="https://pii-engine.test"),
@@ -491,7 +550,7 @@ async def test_engine_client_rejects_duplicate_reversal_keys(
     """Duplicate wire keys cannot collapse conflicting plaintext mappings."""
     reversal = cast(dict[str, str], engine_reply["reversal"])
     token = next(iter(reversal))
-    encoded = json.dumps(engine_reply)
+    encoded = json.dumps(segment_reply(engine_reply))
     original = json.dumps(engine_reply["reversal"])
     duplicate = f'{{{json.dumps(token)}:"Jane Doe",{json.dumps(token)}:"John Doe"}}'
 
@@ -506,7 +565,7 @@ async def test_engine_client_rejects_duplicate_reversal_keys(
     )
     with pytest.raises(InvalidEngineReplyError):
         await client.analyze_request(
-            EngineChatRequest(model="test", messages=[{"role": "user", "content": "hello"}]),
+            _chat(),
             "a" * 64,
         )
 
@@ -519,7 +578,7 @@ async def test_engine_response_accepts_exact_ten_mibibytes(
     client = _client_streaming(200, content) if chunked else _client_returning(200, content)
 
     reply = await client.analyze_request(
-        EngineChatRequest(model="test", messages=[{"role": "user", "content": "hello"}]),
+        _chat(),
         "a" * 64,
     )
 
@@ -538,7 +597,7 @@ async def test_engine_response_rejects_ten_mibibytes_plus_one_before_parsing(
         pytest.raises(InvalidEngineReplyError),
     ):
         await client.analyze_request(
-            EngineChatRequest(model="test", messages=[{"role": "user", "content": "hello"}]),
+            _chat(),
             "a" * 64,
         )
 
@@ -563,7 +622,7 @@ async def test_engine_error_body_accepts_exact_ten_mibibytes(chunked: bool) -> N
 
     with pytest.raises(EnginePolicyError) as raised:
         await client.analyze_request(
-            EngineChatRequest(model="test", messages=[{"role": "user", "content": "hello"}]),
+            _chat(),
             "a" * 64,
         )
 
@@ -588,6 +647,6 @@ async def test_engine_error_body_rejects_ten_mibibytes_plus_one(chunked: bool) -
 
     with pytest.raises(InvalidEngineReplyError):
         await client.analyze_request(
-            EngineChatRequest(model="test", messages=[{"role": "user", "content": "hello"}]),
+            _chat(),
             "a" * 64,
         )

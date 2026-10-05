@@ -23,6 +23,21 @@ and placeholder boundaries. `/health` checks the process; `/ready` verifies the
 PII Engine path; `/metrics` exposes bounded operational metrics. Deployment
 network policy and workload identity are outside this repository.
 
+The segment-contract implementation requires Engine v2 (including
+`/v2/adapter/ready`). One batched analysis call carries text segments; the shared
+[`request_segments` package](packages/request_segments/README.md) retains protocol
+controls and rebuilds only inspected text. AgentGateway still owns provider translation.
+Reviewed scalar control extensions use `EXTPROC_COMPATIBILITY__CONTROLS`; unknown
+content features fail closed. Deploy a compatible Engine before this adapter.
+
+Limit errors include content-free measurements and a correlated `x-request-id`.
+Optional rejected-body capture uses `EXTPROC_REJECTION_CAPTURE__ENABLED=true` and
+`EXTPROC_REJECTION_CAPTURE__DIRECTORY` pointing at private writable storage.
+It defaults off; defaults are 6 MiB/file, 30 MiB total, 20 files, and one-hour
+retention with cleanup every 60 seconds. Each file contains one JSON metadata line
+then original body bytes; `complete` distinguishes a full request from a prefix.
+Capture failures do not replace the original rejection. Bodies are not redacted.
+
 In trusted contract versions one through three, typed attachment content parts in
 Chat Completions and Responses messages, including history, follow the selected
 model's legacy attachment mode:

@@ -9,6 +9,7 @@ WORKDIR /app
 COPY --from=uv /uv /usr/local/bin/uv
 COPY pyproject.toml uv.lock README.md LICENSE THIRD_PARTY_NOTICES.md ./
 COPY LICENSES/ LICENSES/
+COPY packages/request_segments/ packages/request_segments/
 RUN uv sync --frozen --no-dev --no-install-project
 COPY src/ src/
 RUN uv sync --frozen --no-dev --no-editable

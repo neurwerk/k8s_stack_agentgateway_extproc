@@ -6,7 +6,8 @@ from __future__ import annotations
 
 import codecs
 import zlib
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol
+from uuid import uuid4
 
 from agentgateway_extproc.config.settings import Settings
 from agentgateway_extproc.gen import ext_proc_pb2
@@ -33,7 +34,13 @@ from agentgateway_extproc.models.destination import (
     ModelDestinationPolicy,
     destination_policy_from_request,
 )
-from agentgateway_extproc.models.exceptions import McpHttpError, TrustedMetadataError
+from agentgateway_extproc.models.exceptions import (
+    EnginePolicyError,
+    InvalidEngineReplyError,
+    LimitDetail,
+    McpHttpError,
+    TrustedMetadataError,
+)
 from agentgateway_extproc.models.types import (
     PRESIDIO_RESPONSE_HEADER,
     REQUEST_HEADERS,
@@ -81,6 +88,8 @@ class StreamHandler:
     ) -> None:
         """Initialize state for one HTTP request/response stream."""
         limits = settings or Settings()
+        self.correlation_id = uuid4().hex
+        self.compatibility = limits.compatibility
         self.client = client
         self.docling = docling
         self.preferences_client = preferences_client
@@ -322,10 +331,17 @@ class StreamHandler:
             return immediate_response(400, '{"error":"unexpected request body"}')
         size = sum(map(len, self.request_body_chunks)) + len(request.request_body.body)
         if size > self.max_request_bytes:
-            return ext_proc_pb2.ProcessingResponse(
-                immediate_response=ext_proc_pb2.ImmediateResponse(
-                    status={"code": 413}, body='{"error":"request body too large"}'
-                )
+            raise EnginePolicyError(
+                "request_too_large",
+                limit=LimitDetail(
+                    stage="admission",
+                    reason="bytes",
+                    measured=size,
+                    maximum=self.max_request_bytes,
+                    unit="bytes",
+                    exact=request.request_body.end_of_stream,
+                ),
+                correlation_id=self.correlation_id,
             )
         self.request_body_chunks.append(request.request_body.body)
         self.request_trailers_expected = not request.request_body.end_of_stream
@@ -554,7 +570,9 @@ class StreamHandler:
         preserve_encoded = self._retain_encoded_mcp_response(chunk)
         self.response_encoded_bytes += len(chunk)
         if self.response_encoded_bytes > self.max_response_bytes:
-            raise ValueError("response body too large")
+            raise self._response_limit(
+                self.response_encoded_bytes, exact=end, reason="encoded_bytes"
+            )
         if self.response_is_gzip:
             chunk = self._decompress_bounded(chunk, end)
         else:
@@ -575,7 +593,9 @@ class StreamHandler:
         emitted = response.response_body.response.body_mutation.streamed_response.body
         self.response_emitted_bytes += len(emitted)
         if self.response_emitted_bytes > self.max_response_bytes:
-            raise ValueError("transformed response body too large")
+            raise self._response_limit(
+                self.response_emitted_bytes, exact=end, reason="transformed_bytes"
+            )
         if end:
             self.response_processed = True
         return response
@@ -612,7 +632,7 @@ class StreamHandler:
         remaining = self.max_response_bytes - self.response_decoded_bytes
         decoded = decompressor.decompress(chunk, remaining + 1)
         if len(decoded) > remaining or decompressor.unconsumed_tail:
-            raise ValueError("response body too large")
+            raise self._response_limit(self.response_decoded_bytes + len(decoded), exact=False)
         if decompressor.unused_data:
             raise ValueError("gzip response contains trailing data")
         if end:
@@ -620,8 +640,10 @@ class StreamHandler:
                 raise ValueError("gzip response is truncated")
             tail = decompressor.flush(remaining - len(decoded) + 1)
             decoded += tail
-            if len(decoded) > remaining or decompressor.unused_data:
-                raise ValueError("response body too large")
+            if len(decoded) > remaining:
+                raise self._response_limit(self.response_decoded_bytes + len(decoded), exact=False)
+            if decompressor.unused_data:
+                raise ValueError("gzip response contains trailing data")
             self.gzip_decompressor = None
         self._record_decoded_size(len(decoded))
         return decoded
@@ -629,7 +651,25 @@ class StreamHandler:
     def _record_decoded_size(self, size: int) -> None:
         self.response_decoded_bytes += size
         if self.response_decoded_bytes > self.max_response_bytes:
-            raise ValueError("response body too large")
+            raise self._response_limit(self.response_decoded_bytes, exact=False)
+
+    def _response_limit(
+        self,
+        measured: int,
+        *,
+        exact: bool,
+        reason: Literal["encoded_bytes", "decoded_bytes", "transformed_bytes"] = "decoded_bytes",
+    ) -> InvalidEngineReplyError:
+        return InvalidEngineReplyError(
+            limit=LimitDetail(
+                stage="output" if reason == "transformed_bytes" else "provider_response",
+                reason=reason,
+                measured=measured,
+                maximum=self.max_response_bytes,
+                unit="bytes",
+                exact=exact,
+            )
+        )
 
     def finish_request(self) -> ext_proc_pb2.ProcessingResponse | None:
         """Fail closed when an opened request stream ends before analysis."""

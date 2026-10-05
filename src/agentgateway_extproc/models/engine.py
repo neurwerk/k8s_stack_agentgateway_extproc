@@ -4,31 +4,103 @@ from __future__ import annotations
 
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator, model_validator
+from neurwerk_request_segments.models import (
+    ENGINE_REQUEST_ADAPTER as ENGINE_REQUEST_ADAPTER,
+)
+from neurwerk_request_segments.models import (
+    EngineAttachmentPart as EngineAttachmentPart,
+)
+from neurwerk_request_segments.models import (
+    EngineChatRequest as EngineChatRequest,
+)
+from neurwerk_request_segments.models import (
+    EngineChatStreamOptions as EngineChatStreamOptions,
+)
+from neurwerk_request_segments.models import (
+    EngineFunction as EngineFunction,
+)
+from neurwerk_request_segments.models import (
+    EngineMcpParams as EngineMcpParams,
+)
+from neurwerk_request_segments.models import (
+    EngineMcpRequest as EngineMcpRequest,
+)
+from neurwerk_request_segments.models import (
+    EngineMessage as EngineMessage,
+)
+from neurwerk_request_segments.models import (
+    EngineMessageContent as EngineMessageContent,
+)
+from neurwerk_request_segments.models import (
+    EngineRequest as EngineRequest,
+)
+from neurwerk_request_segments.models import (
+    EngineResponseFunctionCall as EngineResponseFunctionCall,
+)
+from neurwerk_request_segments.models import (
+    EngineResponseFunctionOutput as EngineResponseFunctionOutput,
+)
+from neurwerk_request_segments.models import (
+    EngineResponseInput as EngineResponseInput,
+)
+from neurwerk_request_segments.models import (
+    EngineResponseInputItem as EngineResponseInputItem,
+)
+from neurwerk_request_segments.models import (
+    EngineResponseMessage as EngineResponseMessage,
+)
+from neurwerk_request_segments.models import (
+    EngineResponsesRequest as EngineResponsesRequest,
+)
+from neurwerk_request_segments.models import (
+    EngineResponseTextConfig as EngineResponseTextConfig,
+)
+from neurwerk_request_segments.models import (
+    EngineResponseTextFormat as EngineResponseTextFormat,
+)
+from neurwerk_request_segments.models import (
+    EngineResponseTextFormatObject as EngineResponseTextFormatObject,
+)
+from neurwerk_request_segments.models import (
+    EngineResponseTextFormatSchema as EngineResponseTextFormatSchema,
+)
+from neurwerk_request_segments.models import (
+    EngineResponseTextFormatText as EngineResponseTextFormatText,
+)
+from neurwerk_request_segments.models import (
+    EngineResponseTextPart as EngineResponseTextPart,
+)
+from neurwerk_request_segments.models import (
+    EngineTextPart as EngineTextPart,
+)
+from neurwerk_request_segments.models import (
+    EngineToolCall as EngineToolCall,
+)
+from neurwerk_request_segments.models import (
+    EngineToolDefinition as EngineToolDefinition,
+)
+from neurwerk_request_segments.models import (
+    EngineToolFunction as EngineToolFunction,
+)
+from neurwerk_request_segments.models import (
+    JsonScalar as JsonScalar,
+)
+from neurwerk_request_segments.models import (
+    JsonValue as JsonValue,
+)
+from neurwerk_request_segments.models import (
+    McpJsonValue as McpJsonValue,
+)
+from neurwerk_request_segments.models import (
+    McpRequestId as McpRequestId,
+)
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from agentgateway_extproc.models.exceptions import (
     MAX_ENGINE_ERROR_MESSAGE_LENGTH,
     EngineErrorCode,
+    LimitDetail,
     is_safe_engine_error_message,
-)
-
-type JsonScalar = str | int | float | bool | None
-type JsonValue = JsonScalar | list[JsonValue] | dict[str, JsonValue]
-type McpJsonValue = (
-    Annotated[str, Field(strict=True)]
-    | Annotated[int, Field(strict=True)]
-    | Annotated[float, Field(strict=True, allow_inf_nan=False)]
-    | Annotated[bool, Field(strict=True)]
-    | Annotated[list[McpJsonValue], Field(max_length=256)]
-    | Annotated[dict[str, McpJsonValue], Field(max_length=256)]
-    | None
-)
-type McpRequestId = (
-    Annotated[str, Field(strict=True, min_length=1, max_length=256)]
-    | Annotated[
-        int,
-        Field(strict=True, ge=-9_007_199_254_740_991, le=9_007_199_254_740_991),
-    ]
 )
 
 
@@ -61,252 +133,18 @@ class EngineErrorReply(EngineModel):
     error: EngineErrorDetail
 
 
-class EngineTextPart(EngineModel):
-    """Represent one OpenAI Chat text part."""
+class EngineLimitErrorDetail(EngineErrorDetail):
+    """Bind measured limit facts to the size rejection code."""
 
-    type: Literal["text"]
-    text: str = Field(min_length=1)
+    code: Literal["request_too_large"]
+    limit: LimitDetail
 
 
-class EngineAttachmentPart(BaseModel):
-    """Mirror attachment blocks that the engine accepts only to reject by policy."""
+class EngineLimitErrorReply(EngineModel):
+    """Validate the extended error envelope independently of v1 acceptance."""
 
-    model_config = ConfigDict(extra="allow", str_strip_whitespace=False, validate_assignment=True)
-
-    type: Literal[
-        "image_url",
-        "input_audio",
-        "file",
-        "input_image",
-        "input_file",
-        "image",
-        "audio",
-        "resource",
-        "resource_link",
-    ]
-
-
-type EngineMessageContent = (
-    str | Annotated[list[EngineTextPart | EngineAttachmentPart], Field(max_length=64)]
-)
-
-
-class EngineFunction(EngineModel):
-    """Represent a function call in an OpenAI-compatible request."""
-
-    name: str = Field(min_length=1, max_length=256, pattern=r"^[A-Za-z0-9_.:-]+$")
-    arguments: JsonValue = ""
-
-
-class EngineToolCall(EngineModel):
-    """Represent an assistant tool call."""
-
-    id: str = Field(min_length=1, max_length=256, pattern=r"^[A-Za-z0-9_.:-]+$")
-    type: Literal["function"]
-    function: EngineFunction
-
-
-class EngineToolFunction(EngineModel):
-    """Describe a function tool offered to the model."""
-
-    name: str = Field(min_length=1, max_length=256, pattern=r"^[A-Za-z0-9_.:-]+$")
-    # OpenCode tool descriptions can exceed 4,000 characters.
-    description: str | None = Field(default=None, max_length=20_000)
-    parameters: dict[str, JsonValue] | None = None
-
-
-class EngineToolDefinition(EngineModel):
-    """Describe one function tool in an engine request."""
-
-    type: Literal["function"]
-    function: EngineToolFunction
-
-
-class EngineMessage(EngineModel):
-    """Represent a supported Chat message."""
-
-    role: Literal["system", "developer", "user", "assistant", "tool"]
-    content: EngineMessageContent | None = None
-    name: str | None = Field(default=None, max_length=256)
-    tool_calls: list[EngineToolCall] = Field(default_factory=list, max_length=32)
-    tool_call_id: str | None = Field(default=None, max_length=256)
-
-    @model_validator(mode="after")
-    def validate_role_fields(self) -> EngineMessage:
-        """Require fields that distinguish assistant calls and tool results."""
-        if self.role == "tool" and not self.tool_call_id:
-            raise ValueError("tool messages require tool_call_id")  # noqa: TRY003
-        if self.tool_calls and self.role != "assistant":
-            raise ValueError("tool_calls require an assistant message")  # noqa: TRY003
-        if self.role == "assistant" and self.content is None and not self.tool_calls:
-            raise ValueError("assistant messages require content or tool_calls")  # noqa: TRY003
-        return self
-
-
-class EngineChatStreamOptions(EngineModel):
-    """Represent strict streamed Chat completion controls."""
-
-    include_usage: Annotated[bool, Field(strict=True)]
-
-
-class EngineChatRequest(EngineModel):
-    """Represent a bounded OpenAI Chat Completions request."""
-
-    model: str = Field(min_length=1, max_length=256, pattern=r"^[A-Za-z0-9_./:-]+$")
-    messages: list[EngineMessage] = Field(min_length=1, max_length=256)
-    temperature: float | None = Field(default=None, ge=0, le=2)
-    top_p: float | None = Field(default=None, ge=0, le=1)
-    max_tokens: int | None = Field(default=None, ge=1, le=1_000_000)
-    stream: bool = False
-    stream_options: EngineChatStreamOptions | None = None
-    n: int | None = Field(default=None, ge=1, le=16)
-    stop: str | list[str] | None = None
-    tools: list[EngineToolDefinition] = Field(default_factory=list, max_length=128)
-    tool_choice: Literal["none", "auto", "required"] | dict[str, JsonValue] | None = None
-    response_format: dict[str, JsonValue] | None = None
-    user: str | None = Field(default=None, max_length=256)
-
-    @model_validator(mode="after")
-    def validate_stream_options(self) -> EngineChatRequest:
-        """Allow stream options only for streamed Chat Completions requests."""
-        if self.stream_options is not None and not self.stream:
-            raise ValueError("stream_options require stream to be enabled")  # noqa: TRY003
-        return self
-
-
-class EngineResponseTextPart(EngineModel):
-    """Represent one Responses API text content part."""
-
-    type: Literal["input_text", "output_text"]
-    text: str = Field(min_length=1)
-
-
-class EngineResponseMessage(EngineModel):
-    """Represent one Responses API message."""
-
-    type: Literal["message"] = "message"
-    role: Literal["system", "developer", "user", "assistant"]
-    content: list[EngineResponseTextPart | EngineAttachmentPart] = Field(
-        min_length=1, max_length=64
-    )
-
-
-class EngineResponseFunctionCall(EngineModel):
-    """Represent a Responses API function call."""
-
-    type: Literal["function_call"]
-    call_id: str = Field(min_length=1, max_length=256)
-    name: str = Field(min_length=1, max_length=256, pattern=r"^[A-Za-z0-9_.:-]+$")
-    arguments: JsonValue
-
-
-class EngineResponseFunctionOutput(EngineModel):
-    """Represent nested textual output returned by a tool."""
-
-    type: Literal["function_call_output"]
-    call_id: str = Field(min_length=1, max_length=256)
-    output: JsonValue
-
-
-class EngineResponseTextFormatText(EngineModel):
-    """Select ordinary text output from the Responses API."""
-
-    type: Literal["text"]
-
-
-class EngineResponseTextFormatObject(EngineModel):
-    """Select the legacy JSON object response format."""
-
-    type: Literal["json_object"]
-
-
-class EngineResponseTextFormatSchema(EngineModel):
-    """Bound one Responses API structured-output JSON schema."""
-
-    model_config = ConfigDict(serialize_by_alias=True)
-
-    type: Literal["json_schema"]
-    name: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
-    description: str | None = Field(default=None, max_length=4_000)
-    schema_value: dict[str, JsonValue] = Field(alias="schema", max_length=256)
-    strict: bool | None = None
-
-
-type EngineResponseTextFormat = Annotated[
-    EngineResponseTextFormatText | EngineResponseTextFormatObject | EngineResponseTextFormatSchema,
-    Field(discriminator="type"),
-]
-
-
-class EngineResponseTextConfig(EngineModel):
-    """Configure bounded Responses API text output."""
-
-    format: EngineResponseTextFormat | None = None
-    verbosity: Literal["low", "medium", "high"] | None = None
-
-
-type EngineResponseInputItem = (
-    EngineResponseMessage | EngineResponseFunctionCall | EngineResponseFunctionOutput
-)
-type EngineResponseInput = (
-    str | Annotated[list[EngineResponseInputItem], Field(min_length=1, max_length=256)]
-)
-
-
-class EngineResponsesRequest(EngineModel):
-    """Represent a bounded OpenAI Responses request."""
-
-    model: str = Field(min_length=1, max_length=256, pattern=r"^[A-Za-z0-9_./:-]+$")
-    input: EngineResponseInput
-    instructions: str | None = None
-    tools: list[EngineToolDefinition] = Field(default_factory=list, max_length=128)
-    tool_choice: Literal["none", "auto", "required"] | dict[str, JsonValue] | None = None
-    temperature: float | None = Field(default=None, ge=0, le=2)
-    top_p: float | None = Field(default=None, ge=0, le=1)
-    max_output_tokens: int | None = Field(default=None, ge=1, le=1_000_000)
-    text: EngineResponseTextConfig | None = None
-    stream: bool = False
-    previous_response_id: str | None = Field(default=None, max_length=256)
-    user: str | None = Field(default=None, max_length=256)
-
-
-class EngineMcpParams(EngineModel):
-    """Represent narrowed MCP tool input and immutable protocol metadata."""
-
-    model_config = ConfigDict(serialize_by_alias=True)
-
-    name: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.-]+$")
-    arguments: Annotated[dict[str, McpJsonValue], Field(max_length=256)] | None = None
-    meta: (
-        Annotated[
-            dict[Annotated[str, Field(max_length=256)], McpJsonValue],
-            Field(max_length=64),
-        ]
-        | None
-    ) = Field(default=None, alias="_meta")
-
-    @model_validator(mode="before")
-    @classmethod
-    def validate_optional_objects(cls, value: object) -> object:
-        """Reject explicit null where MCP permits only an omitted or object field."""
-        if isinstance(value, dict) and any(
-            key in value and value[key] is None for key in ("arguments", "_meta")
-        ):
-            raise ValueError("optional MCP params must be objects when present")  # noqa: TRY003
-        return value
-
-
-class EngineMcpRequest(EngineModel):
-    """Represent one bounded MCP ``tools/call`` analysis request."""
-
-    jsonrpc: Literal["2.0"]
-    id: McpRequestId
-    method: Literal["tools/call"]
-    params: EngineMcpParams
-
-
-type EngineRequest = EngineChatRequest | EngineResponsesRequest | EngineMcpRequest
-ENGINE_REQUEST_ADAPTER: TypeAdapter[EngineRequest] = TypeAdapter(EngineRequest)
+    api_version: Literal["v2"]
+    error: EngineLimitErrorDetail
 
 
 class AnalysisMetadata(EngineModel):

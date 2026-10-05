@@ -12,6 +12,7 @@ from collections.abc import Mapping
 from dataclasses import replace
 from typing import TYPE_CHECKING, cast
 
+from neurwerk_request_segments import CompatibilitySettings, UnsupportedFeatureError, parse_request
 from pydantic import ValidationError
 
 from agentgateway_extproc.config.settings import MAX_REQUEST_BYTES
@@ -27,10 +28,10 @@ from agentgateway_extproc.lib.pipeline.mcp import (
     parse_mcp_message,
     strict_json_loads,
 )
+from agentgateway_extproc.lib.request_segments import extract_request
 from agentgateway_extproc.lib.session import make_session_key
 from agentgateway_extproc.models.destination import ModelDestinationPolicy
 from agentgateway_extproc.models.engine import (
-    ENGINE_REQUEST_ADAPTER,
     EngineAttachmentPart,
     EngineChatRequest,
     EngineMcpRequest,
@@ -41,7 +42,12 @@ from agentgateway_extproc.models.engine import (
     EngineResponsesRequest,
     VisualFindings,
 )
-from agentgateway_extproc.models.exceptions import EngineUnavailableError, InvalidEngineReplyError
+from agentgateway_extproc.models.exceptions import (
+    EnginePolicyError,
+    EngineUnavailableError,
+    InvalidEngineReplyError,
+    LimitDetail,
+)
 from agentgateway_extproc.models.types import (
     PRESIDIO_NO_PII,
     PRESIDIO_PII_DETECTED,
@@ -60,7 +66,6 @@ type PathPart = str | int
 type TextLeaves = dict[tuple[PathPart, ...], str]
 type OpaqueReasoning = dict[int, dict[str, object]]
 
-_TEXT_LEAF = object()
 _OPAQUE_REQUEST_REASONING_FIELDS = ("reasoning_content", "reasoning_signature")
 _MAX_VALIDATION_ERROR_COUNT = 100
 _UNCHECKED_IMAGE_MARKER = "[Image forwarded without privacy inspection]"
@@ -73,14 +78,27 @@ async def process_request(
     """Validate a request, call the engine, and apply its complete reply."""
     body = b"".join(handler.request_body_chunks)
     if len(body) > handler.max_request_bytes:
-        return immediate_response(413, '{"error":"request body too large"}')
+        raise EnginePolicyError(
+            "request_too_large",
+            limit=LimitDetail(
+                stage="admission",
+                reason="bytes",
+                measured=len(body),
+                maximum=handler.max_request_bytes,
+                unit="bytes",
+                exact=True,
+            ),
+            correlation_id=handler.correlation_id,
+        )
     try:
         payload = strict_json_loads(body.decode("utf-8"))
     except UnicodeDecodeError:
         return immediate_response(400, '{"error":"invalid request encoding"}')
-    except JsonBudgetError:
+    except JsonBudgetError as exc:
         _clear_request(handler)
-        return immediate_response(413, '{"error":"request structure too large"}')
+        raise EnginePolicyError(
+            "request_too_large", limit=exc.limit, correlation_id=handler.correlation_id
+        ) from exc
     except (json.JSONDecodeError, TypeError, ValueError):
         return immediate_response(400, '{"error":"invalid request JSON"}')
     policy = handler.destination_policy
@@ -138,7 +156,36 @@ async def process_request(
             handler.record_dispatch("protocol_failure")
             return immediate_response(400, '{"error":"invalid model request"}')
         try:
-            request = ENGINE_REQUEST_ADAPTER.validate_python(payload, strict=True)
+            path = handler.request_headers.get(":path", "").split("?", 1)[0]
+            kind = (
+                "responses"
+                if path.endswith("/responses")
+                else "chat"
+                if path.endswith("/chat/completions")
+                else None
+            )
+            request = parse_request(
+                payload, kind=kind, controls=getattr(handler, "compatibility", None)
+            )
+        except UnsupportedFeatureError as exc:
+            _logger.warning(
+                "model request validation failed family=%s reason=%s scope=%s count=%d",
+                _model_request_family(payload),
+                "extra_forbidden",
+                {
+                    "stream_options": "stream_options",
+                    "message": "messages",
+                    "tool": "tools",
+                    "function": "tools",
+                }.get(exc.location, "top_level"),
+                1,
+            )
+            handler.record_dispatch("protocol_failure")
+            return immediate_response(
+                400,
+                '{"error":{"code":"unsupported_feature",'
+                '"message":"This request contains an unsupported feature."}}',
+            )
         except ValidationError as exc:
             _log_model_validation_failure(payload, exc)
             handler.record_dispatch("protocol_failure")
@@ -219,7 +266,11 @@ async def process_request(
                     )
                     _validate_image_inspections(images, inspect_images)
                     request, body, unchecked_image_locations = _converted_unchecked_request(
-                        payload, texts_by_index, images, opaque_reasoning
+                        payload,
+                        texts_by_index,
+                        images,
+                        opaque_reasoning,
+                        controls=request._controls,
                     )
                     unchecked_without_documents = not document_indexes
                 else:
@@ -235,7 +286,9 @@ async def process_request(
                         visual_findings = _visual_findings(attachments, images)
                         if image_forwarding != "none":
                             image_locations = _image_locations(payload, images)
-                    request, body = _converted_request(payload, texts, opaque_reasoning)
+                    request, body = _converted_request(
+                        payload, texts, opaque_reasoning, controls=request._controls
+                    )
             except DocumentError as exc:
                 if policy.contract_version == "4.1" and exc.reason.startswith(
                     ("extraction_", "image_analysis_", "image_inspection_")
@@ -285,7 +338,9 @@ async def process_request(
                         image_locations = _image_locations(payload, images)
                 else:
                     texts = await handler.docling.convert(attachments)
-                request, body = _converted_request(payload, texts, opaque_reasoning)
+                request, body = _converted_request(
+                    payload, texts, opaque_reasoning, controls=request._controls
+                )
             except DocumentError as exc:
                 _clear_request(handler)
                 handler.record_dispatch("transport_failure")
@@ -319,7 +374,7 @@ async def process_request(
                     _restore_images(data, image_locations, offset=0)
                     body = json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode()
                     if len(body) > handler.max_transformed_request_bytes:
-                        raise DocumentError(413)  # noqa: TRY301
+                        _raise_output_limit(len(body), handler.max_transformed_request_bytes)
                 except DocumentError as exc:
                     _clear_request(handler)
                     return immediate_response(exc.status, json.dumps({"error": exc.message}))
@@ -330,7 +385,7 @@ async def process_request(
                     _restore_opaque_chat_reasoning(data, opaque_reasoning, offset=0)
                     body = json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode()
                     if len(body) > handler.max_transformed_request_bytes:
-                        raise DocumentError(413)  # noqa: TRY301
+                        _raise_output_limit(len(body), handler.max_transformed_request_bytes)
                 except DocumentError as exc:
                     _clear_request(handler)
                     return immediate_response(exc.status, json.dumps({"error": exc.message}))
@@ -362,11 +417,16 @@ async def process_request(
                     document=True,
                     text_pii_enabled=handler.text_pii_enabled,
                     visual_findings=visual_findings,
+                    correlation_id=handler.correlation_id,
                 )
             else:
-                reply = await client.analyze_request(request, session_key, document=True)
+                reply = await client.analyze_request(
+                    request, session_key, document=True, correlation_id=handler.correlation_id
+                )
         else:
-            reply = await client.analyze_request(request, session_key)
+            reply = await client.analyze_request(
+                request, session_key, correlation_id=handler.correlation_id
+            )
         _validate_request_mutation(request, reply)
         if handler.text_pii_enabled:
             _validate_reversal(request, reply)
@@ -494,7 +554,7 @@ async def process_request(
         handler.guard_injected = True
     serialized = cast(
         dict[str, object],
-        transformed.model_dump(mode="json", by_alias=True, exclude_none=True),
+        transformed.model_dump(mode="json", by_alias=True, exclude_unset=True),
     )
     if isinstance(request, EngineChatRequest):
         for message in _dict_list(serialized.get("messages")):
@@ -528,7 +588,18 @@ async def process_request(
         separators=(",", ":"),
     ).encode()
     if len(mutated) > handler.max_transformed_request_bytes:
-        raise ValueError("transformed request body too large")  # noqa: TRY003
+        raise EnginePolicyError(
+            "request_too_large",
+            limit=LimitDetail(
+                stage="output",
+                reason="transformed_bytes",
+                measured=len(mutated),
+                maximum=handler.max_transformed_request_bytes,
+                unit="bytes",
+                exact=True,
+            ),
+            correlation_id=handler.correlation_id,
+        )
     headers: dict[str, str] = {}
     if not is_mcp:
         headers = {
@@ -656,7 +727,11 @@ def _image_policy_block(
 
 
 def _converted_request(
-    payload: object, texts: list[str], reasoning: OpaqueReasoning
+    payload: object,
+    texts: list[str],
+    reasoning: OpaqueReasoning,
+    *,
+    controls: CompatibilitySettings | None = None,
 ) -> tuple[EngineChatRequest | EngineResponsesRequest, bytes]:
     """Replace only typed file parts, retaining the original protocol controls."""
     data = cast(dict[str, object], payload)
@@ -679,16 +754,16 @@ def _converted_request(
         raise DocumentError
     request = cast(
         EngineChatRequest | EngineResponsesRequest,
-        ENGINE_REQUEST_ADAPTER.validate_python(data, strict=True),
+        parse_request(data, controls=controls),
     )
-    if len(request.model_dump_json(by_alias=True, exclude_none=True).encode()) > MAX_REQUEST_BYTES:
-        raise DocumentError(413)
-    if sum(len(text) for text in _mutable_text_leaves(request).values()) > MAX_TEXT:
-        raise DocumentError(413)
+    serialized_size = len(request.model_dump_json(by_alias=True, exclude_unset=True).encode())
+    if serialized_size > MAX_REQUEST_BYTES:
+        _raise_output_limit(serialized_size, MAX_REQUEST_BYTES)
+    _check_converted_text_limit(request)
     _restore_opaque_chat_reasoning(data, reasoning, offset=0)
     body = json.dumps(data, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode()
     if len(body) > MAX_REQUEST_BYTES:
-        raise DocumentError(413)
+        _raise_output_limit(len(body), MAX_REQUEST_BYTES)
     return request, body
 
 
@@ -697,6 +772,8 @@ def _converted_unchecked_request(
     texts: dict[int, str],
     images: ImageBatch,
     reasoning: OpaqueReasoning,
+    *,
+    controls: CompatibilitySettings | None = None,
 ) -> tuple[
     EngineChatRequest | EngineResponsesRequest,
     bytes,
@@ -727,14 +804,45 @@ def _converted_unchecked_request(
         raise DocumentError
     request = cast(
         EngineChatRequest | EngineResponsesRequest,
-        ENGINE_REQUEST_ADAPTER.validate_python(data, strict=True),
+        parse_request(data, controls=controls),
     )
-    if sum(len(text) for text in _mutable_text_leaves(request).values()) > MAX_TEXT:
-        raise DocumentError(413)
+    _check_converted_text_limit(request)
     body = json.dumps(data, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode()
     if len(body) > MAX_REQUEST_BYTES:
-        raise DocumentError(413)
+        _raise_output_limit(len(body), MAX_REQUEST_BYTES)
     return request, body, locations
+
+
+def _raise_output_limit(measured: int, maximum: int) -> None:
+    """Keep actual serialized byte measurements when converted output is rejected."""
+    raise EnginePolicyError(
+        "request_too_large",
+        limit=LimitDetail(
+            stage="output",
+            reason="transformed_bytes",
+            measured=measured,
+            maximum=maximum,
+            unit="bytes",
+            exact=True,
+        ),
+    )
+
+
+def _check_converted_text_limit(request: EngineRequest) -> None:
+    """Count all independent converted text leaves without approximating wire size."""
+    measured = sum(len(text) for text in _mutable_text_leaves(request).values())
+    if measured > MAX_TEXT:
+        raise EnginePolicyError(
+            "request_too_large",
+            limit=LimitDetail(
+                stage="inspection",
+                reason="text_characters",
+                measured=measured,
+                maximum=MAX_TEXT,
+                unit="characters",
+                exact=True,
+            ),
+        )
 
 
 def _replace_unchecked_images(
@@ -1144,142 +1252,13 @@ def _validate_request_mutation(original: EngineRequest, reply: EngineReply) -> N
 
 def _control_shape(request: EngineRequest) -> dict[str, object]:
     """Replace only mutable text leaves while retaining every protocol control."""
-    data = cast(dict[str, object], request.model_dump(mode="python", exclude_none=True))
-    if isinstance(request, EngineChatRequest):
-        _normalize_chat_text(data)
-    elif isinstance(request, EngineResponsesRequest):
-        _normalize_responses_text(data)
-    elif isinstance(request, EngineMcpRequest):
-        _normalize_mcp_text(data)
-    return data
-
-
-def _normalize_chat_text(data: dict[str, object]) -> None:
-    for message in _dict_list(data.get("messages")):
-        content = message.get("content")
-        if isinstance(content, str):
-            message["content"] = _TEXT_LEAF
-        elif isinstance(content, list):
-            _normalize_content_parts(content, {"text"})
-        for call in _dict_list(message.get("tool_calls")):
-            function = call.get("function")
-            if isinstance(function, dict):
-                function["arguments"] = _normalize_json_text(function.get("arguments"))
-    _normalize_tools(data.get("tools"))
-    response_format = data.get("response_format")
-    if isinstance(response_format, dict):
-        data["response_format"] = _normalize_schema_text(response_format)
-
-
-def _normalize_responses_text(data: dict[str, object]) -> None:
-    if isinstance(data.get("instructions"), str):
-        data["instructions"] = _TEXT_LEAF
-    value = data.get("input")
-    if isinstance(value, str):
-        data["input"] = _TEXT_LEAF
-    elif isinstance(value, list):
-        for item in _dict_list(value):
-            content = item.get("content")
-            if item.get("type") == "message" and isinstance(content, list):
-                _normalize_content_parts(content, {"input_text", "output_text"})
-            elif item.get("type") == "function_call":
-                item["arguments"] = _normalize_json_text(item.get("arguments"))
-            elif item.get("type") == "function_call_output":
-                item["output"] = _normalize_json_text(item.get("output"))
-    text = data.get("text")
-    if isinstance(text, dict) and isinstance(text.get("format"), dict):
-        text["format"] = _normalize_schema_text(text["format"])
-    _normalize_tools(data.get("tools"))
-
-
-def _normalize_mcp_text(data: dict[str, object]) -> None:
-    params = data.get("params")
-    if not isinstance(params, dict):
-        return
-    if "arguments" in params:
-        params["arguments"] = _normalize_json_text(params["arguments"])
-
-
-def _normalize_content_parts(parts: list[object], text_types: set[str]) -> None:
-    for part in parts:
-        if isinstance(part, dict) and part.get("type") in text_types:
-            part["text"] = _TEXT_LEAF
-
-
-def _normalize_tools(value: object) -> None:
-    for tool in _dict_list(value):
-        function = tool.get("function")
-        if not isinstance(function, dict):
-            continue
-        if isinstance(function.get("description"), str):
-            function["description"] = _TEXT_LEAF
-        parameters = function.get("parameters")
-        if isinstance(parameters, dict):
-            function["parameters"] = _normalize_schema_text(parameters)
-
-
-def _normalize_schema_text(value: object) -> object:
-    if not isinstance(value, dict):
-        return value
-    normalized: dict[str, object] = {}
-    for key, item in value.items():
-        if key in {"description", "title", "default", "examples"}:
-            normalized[key] = _normalize_json_text(item)
-        elif key in {"schema", "json_schema", "items"}:
-            normalized[key] = _normalize_schema_text(item)
-        elif key in {"properties", "$defs"}:
-            if isinstance(item, dict):
-                normalized[key] = {
-                    child_key: _normalize_schema_text(child) for child_key, child in item.items()
-                }
-            else:
-                normalized[key] = item
-        elif key in {"allOf", "anyOf", "oneOf"}:
-            if isinstance(item, list):
-                normalized[key] = [_normalize_schema_text(child) for child in item]
-            else:
-                normalized[key] = item
-        else:
-            normalized[key] = item
-    return normalized
-
-
-def _normalize_json_text(value: object) -> object:
-    if isinstance(value, str):
-        return _TEXT_LEAF
-    if isinstance(value, list):
-        return [_normalize_json_text(item) for item in value]
-    if isinstance(value, dict):
-        return {str(key): _normalize_json_text(item) for key, item in value.items()}
-    return value
+    return extract_request(request).control_shape()
 
 
 def _mutable_text_leaves(request: EngineRequest) -> TextLeaves:
     """Return schema-designated model-visible strings keyed by structural path."""
-    data = cast(dict[str, object], request.model_dump(mode="python", exclude_none=True))
-    leaves: TextLeaves = {}
-    _collect_text_leaves(data, _control_shape(request), (), leaves)
-    return leaves
-
-
-def _collect_text_leaves(
-    value: object,
-    normalized: object,
-    path: tuple[PathPart, ...],
-    leaves: TextLeaves,
-) -> None:
-    """Collect values replaced by the private control-shape sentinel."""
-    if normalized is _TEXT_LEAF:
-        if isinstance(value, str):
-            leaves[path] = value
-        return
-    if isinstance(value, dict) and isinstance(normalized, dict):
-        for key, child in normalized.items():
-            _collect_text_leaves(value.get(key), child, (*path, str(key)), leaves)
-        return
-    if isinstance(value, list) and isinstance(normalized, list):
-        for index, child in enumerate(normalized):
-            _collect_text_leaves(value[index], child, (*path, index), leaves)
+    extracted = extract_request(request)
+    return {extracted.diagnostic_path(segment.id): segment.text for segment in extracted.segments}
 
 
 def _dict_list(value: object) -> list[dict[str, object]]:
