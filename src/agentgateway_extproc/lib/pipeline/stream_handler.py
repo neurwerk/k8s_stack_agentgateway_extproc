@@ -22,6 +22,7 @@ from agentgateway_extproc.lib.pipeline.mcp import (
     McpHeaderContext,
     McpMessageContext,
     McpProtocolError,
+    McpUnsupportedFeatureError,
     validate_mcp_headers,
 )
 from agentgateway_extproc.lib.pipeline.request import immediate_response, process_request
@@ -270,6 +271,8 @@ class StreamHandler:
                 "content-type",
                 "content-encoding",
                 "mcp-protocol-version",
+                "mcp-method",
+                "mcp-name",
                 "last-event-id",
             }
             names = [item.key.lower() for item in header_items]
@@ -278,6 +281,9 @@ class StreamHandler:
                 return immediate_response(400, '{"error":"invalid MCP request headers"}')
             try:
                 self.mcp_headers = validate_mcp_headers(self.request_headers, policy)
+            except McpUnsupportedFeatureError as exc:
+                self.record_dispatch("protocol_failure")
+                return immediate_response(400, exc.body)
             except McpProtocolError:
                 self.record_dispatch("protocol_failure")
                 return immediate_response(400, '{"error":"invalid MCP request headers"}')
@@ -405,11 +411,7 @@ class StreamHandler:
             encoding="gzip" if self.response_is_gzip else "identity",
         ).inc()
         preserve_mcp_bytes = self._preserve_mcp_response_bytes()
-        removed = (
-            [] if preserve_mcp_bytes else ["content-length", "etag", "content-md5", "digest"]
-        ) + [PRESIDIO_RESPONSE_HEADER]
-        if self.response_is_gzip and not preserve_mcp_bytes:
-            removed.append("content-encoding")
+        removed = self._response_removed_headers(headers, preserve=preserve_mcp_bytes)
         if self.response_is_gzip:
             self.gzip_decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
         set_headers = []
@@ -456,9 +458,16 @@ class StreamHandler:
         context = self.mcp_context
         if context is None:
             raise McpProtocolError("MCP response has no request context")
-        if 400 <= self.response_status <= 599:
+        modern_protocol_error = (
+            context.protocol_version == "2026-07-28"
+            and self.response_status in {400, 404}
+            and media_type == "application/json"
+            and not end_of_stream
+        )
+        if 400 <= self.response_status <= 599 and not modern_protocol_error:
             raise McpHttpError(self.response_status, headers)
-        self._validate_mcp_response_status(context, media_type)
+        if not modern_protocol_error:
+            self._validate_mcp_response_status(context, media_type)
         self._validate_mcp_bodyless_transport(headers)
         bodyless = self.response_status in {202, 204}
         if bodyless:
@@ -600,9 +609,32 @@ class StreamHandler:
             self.response_processed = True
         return response
 
+    def _response_removed_headers(self, headers: dict[str, str], *, preserve: bool) -> list[str]:
+        """Remove stale content controls and strip diagnostics from modern error replies."""
+        removed = ([] if preserve else ["content-length", "etag", "content-md5", "digest"]) + [
+            PRESIDIO_RESPONSE_HEADER
+        ]
+        if self._modern_protocol_error():
+            removed.extend(key for key in headers if key not in {":status", "content-type"})
+        if self.response_is_gzip and not preserve:
+            removed.append("content-encoding")
+        return removed
+
+    def _modern_protocol_error(self) -> bool:
+        """Identify modern negotiation replies that must never retain upstream bytes."""
+        return (
+            self.mcp_context is not None
+            and self.mcp_context.protocol_version == "2026-07-28"
+            and self.response_status in {400, 404}
+        )
+
     def _preserve_mcp_response_bytes(self) -> bool:
         policy = self.destination_policy
-        return isinstance(policy, McpDestinationPolicy) and not policy.pii_enabled
+        return (
+            isinstance(policy, McpDestinationPolicy)
+            and not policy.pii_enabled
+            and not self._modern_protocol_error()
+        )
 
     def _retain_encoded_mcp_response(self, chunk: bytes) -> bool:
         preserve = bool(self.response_is_gzip) and self._preserve_mcp_response_bytes()
@@ -687,6 +719,12 @@ class StreamHandler:
         self, request: ext_proc_pb2.ProcessingRequest
     ) -> ext_proc_pb2.ProcessingResponse:
         names = {item.key.casefold() for item in request.response_trailers.trailers.headers}
+        if self._modern_protocol_error():
+            return ext_proc_pb2.ProcessingResponse(
+                response_trailers=ext_proc_pb2.TrailersResponse(
+                    header_mutation={"remove_headers": sorted(names)}
+                )
+            )
         removed = (
             sorted(names & {"etag", "content-md5", "digest"})
             if self.response_processing_enabled and not self._preserve_mcp_response_bytes()

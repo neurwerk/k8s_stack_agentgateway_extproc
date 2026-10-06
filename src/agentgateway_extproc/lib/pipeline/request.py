@@ -23,6 +23,7 @@ from agentgateway_extproc.lib.masking.reversal import placeholder_entity_prefixe
 from agentgateway_extproc.lib.pipeline.guard import inject_guard_instruction
 from agentgateway_extproc.lib.pipeline.mcp import (
     McpProtocolError,
+    McpUnsupportedFeatureError,
     parse_mcp_message,
     strict_json_loads,
 )
@@ -117,6 +118,9 @@ async def process_request(
             raise ValueError("validated MCP headers are unavailable")  # noqa: TRY003
         try:
             context = parse_mcp_message(body, handler.mcp_headers)
+        except McpUnsupportedFeatureError as exc:
+            handler.record_dispatch("protocol_failure")
+            return immediate_response(400, exc.body)
         except McpProtocolError:
             handler.record_dispatch("protocol_failure")
             return immediate_response(400, '{"error":"invalid MCP request"}')
