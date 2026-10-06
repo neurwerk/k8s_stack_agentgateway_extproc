@@ -60,6 +60,7 @@ from agentgateway_extproc.models.types import (
     PRESIDIO_PII_DETECTED,
     PRESIDIO_PII_TRANSFORMED,
     PRESIDIO_REROUTED,
+    RESERVED_PLACEHOLDER_PREFIX_RE,
     RequestStats,
 )
 
@@ -417,6 +418,7 @@ async def process_request(
             request_nonce=handler.request_nonce,
         )
         handler.record_dispatch("model_analyzed")
+    request = _literalize_request_placeholders(request)
     try:
         if converted:
             _clear_request(handler)
@@ -619,6 +621,25 @@ async def process_request(
         if reply.entities:
             headers["x-pii-entities"] = ",".join(reply.entities)
     return request_mutation(mutated, headers, converted or mutated != body)
+
+
+def _literalize_request_placeholders(request: EngineRequest) -> EngineRequest:
+    """Keep incoming aliases masked without making them eligible for reversal."""
+    extracted = extract_request(request)
+    if not any(RESERVED_PLACEHOLDER_PREFIX_RE.search(part.text) for part in extracted.segments):
+        return request
+    return extracted.rebuild(
+        [
+            part.model_copy(
+                update={
+                    "text": RESERVED_PLACEHOLDER_PREFIX_RE.sub(
+                        lambda match: f"<LITERAL_{match.group()[1:]}", part.text
+                    )
+                }
+            )
+            for part in extracted.segments
+        ]
+    )
 
 
 def _visual_findings(attachments: list[EngineAttachmentPart], images: ImageBatch) -> VisualFindings:

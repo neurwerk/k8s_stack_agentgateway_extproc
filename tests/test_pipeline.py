@@ -1095,7 +1095,10 @@ async def test_cached_reroute_preserves_historical_report_without_reversal(
             "reversal": {},
         }
     )
-    engine_reply["request"]["messages"][0]["content"] = "Jane Doe"
+    engine_reply["request"]["messages"] = [
+        {"role": "user", "content": f"<LITERAL_{REVERSIBLE_TOKEN[1:]}"},
+        {"role": "user", "content": "Jane Doe"},
+    ]
     engine_reply["analysis"].update(
         {
             "source": "cached_decision",
@@ -1117,11 +1120,19 @@ async def test_cached_reroute_preserves_historical_report_without_reversal(
     handler = StreamHandler(engine_client)
     await handler.handle(header_request())
 
-    response = await handler.handle(body_request(request_json()))
+    original = {
+        "model": "test",
+        "messages": [
+            {"role": "user", "content": REVERSIBLE_TOKEN},
+            {"role": "user", "content": "Jane Doe"},
+        ],
+    }
+    response = await handler.handle(body_request(json.dumps(original).encode()))
 
     assert response is not None and response.HasField("request_body")
     forwarded = json.loads(response.request_body.response.body_mutation.body)
-    assert forwarded["messages"][1]["content"] == "Jane Doe"
+    assert forwarded["messages"][1]["content"] == f"<LITERAL_{REVERSIBLE_TOKEN[1:]}"
+    assert forwarded["messages"][2]["content"] == "Jane Doe"
     headers = {
         item.header.key: item.header.value
         for item in response.request_body.response.header_mutation.set_headers
@@ -1134,15 +1145,39 @@ async def test_cached_reroute_preserves_historical_report_without_reversal(
     assert handler.request_stats.report.model_dump() == engine_reply["report"]
 
 
-async def test_preexisting_request_placeholder_is_rejected(engine_client) -> None:
+@pytest.mark.parametrize(
+    "prior",
+    [REVERSIBLE_TOKEN, REVERSIBLE_TOKEN.replace("<REV_", "<ENCRYPTED_")],
+)
+async def test_preexisting_request_placeholder_stays_masked_without_reversal_rights(
+    engine_client, engine_reply, prior: str
+) -> None:
+    """An old alias cannot recover plaintext even if the current reply uses that token."""
+    literal = f"<LITERAL_{prior[1:]}"
+    engine_reply["request"]["messages"] = [
+        {"role": "user", "content": literal},
+        {"role": "user", "content": REVERSIBLE_TOKEN},
+    ]
+    engine_reply["analysis"]["text_leaf_count"] = 2
     handler = StreamHandler(engine_client)
     await handler.handle(header_request())
     body = json.dumps(
-        {"model": "test", "messages": [{"role": "user", "content": REVERSIBLE_TOKEN}]}
+        {
+            "model": "test",
+            "messages": [
+                {"role": "user", "content": prior},
+                {"role": "user", "content": "Jane Doe"},
+            ],
+        }
     ).encode()
 
-    with pytest.raises(InvalidEngineReplyError, match="already existed"):
-        await handler.handle(body_request(body))
+    response = await handler.handle(body_request(body))
+
+    assert response is not None and response.HasField("request_body")
+    forwarded = json.loads(response.request_body.response.body_mutation.body)
+    assert forwarded["messages"][1]["content"] == literal
+    assert forwarded["messages"][2]["content"] == REVERSIBLE_TOKEN
+    assert handler.reversal_map == {REVERSIBLE_TOKEN: "Jane Doe"}
 
 
 async def test_large_reversal_map_restores_exact_request_in_linear_pass(
