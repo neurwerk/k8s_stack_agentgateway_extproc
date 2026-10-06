@@ -407,6 +407,11 @@ fields are not transport-session headers and are unaffected by this rejection.
 
 ## Cached PII Decisions
 
+Before analysis, incoming `<REV_` and `<ENCRYPTED_` prefixes in model-visible
+text become stable `<LITERAL_REV_` and `<LITERAL_ENCRYPTED_` prefixes. History
+stays masked without acquiring current-request reversal rights. Repeated
+requests keep the same literal text and conversation session key.
+
 Replies with `analysis.source: cached_decision` retain historical report rows but
 carry no request-local reversal mappings. Historical transformation counts do not
 require placeholders in the current request. The adapter still rejects reversal
