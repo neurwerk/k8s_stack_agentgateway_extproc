@@ -367,6 +367,27 @@ PII-disabled byte-preserving bypass remain intact.
 
 ### Stateless MCP
 
+The processor supports `2025-11-25` and `2026-07-28` Streamable HTTP discovery,
+listing and ordinary tool calls. AgentGateway owns upstream negotiation and tool
+prefixing. Modern wire shapes are checked with pinned official `mcp-types`, without
+reserializing requests through its models or silently discarding unknown controls.
+Modern requests must supply matching version metadata, `Mcp-Method`, and applicable
+`Mcp-Name` headers (including the protocol's Base64 name encoding). Successful modern
+results require `resultType: complete`; JSON and request-scoped SSE are supported.
+Tool argument strings remain the inspection boundary; metadata is not scanned.
+
+This is not unrestricted support for every MCP feature. Multi-round-trip calls,
+subscriptions and tasks remain unsupported. Requests with `Mcp-Param-*` argument
+headers are rejected when PII is enabled, rather than allowing an original argument
+to escape in a header while its body copy is masked. Recognized unsupported features
+return a fixed `unsupported_feature` error. Validated modern HTTP negotiation errors
+retain safe codes and supported versions, never backend diagnostics or arbitrary data.
+The existing per-request nonce and reversal behavior are unchanged. There is no
+cross-request reversal state for multi-round-trip retries.
+
+Platform adoption requires publishing this processor and updating Base separately;
+an older pinned image does not gain this behavior from a chart values change.
+
 All gateway MCP traffic is stateless. At the trusted request-header stage,
 any `Mcp-Session-Id` header (including empty or duplicate headers, regardless of
 case) is rejected with HTTP 404 and the fixed JSON error below, before upstream

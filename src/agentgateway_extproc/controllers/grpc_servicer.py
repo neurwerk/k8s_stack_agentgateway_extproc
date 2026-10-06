@@ -20,7 +20,7 @@ from agentgateway_extproc.gen import ext_proc_pb2, ext_proc_pb2_grpc
 from agentgateway_extproc.lib.docling import DoclingClient
 from agentgateway_extproc.lib.engine.client import EngineClient
 from agentgateway_extproc.lib.notice.preferences import NoticePreferencesClient
-from agentgateway_extproc.lib.pipeline.mcp import McpProtocolError
+from agentgateway_extproc.lib.pipeline.mcp import McpProtocolError, McpUnsupportedFeatureError
 from agentgateway_extproc.lib.pipeline.request import immediate_response
 from agentgateway_extproc.lib.pipeline.stream_handler import StreamHandler
 from agentgateway_extproc.lib.rejection_capture import RejectionCapture, RejectionCaptureConfig
@@ -300,6 +300,9 @@ async def _handle_message(
 
 def _failure_response(phase: str, exc: Exception) -> ext_proc_pb2.ProcessingResponse:
     """Record only bounded response failure context and fail the stream closed."""
+    if isinstance(exc, McpUnsupportedFeatureError):
+        _record_failure(phase, exc)
+        return immediate_response(400, exc.body)
     if isinstance(exc, McpHttpError):
         response = immediate_response(exc.status_code, '{"error":"MCP HTTP request failed"}')
         for key, value in exc.headers.items():
