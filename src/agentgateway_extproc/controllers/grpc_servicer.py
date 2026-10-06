@@ -27,6 +27,7 @@ from agentgateway_extproc.lib.rejection_capture import RejectionCapture, Rejecti
 from agentgateway_extproc.lib.rejections import annotate_rejection, log_limit_rejection
 from agentgateway_extproc.metrics import active_streams, errors_total, response_failures_total
 from agentgateway_extproc.models.exceptions import (
+    ContextForgeAccountRequiredError,
     EnginePolicyError,
     EngineUnavailableError,
     InvalidEngineReplyError,
@@ -300,6 +301,13 @@ async def _handle_message(
 
 def _failure_response(phase: str, exc: Exception) -> ext_proc_pb2.ProcessingResponse:
     """Record only bounded response failure context and fail the stream closed."""
+    if isinstance(exc, ContextForgeAccountRequiredError):
+        return immediate_response(
+            403,
+            '{"error":{"code":"contextforge_account_required",'
+            '"message":"A verified account email is required. '
+            'Connect your ContextForge account."}}',
+        )
     if isinstance(exc, McpUnsupportedFeatureError):
         _record_failure(phase, exc)
         return immediate_response(400, exc.body)

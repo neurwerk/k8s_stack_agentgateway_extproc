@@ -43,6 +43,125 @@ from .conftest import (
     response_body,
     response_headers,
 )
+from .test_mcp_modern import modern_headers, modern_request
+
+
+@pytest.mark.parametrize("pii_enabled", [True, False])
+@pytest.mark.parametrize(
+    "version,method", [("2025-11-25", "tools/list"), ("2026-07-28", "server/discover")]
+)
+async def test_contextforge_injects_only_verified_account_and_preserves_mcp(
+    engine_client, pii_enabled, version, method
+) -> None:
+    policy = {
+        **mcp_policy(pii_enabled=pii_enabled),
+        "contextforge": True,
+        "account_email": "owner@example.test",
+    }
+    headers = mcp_headers() if version == "2025-11-25" else modern_headers(method)
+    headers.update(
+        {
+            "X-ContextForge-Account-Email": "attacker@example.test",
+            "x-contextforge-account-email": "another@example.test",
+            "Authorization": "Bearer caller-token",
+            "x-api-key": "caller-key",
+            "x-agentgateway-auth-context": '{"account_email":"attacker@example.test"}',
+            "cookie": "caller-session",
+        }
+    )
+    handler = StreamHandler(engine_client)
+    response = await handler.handle(header_request(headers, policy=policy))
+    assert response is not None and response.HasField("request_headers")
+    mutation = response.request_headers.response.header_mutation
+    assert set(mutation.remove_headers) >= {
+        "x-contextforge-account-email",
+        "authorization",
+        "x-api-key",
+        "x-agentgateway-auth-context",
+        "cookie",
+    }
+    assert len(mutation.set_headers) == 1
+    injected = mutation.set_headers[0]
+    assert injected.header.key == "x-contextforge-account-email"
+    assert injected.header.value == "owner@example.test"
+    assert injected.append_action == 2
+    assert "authorization" not in handler.request_headers
+    assert "x-contextforge-account-email" not in handler.request_headers
+    assert handler.destination_policy is not None
+    assert handler.destination_policy.principal_id == "principal-1"
+    payload = (
+        {"jsonrpc": "2.0", "id": 1, "method": method}
+        if version == "2025-11-25"
+        else modern_request(method)
+    )
+    with patch.object(engine_client, "analyze_request", new_callable=AsyncMock) as analyze:
+        response = await handler.handle(body_request(json.dumps(payload).encode(), policy=policy))
+    assert response is not None and response.HasField("request_body")
+    analyze.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "email",
+    [
+        None,
+        "",
+        "not-email",
+        "x@example.test\r\nx-admin: true",
+        " owner@example.test",
+        "a..b@example.test",
+        "a@-bad.test",
+        "a" * 65 + "@example.test",
+        ["owner@example.test"],
+    ],
+)
+async def test_contextforge_requires_trusted_account_not_caller_header(engine_client, email):
+    policy = {**mcp_policy(), "contextforge": True, "account_email": email}
+
+    async def requests():
+        yield header_request(
+            mcp_headers() | {"x-contextforge-account-email": "caller@example.test"}, policy=policy
+        )
+        pytest.fail("account-required rejection must stop before upstream dispatch")
+
+    responses = [
+        response async for response in ExtProcServicer(engine_client).Process(requests(), object())
+    ]
+    assert len(responses) == 1
+    assert responses[0].immediate_response.status.code == 403
+    error = json.loads(responses[0].immediate_response.body)["error"]
+    assert error["code"] == "contextforge_account_required"
+    assert "Connect your ContextForge account" in error["message"]
+
+
+@pytest.mark.parametrize("mcp", [True, False])
+@pytest.mark.parametrize("email", [None, "owner@example.test"])
+async def test_non_contextforge_strips_account_header_without_injecting(engine_client, mcp, email):
+    policy = {**(mcp_policy() if mcp else MODEL_POLICY), "account_email": email}
+    headers = (mcp_headers() if mcp else {}) | {
+        "X-ContextForge-Account-Email": "caller@example.test"
+    }
+    handler = StreamHandler(engine_client)
+    response = await handler.handle(header_request(headers, policy=policy))
+    assert response is not None and response.HasField("request_headers")
+    mutation = response.request_headers.response.header_mutation
+    assert "x-contextforge-account-email" in mutation.remove_headers
+    assert not mutation.set_headers
+
+
+async def test_contextforge_account_and_destination_cannot_change_midstream(engine_client):
+    policy = {**mcp_policy(), "contextforge": True, "account_email": "owner@example.test"}
+    handler = StreamHandler(engine_client)
+    await handler.handle(header_request(mcp_headers(), policy=policy))
+    with pytest.raises(TrustedMetadataError):
+        await handler.handle(
+            body_request(b"{}", policy=policy | {"account_email": "other@example.test"})
+        )
+    with pytest.raises(TrustedMetadataError):
+        await handler.handle(body_request(b"{}", policy=policy | {"contextforge": False}))
+    wrong_route = await StreamHandler(engine_client).handle(
+        header_request(mcp_headers(destination_id="other"), policy=policy)
+    )
+    assert wrong_route is not None and wrong_route.immediate_response.status.code == 400
 
 
 async def test_missing_or_changing_metadata_is_a_platform_503(engine_client) -> None:

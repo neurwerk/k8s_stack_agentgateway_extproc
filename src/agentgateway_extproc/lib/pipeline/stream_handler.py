@@ -36,6 +36,7 @@ from agentgateway_extproc.models.destination import (
     destination_policy_from_request,
 )
 from agentgateway_extproc.models.exceptions import (
+    ContextForgeAccountRequiredError,
     EnginePolicyError,
     InvalidEngineReplyError,
     LimitDetail,
@@ -43,6 +44,7 @@ from agentgateway_extproc.models.exceptions import (
     TrustedMetadataError,
 )
 from agentgateway_extproc.models.types import (
+    CONTEXTFORGE_ACCOUNT_HEADER,
     PRESIDIO_RESPONSE_HEADER,
     REQUEST_HEADERS,
     RequestStats,
@@ -301,12 +303,12 @@ class StreamHandler:
                 )
                 self.response_api_kind = "mcp"
                 self.record_dispatch("mcp_lifecycle_pass")
-                return _request_headers_response(removed)
+                return _request_headers_response(removed, policy=policy)
             if request.request_headers.end_of_stream:
                 self.request_processed = True
                 self.record_dispatch("protocol_failure")
                 return immediate_response(400, '{"error":"MCP request body required"}')
-            return _request_headers_response(removed)
+            return _request_headers_response(removed, policy=policy)
         if self.preferences_client is not None:
             self.notice_preferences = await self.preferences_client.get(policy)
         if request.request_headers.end_of_stream:
@@ -743,13 +745,23 @@ def _utf8_decoder() -> codecs.IncrementalDecoder:
 
 
 def _request_headers_response(
-    removed: list[str], *, disable_response: bool = False
+    removed: list[str],
+    *,
+    disable_response: bool = False,
+    policy: McpDestinationPolicy | None = None,
 ) -> ext_proc_pb2.ProcessingResponse:
     response = ext_proc_pb2.ProcessingResponse(
         request_headers=ext_proc_pb2.HeadersResponse(
             response=ext_proc_pb2.CommonResponse(header_mutation={"remove_headers": removed})
         )
     )
+    if policy is not None and policy.contextforge:
+        if policy.account_email is None:
+            raise ContextForgeAccountRequiredError
+        response.request_headers.response.header_mutation.set_headers.add(
+            header={"key": CONTEXTFORGE_ACCOUNT_HEADER, "value": policy.account_email},
+            append_action=2,
+        )
     if disable_response:
         response.mode_override.CopyFrom(
             ext_proc_pb2.ProcessingMode(
