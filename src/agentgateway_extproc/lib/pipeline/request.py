@@ -68,7 +68,13 @@ if TYPE_CHECKING:
 
 type OpaqueReasoning = dict[int, dict[str, object]]
 
-_OPAQUE_REQUEST_REASONING_FIELDS = ("reasoning_content", "reasoning_signature")
+_OPAQUE_REQUEST_REASONING_FIELDS = (
+    "reasoning_content",
+    "reasoning",
+    "reasoning_details",
+    "thinking_blocks",
+    "reasoning_signature",
+)
 _UNCHECKED_IMAGE_MARKER = "[Image forwarded without privacy inspection]"
 _logger = logging.getLogger(__name__)
 

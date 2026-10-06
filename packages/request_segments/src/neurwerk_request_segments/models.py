@@ -487,6 +487,8 @@ def reserved_fields(endpoint: str, location: str) -> set[str]:
         "reasoning_content",
         "reasoning_signature",
         "reasoning",
+        "reasoning_details",
+        "thinking_blocks",
         "encrypted_content",
         "annotations",
         "content",

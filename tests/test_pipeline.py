@@ -883,6 +883,8 @@ async def test_assistant_reasoning_bypasses_analysis_and_replays_unchanged(
         "provider": "opaque",
         "parts": [None, REVERSIBLE_TOKEN, GUARD_INSTRUCTION],
     }
+    reasoning_details = [{"type": "reasoning.text", "text": REVERSIBLE_TOKEN}]
+    thinking_blocks = [{"type": "thinking", "thinking": GUARD_INSTRUCTION}]
     original = {
         "model": "test",
         "messages": [
@@ -891,6 +893,9 @@ async def test_assistant_reasoning_bypasses_analysis_and_replays_unchanged(
                 "role": "assistant",
                 "content": None,
                 "reasoning_content": None,
+                "reasoning": "opaque reasoning",
+                "reasoning_details": reasoning_details,
+                "thinking_blocks": thinking_blocks,
                 "reasoning_signature": signature,
                 "tool_calls": [
                     {
@@ -939,6 +944,9 @@ async def test_assistant_reasoning_bypasses_analysis_and_replays_unchanged(
     assistant = forwarded["messages"][2]
     assert assistant["content"] is None
     assert "reasoning_content" in assistant and assistant["reasoning_content"] is None
+    assert assistant["reasoning"] == "opaque reasoning"
+    assert assistant["reasoning_details"] == reasoning_details
+    assert assistant["thinking_blocks"] == thinking_blocks
     assert assistant["reasoning_signature"] == signature
     second_assistant = forwarded["messages"][4]
     assert second_assistant["reasoning_content"] == {"parts": [REVERSIBLE_TOKEN, None]}
@@ -949,9 +957,9 @@ async def test_assistant_reasoning_bypasses_analysis_and_replays_unchanged(
     "message",
     [
         {"role": "user", "content": "safe", "reasoning_content": "not allowed"},
-        {"role": "assistant", "content": "safe", "reasoning": "not supported"},
+        {"role": "user", "content": "safe", "reasoning": "not allowed"},
     ],
-    ids=["non-assistant", "unsupported-field"],
+    ids=["non-assistant-content", "non-assistant-reasoning"],
 )
 async def test_request_reasoning_contract_rejects_unsupported_locations(
     engine_client, message
@@ -964,12 +972,7 @@ async def test_request_reasoning_contract_rejects_unsupported_locations(
 
     assert response is not None
     assert response.immediate_response.status.code == 400
-    if "reasoning" in message:
-        assert (
-            json.loads(response.immediate_response.body)["error"]["code"] == "unsupported_feature"
-        )
-    else:
-        assert response.immediate_response.body == '{"error":"invalid model request"}'
+    assert response.immediate_response.body == '{"error":"invalid model request"}'
 
 
 async def test_mcp_mutates_only_arguments_and_reverses_only_result_text(
