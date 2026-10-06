@@ -12,7 +12,11 @@ import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from mcp_types import PROTOCOL_VERSION_META_KEY
+from mcp_types import (
+    PROTOCOL_VERSION_META_KEY,
+    MissingRequiredClientCapabilityErrorData,
+    UnsupportedProtocolVersionErrorData,
+)
 from mcp_types.methods import validate_client_request, validate_server_result
 
 from agentgateway_extproc.lib.json_limits import bounded_json_text
@@ -20,7 +24,7 @@ from agentgateway_extproc.lib.masking.reversal import reverse_placeholders
 from agentgateway_extproc.lib.pipeline.sse import SseDecoder
 from agentgateway_extproc.models.destination import McpDestinationPolicy
 from agentgateway_extproc.models.engine import EngineMcpRequest, JsonValue
-from agentgateway_extproc.models.exceptions import InvalidReversalError
+from agentgateway_extproc.models.exceptions import InvalidReversalError, McpHttpError
 from agentgateway_extproc.models.types import RESERVED_PLACEHOLDER_PREFIX_RE
 
 if TYPE_CHECKING:
@@ -401,11 +405,32 @@ def _contains_string(value: JsonValue | None) -> bool:
 
 def process_mcp_json_response(handler: StreamHandler, text: str) -> str:
     """Validate one correlated MCP response and reverse only authorized result text."""
+    context = handler.mcp_context
+    if (
+        context is not None
+        and context.protocol_version == MCP_MODERN_VERSION
+        and handler.response_status in {400, 404}
+    ):
+        try:
+            return _validated_modern_http_error(text, handler.response_status, context)
+        except McpProtocolError as exc:
+            # Legacy endpoints need not emit JSON-RPC. Preserve their fallback signal,
+            # but never forward unvalidated bytes or diagnostic transport hints.
+            raise McpHttpError(handler.response_status, {}) from exc
     if not text:
         validate_mcp_empty_response(handler)
         return text
     payload = _parse_response_payload(text)
     return _process_mcp_response_payload(handler, payload, text)
+
+
+def _validated_modern_http_error(text: str, status: int, context: McpMessageContext) -> str:
+    payload = _parse_response_payload(text)
+    if not isinstance(payload, dict):
+        raise McpProtocolError("invalid MCP HTTP error")
+    _validate_json_bounds(payload)
+    _validate_response_envelope(payload, context.request_id)
+    return _safe_modern_error(payload, status, context.protocol_version)
 
 
 def process_mcp_sse_message(handler: StreamHandler, text: str) -> tuple[str, bool]:
@@ -446,19 +471,16 @@ def _process_mcp_response_payload(handler: StreamHandler, payload: Any, text: st
         raise McpProtocolError("MCP response must be one JSON-RPC object")
     _validate_json_bounds(payload)
     _validate_response_envelope(payload, context.request_id)
-    if context.protocol_version == MCP_MODERN_VERSION:
-        if handler.response_status in {400, 404}:
-            return _safe_modern_error(payload, handler.response_status)
-        if "result" in payload:
-            result = payload["result"]
-            if isinstance(result, dict) and result.get("resultType") == "input_required":
-                raise McpUnsupportedFeatureError(context.request_id)
-            if not isinstance(result, dict) or result.get("resultType") != "complete":
-                raise McpProtocolError("unsupported MCP result type")
-            try:
-                validate_server_result(context.method, MCP_MODERN_VERSION, result)
-            except (KeyError, TypeError, ValueError) as exc:
-                raise McpProtocolError("invalid modern MCP result") from exc
+    if context.protocol_version == MCP_MODERN_VERSION and "result" in payload:
+        result = payload["result"]
+        if isinstance(result, dict) and result.get("resultType") == "input_required":
+            raise McpUnsupportedFeatureError(context.request_id)
+        if not isinstance(result, dict) or result.get("resultType") != "complete":
+            raise McpProtocolError("unsupported MCP result type")
+        try:
+            validate_server_result(context.method, MCP_MODERN_VERSION, result)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise McpProtocolError("invalid modern MCP result") from exc
     if context.method == "initialize" and "result" in payload:
         result = payload.get("result")
         if not isinstance(result, dict) or result.get("protocolVersion") != MCP_PROTOCOL_VERSION:
@@ -476,7 +498,7 @@ def _process_mcp_response_payload(handler: StreamHandler, payload: Any, text: st
     return text if transformed == payload else _json_dumps(transformed)
 
 
-def _safe_modern_error(payload: dict[str, Any], status: int) -> str:
+def _safe_modern_error(payload: dict[str, Any], status: int, requested: str) -> str:
     """Retain negotiation signals, never upstream diagnostics or arbitrary error data."""
     error = payload.get("error")
     allowed = {
@@ -496,8 +518,32 @@ def _safe_modern_error(payload: dict[str, Any], status: int) -> str:
         versions = data.get("supported") if isinstance(data, dict) else None
         if not isinstance(versions, list) or any(not isinstance(item, str) for item in versions):
             raise McpProtocolError("invalid MCP supported versions")
-        safe["data"] = {"supported": [v for v in MCP_SUPPORTED_VERSIONS if v in versions]}
+        safe["data"] = {
+            "supported": [v for v in MCP_SUPPORTED_VERSIONS if v in versions],
+            "requested": requested,
+        }
+        UnsupportedProtocolVersionErrorData.model_validate(safe["data"], strict=True)
+    elif code == -32021:
+        data = error.get("data")
+        capabilities = data.get("requiredCapabilities") if isinstance(data, dict) else None
+        _validate_safe_capabilities(capabilities)
+        safe["data"] = {"requiredCapabilities": capabilities}
+        MissingRequiredClientCapabilityErrorData.model_validate(safe["data"], strict=True)
     return _json_dumps({"jsonrpc": "2.0", "id": payload["id"], "error": safe})
+
+
+def _validate_safe_capabilities(value: Any) -> None:
+    """Allow only core capability markers, never arbitrary extension diagnostics."""
+    shapes = {"roots": set(), "sampling": {"context", "tools"}, "elicitation": {"form", "url"}}
+    if not isinstance(value, dict) or set(value) - shapes.keys():
+        raise McpProtocolError("unsupported required MCP capabilities")
+    for name, markers in value.items():
+        if (
+            not isinstance(markers, dict)
+            or set(markers) - shapes[name]
+            or any(marker != {} for marker in markers.values())
+        ):
+            raise McpProtocolError("invalid required MCP capability markers")
 
 
 def _parse_response_payload(text: str) -> Any:

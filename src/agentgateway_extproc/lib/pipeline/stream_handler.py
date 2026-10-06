@@ -719,6 +719,12 @@ class StreamHandler:
         self, request: ext_proc_pb2.ProcessingRequest
     ) -> ext_proc_pb2.ProcessingResponse:
         names = {item.key.casefold() for item in request.response_trailers.trailers.headers}
+        if self._modern_protocol_error():
+            return ext_proc_pb2.ProcessingResponse(
+                response_trailers=ext_proc_pb2.TrailersResponse(
+                    header_mutation={"remove_headers": sorted(names)}
+                )
+            )
         removed = (
             sorted(names & {"etag", "content-md5", "digest"})
             if self.response_processing_enabled and not self._preserve_mcp_response_bytes()

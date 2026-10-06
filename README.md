@@ -382,6 +382,10 @@ headers are rejected when PII is enabled, rather than allowing an original argum
 to escape in a header while its body copy is masked. Recognized unsupported features
 return a fixed `unsupported_feature` error. Validated modern HTTP negotiation errors
 retain safe codes and supported versions, never backend diagnostics or arbitrary data.
+Version errors include the request's validated version; capability errors retain only
+core roots, sampling and elicitation markers. Extension-specific or malformed errors
+keep their HTTP 400/404 status with a fixed generic body for legacy fallback. All
+upstream trailers are stripped from sanitized modern error replies.
 The existing per-request nonce and reversal behavior are unchanged. There is no
 cross-request reversal state for multi-round-trip retries.
 

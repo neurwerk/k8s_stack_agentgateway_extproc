@@ -4,7 +4,10 @@ import base64
 import json
 
 import pytest
+from mcp_types import MissingRequiredClientCapabilityErrorData, UnsupportedProtocolVersionErrorData
 
+from agentgateway_extproc.controllers.grpc_servicer import ExtProcServicer
+from agentgateway_extproc.gen import ext_proc_pb2
 from agentgateway_extproc.lib.pipeline.mcp import (
     MCP_MODERN_VERSION,
     McpProtocolError,
@@ -16,6 +19,7 @@ from agentgateway_extproc.models.destination import McpDestinationPolicy
 
 from .conftest import (
     REVERSIBLE_TOKEN,
+    add_policy,
     body_request,
     header_request,
     mcp_headers,
@@ -176,13 +180,110 @@ async def test_modern_negotiation_error_keeps_safe_versions_not_diagnostics(
     assert safe["error"] == {
         "code": -32022,
         "message": "Unsupported MCP protocol version",
-        "data": {"supported": ["2025-11-25"]},
+        "data": {"supported": ["2025-11-25"], "requested": MCP_MODERN_VERSION},
     }
     headers = handler.pop_pending_response_headers()
     assert headers is not None
     removed = headers.response_headers.response.header_mutation.remove_headers
     assert "www-authenticate" in removed
     assert "x-debug" in removed
+
+
+@pytest.mark.parametrize("pii_enabled", [True, False])
+@pytest.mark.parametrize(
+    "status,body",
+    [
+        (400, b'{"error":"unsupported protocol version"}'),
+        (404, b'{"detail":"not found"}'),
+        (400, b""),
+        (400, b"not JSON"),
+        (400, b'{"jsonrpc":"2.0","id":99,"error":{"code":-32020,"message":"x"}}'),
+        (400, b'{"jsonrpc":"2.0","id":1,"error":{"code":-32021,"message":"x"}}'),
+    ],
+)
+async def test_unrecognized_modern_http_errors_preserve_fallback_status(
+    engine_client, pii_enabled, status, body
+):
+    policy = mcp_policy(pii_enabled=pii_enabled)
+
+    async def messages():
+        yield header_request(modern_headers("server/discover"), policy=policy)
+        yield body_request(json.dumps(modern_request("server/discover")).encode(), policy=policy)
+        yield response_headers("application/json", status=status, policy=policy)
+        yield response_body(body, policy=policy)
+
+    outputs = [item async for item in ExtProcServicer(engine_client).Process(messages(), None)]
+    assert outputs[-1].immediate_response.status.code == status
+    assert outputs[-1].immediate_response.body == '{"error":"MCP HTTP request failed"}'
+    assert not any(
+        item.HasField("response_headers") or item.HasField("response_body") for item in outputs
+    )
+
+
+@pytest.mark.parametrize("pii_enabled", [True, False])
+@pytest.mark.parametrize(
+    "code,data,expected,model",
+    [
+        (
+            -32022,
+            {"supported": ["2025-11-25"], "requested": "private diagnostic"},
+            {"supported": ["2025-11-25"], "requested": MCP_MODERN_VERSION},
+            UnsupportedProtocolVersionErrorData,
+        ),
+        (
+            -32021,
+            {"requiredCapabilities": {"sampling": {"tools": {}}, "roots": {}}},
+            {"requiredCapabilities": {"sampling": {"tools": {}}, "roots": {}}},
+            MissingRequiredClientCapabilityErrorData,
+        ),
+    ],
+)
+async def test_modern_errors_keep_valid_data_and_strip_all_trailers(
+    engine_client, pii_enabled, code, data, expected, model
+):
+    policy = mcp_policy(pii_enabled=pii_enabled)
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "error": {
+            "code": code,
+            "message": "private diagnostic",
+            "data": {**data, "secret": "private"},
+        },
+    }
+
+    async def messages():
+        yield header_request(modern_headers("server/discover"), policy=policy)
+        yield body_request(json.dumps(modern_request("server/discover")).encode(), policy=policy)
+        yield response_headers(
+            "application/json", status=400, policy=policy, extra_headers={"x-debug": "private"}
+        )
+        yield response_body(json.dumps(payload).encode(), end_of_stream=False, policy=policy)
+        yield add_policy(
+            ext_proc_pb2.ProcessingRequest(
+                response_trailers=ext_proc_pb2.HttpTrailers(
+                    trailers={
+                        "headers": [
+                            {"key": "X-Debug", "value": "private"},
+                            {"key": "grpc-message", "value": "private"},
+                        ]
+                    }
+                )
+            ),
+            policy,
+        )
+
+    outputs = [item async for item in ExtProcServicer(engine_client).Process(messages(), None)]
+    headers, body, trailers = outputs[-3:]
+    assert "x-debug" in headers.response_headers.response.header_mutation.remove_headers
+    emitted = json.loads(body.response_body.response.body_mutation.streamed_response.body)
+    assert emitted["error"]["data"] == expected
+    model.model_validate(emitted["error"]["data"], strict=True)
+    assert "private" not in json.dumps(emitted)
+    assert set(trailers.response_trailers.header_mutation.remove_headers) == {
+        "x-debug",
+        "grpc-message",
+    }
 
 
 @pytest.mark.parametrize("result", [{}, {"resultType": "input_required", "requestState": "x"}])
