@@ -2,16 +2,25 @@
 
 from __future__ import annotations
 
+import re
 from typing import Annotated, Literal, cast
 
 from google.protobuf.json_format import MessageToDict
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator, model_validator
 
 from agentgateway_extproc.gen import ext_proc_pb2
-from agentgateway_extproc.models.exceptions import TrustedMetadataError
+from agentgateway_extproc.models.exceptions import (
+    ContextForgeAccountRequiredError,
+    TrustedMetadataError,
+)
 
 DESTINATION_POLICY_NAMESPACE = "neurwerk.destination_policy"
 MAX_PRINCIPAL_BYTES = 256
+_ACCOUNT_EMAIL_RE = re.compile(
+    r"[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+)*@"
+    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+"
+)
 
 type ModelId = Annotated[
     str,
@@ -23,6 +32,7 @@ class DestinationModel(BaseModel):
     """Reject coercion and undocumented trusted metadata fields."""
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+    account_email: str | None = None
 
 
 class ModelDestinationPolicy(DestinationModel):
@@ -240,6 +250,7 @@ class McpDestinationPolicy(DestinationModel):
         pattern=r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*$",
     )
     pii_enabled: bool
+    contextforge: bool = False
 
     @field_validator("principal_id")
     @classmethod
@@ -268,6 +279,15 @@ def destination_policy_from_request(
         # google.protobuf.Struct represents every JSON number as a double.
         if type(version) is float and version in {1.0, 2.0, 3.0, 4.0}:
             payload["contract_version"] = int(version)
+        if payload.get("destination_kind") == "mcp" and payload.get("contextforge") is True:
+            email = payload.get("account_email")
+            if (
+                not isinstance(email, str)
+                or len(email) > 254
+                or len(email.partition("@")[0]) > 64
+                or _ACCOUNT_EMAIL_RE.fullmatch(email) is None
+            ):
+                raise ContextForgeAccountRequiredError
         return DESTINATION_POLICY_ADAPTER.validate_python(payload, strict=True)
     except TrustedMetadataError:
         raise

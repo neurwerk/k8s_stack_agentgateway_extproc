@@ -168,6 +168,10 @@ class TrustedMetadataError(Exception):
     """Indicate missing, malformed, or changing trusted destination metadata."""
 
 
+class ContextForgeAccountRequiredError(Exception):
+    """Reject a ContextForge destination without a valid verified account email."""
+
+
 def is_safe_engine_error_message(message: object) -> bool:
     """Accept one bounded printable line suitable for a JSON client error."""
     return (

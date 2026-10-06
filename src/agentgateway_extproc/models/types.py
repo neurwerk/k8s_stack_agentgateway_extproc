@@ -21,8 +21,22 @@ PRESIDIO_NO_PII = "P00"
 PRESIDIO_PII_DETECTED = "P01"
 PRESIDIO_PII_TRANSFORMED = "P02"
 PRESIDIO_REROUTED = "P03"
+CONTEXTFORGE_ACCOUNT_HEADER = "x-contextforge-account-email"
 
 REQUEST_HEADERS = {
+    CONTEXTFORGE_ACCOUNT_HEADER,
+    "authorization",
+    "proxy-authorization",
+    "x-api-key",
+    "api-key",
+    "cookie",
+    "x-agentgateway-auth-context",
+    "x-agentgateway-user",
+    "x-agentgateway-principal-id",
+    "x-forwarded-user",
+    "x-forwarded-email",
+    "x-auth-request-user",
+    "x-auth-request-email",
     "x-remote-allowed",
     "x-route-class",
     "x-pii-entities",
