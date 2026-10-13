@@ -19,6 +19,9 @@ invalid_placeholder_total = Counter(
     "Unauthorized model placeholders replaced in human-readable output",
 )
 errors_total = Counter("extproc_errors_total", "Adapter errors", ["type"])
+rejection_exports_total = Counter(
+    "extproc_rejection_exports_total", "Debug rejection export outcomes", ["outcome"]
+)
 active_streams = Gauge("extproc_active_streams", "Active ext_proc streams")
 response_transport_total = Counter(
     "extproc_response_transport_total",

@@ -24,6 +24,7 @@ from agentgateway_extproc.lib.pipeline.mcp import McpProtocolError, McpUnsupport
 from agentgateway_extproc.lib.pipeline.request import immediate_response
 from agentgateway_extproc.lib.pipeline.stream_handler import StreamHandler
 from agentgateway_extproc.lib.rejection_capture import RejectionCapture, RejectionCaptureConfig
+from agentgateway_extproc.lib.rejection_langfuse import RejectionLangfuse
 from agentgateway_extproc.lib.rejections import annotate_rejection, log_limit_rejection
 from agentgateway_extproc.metrics import active_streams, errors_total, response_failures_total
 from agentgateway_extproc.models.exceptions import (
@@ -67,12 +68,14 @@ class ExtProcServicer(ext_proc_pb2_grpc.ExternalProcessorServicer):
         settings: Settings | None = None,
         docling: DoclingClient | None = None,
         preferences_client: NoticePreferencesClient | None = None,
+        rejection_langfuse: RejectionLangfuse | None = None,
     ) -> None:
         """Store the shared engine client used by all streams."""
         self._client = client
         self._settings = settings or Settings()
         self._docling = docling
         self._preferences_client = preferences_client
+        self._rejection_langfuse = rejection_langfuse
         self._capture = RejectionCapture(
             RejectionCaptureConfig(**self._settings.rejection_capture.model_dump())
         )
@@ -105,10 +108,18 @@ class ExtProcServicer(ext_proc_pb2_grpc.ExternalProcessorServicer):
         return size
 
     def _capture_input(self, request: ext_proc_pb2.ProcessingRequest) -> tuple[bytes, int, bool]:
-        if not request.HasField("request_body") or not self._capture.config.enabled:
+        if not request.HasField("request_body"):
+            return b"", 0, False
+        maximum = max(
+            self._capture.config.max_file_bytes if self._capture.config.enabled else 0,
+            self._settings.rejection_langfuse.max_capture_bytes
+            if self._settings.rejection_langfuse.enabled
+            else 0,
+        )
+        if maximum == 0:
             return b"", 0, False
         inbound = request.request_body.body
-        original = inbound[: self._capture.config.max_file_bytes]
+        original = inbound[:maximum]
         complete = request.request_body.end_of_stream and len(original) == len(inbound)
         return original, len(inbound), complete
 
@@ -130,7 +141,9 @@ class ExtProcServicer(ext_proc_pb2_grpc.ExternalProcessorServicer):
                 original_body, observed_bytes, body_complete = self._capture_input(request)
                 size = self._reserve_body(request)
                 if size is None:
-                    yield _overloaded(handler.correlation_id)
+                    yield self._body_overloaded(
+                        handler.correlation_id, original_body, observed_bytes, body_complete
+                    )
                     return
                 buffered_bytes += size
                 try:
@@ -177,6 +190,20 @@ class ExtProcServicer(ext_proc_pb2_grpc.ExternalProcessorServicer):
             self._buffered_bytes -= buffered_bytes
             active_streams.dec()
 
+    def _body_overloaded(
+        self, correlation_id: str, body: bytes, observed_bytes: int, complete: bool
+    ) -> ext_proc_pb2.ProcessingResponse:
+        if observed_bytes > 0 and self._rejection_langfuse is not None:
+            self._rejection_langfuse.submit(
+                body,
+                request_id=correlation_id,
+                status=503,
+                observed_bytes=observed_bytes,
+                complete=complete,
+                reason="capacity_unavailable",
+            )
+        return _overloaded(correlation_id)
+
     async def _annotate_rejection(
         self,
         handler: StreamHandler,
@@ -197,6 +224,19 @@ class ExtProcServicer(ext_proc_pb2_grpc.ExternalProcessorServicer):
         ):
             annotate_rejection(response, handler.correlation_id, limit=limit)
         status = response.immediate_response.status.code
+        if (
+            status in {400, 413, 403, 503}
+            and observed_bytes > 0
+            and self._rejection_langfuse is not None
+        ):
+            self._rejection_langfuse.submit(
+                original_body,
+                request_id=handler.correlation_id,
+                status=status,
+                observed_bytes=observed_bytes,
+                complete=complete,
+                limit=limit,
+            )
         if status not in {400, 413} or not self._capture.config.enabled:
             return
         declared = handler.request_headers.get("content-length", "")
