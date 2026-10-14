@@ -86,6 +86,7 @@ async def exchange(client, messages, *, settings=None, exporter=None):
 async def test_one_resolution_drives_permissions_policy_and_final_provider_model(
     admission, engine_reply, responses, requested, pii
 ):
+    engine_reply["route_class"] = "general"
     if responses:
         admission["request_context"]["protocol_profile"] = "openai-responses-v1"
     admission["destination_policy"]["models"]["example-chat"] = pii
@@ -759,8 +760,19 @@ async def test_v5_notice_identity_uses_neurwerk_key_and_existing_cache(
     ],
 )
 async def test_api_mount_uses_only_verified_binding_for_validation(
-    admission, engine_client, responses, mode, prefix, accepted
+    admission, engine_client, engine_reply, responses, mode, prefix, accepted
 ):
+    # Ordinary Engine passes classify content without requesting a reroute.
+    engine_reply.update(
+        decision="pass",
+        entities=[],
+        entity_counts={},
+        applied_actions=[],
+        route_class="general",
+        request=json.loads(request_json()),
+        report={"rows": []},
+        reversal={},
+    )
     admission["request_context"]["entry_mode"] = mode
     if responses:
         admission["request_context"]["protocol_profile"] = "openai-responses-v1"

@@ -473,9 +473,8 @@ async def process_request(
         validate_request_mutation(request, reply)
         if handler.text_pii_enabled:
             validate_reversal(request, reply)
-        if handler.admission is not None and (
-            reply.decision == "reroute" or reply.route_class is not None
-        ):
+        # Nonterminal replies also carry content classification in route_class.
+        if handler.admission is not None and reply.decision == "reroute":
             _clear_request(handler)
             raise GatewayPolicyError("unsupported_reroute")
     except (EngineUnavailableError, InvalidEngineReplyError):

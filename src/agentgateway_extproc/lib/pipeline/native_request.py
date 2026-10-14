@@ -99,7 +99,8 @@ async def process_native_request(  # noqa: C901
         )
         validate_request_mutation(request, reply)
         validate_reversal(request, reply)
-        if reply.decision == "reroute" or reply.route_class is not None:
+        # Nonterminal replies also carry content classification in route_class.
+        if reply.decision == "reroute":
             raise GatewayPolicyError("unsupported_reroute")
         if reply.decision == "block" or reply.request is None:
             handler.record_dispatch("policy_block")

@@ -72,6 +72,7 @@ async def native_engine(engine_reply):
         reply.pop("request")
         reply.update(
             api_version="v2",
+            route_class="general",
             segments=[
                 {**segment, "text": segment["text"].replace(private_value, REVERSIBLE_TOKEN)}
                 for segment in segments
