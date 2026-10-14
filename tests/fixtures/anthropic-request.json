@@ -1,0 +1,13 @@
+{
+  "model": "provider-chat",
+  "max_tokens": 128,
+  "system": [{"type": "text", "text": "Help Jane Doe"}],
+  "messages": [
+    {"role": "user", "content": "Find Jane Doe"},
+    {"role": "assistant", "content": [{"type": "tool_use", "id": "call-1", "name": "lookup", "input": {"person": "Jane Doe", "count": 1}}]},
+    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call-1", "content": [{"type": "text", "text": "Jane Doe found"}], "is_error": false}]}
+  ],
+  "tools": [{"name": "lookup", "description": "Look up Jane Doe", "input_schema": {"type": "object", "properties": {"person": {"type": "string", "description": "Person such as Jane Doe"}}, "required": ["person"]}}],
+  "tool_choice": {"type": "auto", "disable_parallel_tool_use": false},
+  "stream": true
+}

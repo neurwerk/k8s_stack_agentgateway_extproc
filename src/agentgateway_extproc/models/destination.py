@@ -13,6 +13,7 @@ from agentgateway_extproc.models.exceptions import (
     ContextForgeAccountRequiredError,
     TrustedMetadataError,
 )
+from agentgateway_extproc.models.immutable import FrozenMap
 
 DESTINATION_POLICY_NAMESPACE = "neurwerk.destination_policy"
 MAX_PRINCIPAL_BYTES = 256
@@ -31,7 +32,7 @@ type ModelId = Annotated[
 class DestinationModel(BaseModel):
     """Reject coercion and undocumented trusted metadata fields."""
 
-    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True, validate_default=True)
     account_email: str | None = None
 
 
@@ -44,31 +45,31 @@ class ModelDestinationPolicy(DestinationModel):
     credential_context_version: Literal["1"] | None = None
     credential_id: str | None = None
     credential_kind: Literal["personal", "managed"] | None = None
-    models: dict[ModelId, bool] = Field(min_length=1, max_length=256)
-    attachment_modes: dict[ModelId, Literal["block", "extract", "process", "passthrough"]] = Field(
+    models: FrozenMap[ModelId, bool] = Field(min_length=1, max_length=256)
+    attachment_modes: FrozenMap[ModelId, Literal["block", "extract", "process", "passthrough"]] = (
+        Field(default_factory=dict, max_length=256)
+    )
+    document_modes: FrozenMap[ModelId, Literal["block", "extract-text"]] = Field(
         default_factory=dict, max_length=256
     )
-    document_modes: dict[ModelId, Literal["block", "extract-text"]] = Field(
+    image_modes: FrozenMap[ModelId, Literal["block", "extract-text", "forward-normalized"]] = Field(
         default_factory=dict, max_length=256
     )
-    image_modes: dict[ModelId, Literal["block", "extract-text", "forward-normalized"]] = Field(
-        default_factory=dict, max_length=256
-    )
-    image_forwarding: dict[
+    image_forwarding: FrozenMap[
         ModelId, Literal["none", "if-no-pii-detected", "if-policy-allows", "pii-unchecked"]
     ] = Field(default_factory=dict, max_length=256)
-    face_protection: dict[ModelId, bool] = Field(default_factory=dict, max_length=256)
-    local_models: dict[ModelId, bool] = Field(default_factory=dict, max_length=256)
-    image_models: dict[ModelId, bool] = Field(default_factory=dict, max_length=256)
-    image_inspection: dict[ModelId, Literal["document-only", "document-and-vision"]] = Field(
+    face_protection: FrozenMap[ModelId, bool] = Field(default_factory=dict, max_length=256)
+    local_models: FrozenMap[ModelId, bool] = Field(default_factory=dict, max_length=256)
+    image_models: FrozenMap[ModelId, bool] = Field(default_factory=dict, max_length=256)
+    image_inspection: FrozenMap[ModelId, Literal["document-only", "document-and-vision"]] = Field(
         default_factory=dict, max_length=256
     )
-    image_textless: dict[ModelId, Literal["block", "allow-if-inspected"]] = Field(
+    image_textless: FrozenMap[ModelId, Literal["block", "allow-if-inspected"]] = Field(
         default_factory=dict, max_length=256
     )
-    image_reroutes: dict[ModelId, Annotated[dict[ModelId, ModelId], Field(max_length=256)]] = Field(
-        default_factory=dict, max_length=256
-    )
+    image_reroutes: FrozenMap[
+        ModelId, Annotated[FrozenMap[ModelId, ModelId], Field(max_length=256)]
+    ] = Field(default_factory=dict, max_length=256)
 
     @model_validator(mode="before")
     @classmethod
@@ -275,6 +276,17 @@ def destination_policy_from_request(
             dict[str, object],
             MessageToDict(metadata, preserving_proto_field_name=True),
         )
+        return destination_policy_from_payload(payload)
+    except TrustedMetadataError:
+        raise
+    except (KeyError, TypeError, ValueError) as exc:
+        raise TrustedMetadataError from exc
+
+
+def destination_policy_from_payload(payload: dict[str, object]) -> DestinationPolicy:
+    """Validate a legacy policy, including one nested in an admission envelope."""
+    try:
+        payload = dict(payload)
         version = payload.get("contract_version")
         # google.protobuf.Struct represents every JSON number as a double.
         if type(version) is float and version in {1.0, 2.0, 3.0, 4.0}:

@@ -14,10 +14,12 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 from .compatibility import (
     CompatibilitySettings,
     ExtractionLimitError,
+    ProtocolKind,
     RequestKind,
     UnsupportedFeatureError,
 )
 from .models import EngineChatRequest, EngineMcpRequest, EngineResponsesRequest, SupportedRequest
+from .native import AnthropicRequest, GoogleRequest
 
 type Path = tuple[str | int, ...]
 
@@ -40,7 +42,7 @@ class _Leaf:
 def parse_request(
     payload: object,
     *,
-    kind: RequestKind | None = None,
+    kind: ProtocolKind | None = None,
     controls: CompatibilitySettings | None = None,
 ) -> SupportedRequest:
     """Validate one endpoint shape without rewriting omitted or explicit controls."""
@@ -59,11 +61,15 @@ def parse_request(
         "chat": EngineChatRequest,
         "responses": EngineResponsesRequest,
         "mcp": EngineMcpRequest,
+        "anthropic": AnthropicRequest,
+        "google": GoogleRequest,
     }[kind]
     try:
         request = model.model_validate(payload, strict=True, context={"controls": controls})
     except ValidationError as exc:
         for error in exc.errors(include_url=False, include_input=False):
+            if kind in {"anthropic", "google"} and error["type"] == "union_tag_invalid":
+                raise UnsupportedFeatureError("request", "native_content") from exc
             cause = error.get("ctx", {}).get("error")
             if isinstance(cause, UnsupportedFeatureError):
                 raise cause from exc
@@ -82,6 +88,7 @@ class ExtractedRequest:
     _request: SupportedRequest
     _leaves: tuple[_Leaf, ...]
     _max_depth: int = 32
+    protocol_kind: ProtocolKind = "chat"
 
     def diagnostic_path(self, id: str) -> Path:
         """Resolve an opaque ID locally, never in the analysis service."""
@@ -118,7 +125,7 @@ class ExtractedRequest:
                 root,
                 json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":")),
             )
-        return parse_request(data, kind=self.request_kind, controls=self._request._controls)
+        return parse_request(data, kind=self.protocol_kind, controls=self._request._controls)
 
     def control_shape(self) -> dict[str, object]:
         """Normalize text, including encoded argument leaves, for mutation checks."""
@@ -197,7 +204,7 @@ def extract_request(request: SupportedRequest, *, max_depth: int = 32) -> Extrac
         leaves.extend(
             _schema(data.get("response_format"), ("response_format",), max_depth=max_depth)
         )
-    else:
+    elif isinstance(request, EngineResponsesRequest):
         kind = "responses"
         text(data.get("instructions"), ("instructions",))
         value = data["input"]
@@ -219,6 +226,10 @@ def extract_request(request: SupportedRequest, *, max_depth: int = 32) -> Extrac
         config = data.get("text")
         if isinstance(config, dict):
             leaves.extend(_schema(config.get("format"), ("text", "format"), max_depth=max_depth))
+    else:
+        # Native conversations share Engine's chat analysis family, not its provider shape.
+        kind = "chat"
+        leaves.extend(_native_leaves(data, request, max_depth))
     return ExtractedRequest(
         [TextSegment(id=f"s{index}", text=leaf.text) for index, leaf in enumerate(leaves)],
         kind,
@@ -226,7 +237,86 @@ def extract_request(request: SupportedRequest, *, max_depth: int = 32) -> Extrac
         deepcopy(request),
         tuple(leaves),
         max_depth,
+        "anthropic"
+        if isinstance(request, AnthropicRequest)
+        else "google"
+        if isinstance(request, GoogleRequest)
+        else kind,
     )
+
+
+def _native_leaves(  # noqa: C901
+    data: dict[str, object], request: AnthropicRequest | GoogleRequest, max_depth: int
+) -> list[_Leaf]:
+    """Enumerate native text leaves without constructing an OpenAI request."""
+    leaves: list[_Leaf] = []
+
+    def text(value: object, path: Path) -> None:
+        if isinstance(value, str):
+            leaves.append(_Leaf(path, value))
+
+    def anthropic_content(value: object, path: Path) -> None:
+        if isinstance(value, str):
+            text(value, path)
+        elif isinstance(value, list):
+            for index, block in enumerate(value):
+                child = (*path, index)
+                if block["type"] == "text":
+                    text(block["text"], (*child, "text"))
+                elif block["type"] == "tool_use":
+                    leaves.extend(
+                        _json_leaves(block["input"], (*child, "input"), max_depth=max_depth)
+                    )
+                else:
+                    anthropic_content(block["content"], (*child, "content"))
+
+    if isinstance(request, AnthropicRequest):
+        anthropic_content(data.get("system"), ("system",))
+        for index, message in enumerate(cast(list[dict[str, object]], data["messages"])):
+            anthropic_content(message["content"], ("messages", index, "content"))
+        for index, tool in enumerate(cast(list[dict[str, object]], data.get("tools") or [])):
+            path = ("tools", index)
+            text(tool.get("description"), (*path, "description"))
+            leaves.extend(
+                _schema(tool["input_schema"], (*path, "input_schema"), max_depth=max_depth)
+            )
+    else:
+        contents = cast(list[dict[str, object]], data["contents"])
+        entries: list[tuple[dict[str, object], Path]] = [
+            (content, ("contents", index)) for index, content in enumerate(contents)
+        ]
+        if isinstance(data.get("systemInstruction"), dict):
+            entries.append(
+                (cast(dict[str, object], data["systemInstruction"]), ("systemInstruction",))
+            )
+        for content, path in entries:
+            for index, part in enumerate(cast(list[dict[str, object]], content["parts"])):
+                child = (*path, "parts", index)
+                text(part.get("text"), (*child, "text"))
+                for field, payload in (("functionCall", "args"), ("functionResponse", "response")):
+                    value = part.get(field)
+                    if isinstance(value, dict):
+                        leaves.extend(
+                            _json_leaves(
+                                value[payload], (*child, field, payload), max_depth=max_depth
+                            )
+                        )
+        for index, tools in enumerate(cast(list[dict[str, object]], data.get("tools") or [])):
+            for fi, function in enumerate(
+                cast(list[dict[str, object]], tools["functionDeclarations"])
+            ):
+                path = ("tools", index, "functionDeclarations", fi)
+                leaves.extend(_definition(function, path, max_depth))
+                leaves.extend(
+                    _schema(function.get("response"), (*path, "response"), max_depth=max_depth)
+                )
+        config = data.get("generationConfig")
+        if isinstance(config, dict):
+            for field in ("responseSchema", "responseJsonSchema"):
+                leaves.extend(
+                    _schema(config.get(field), ("generationConfig", field), max_depth=max_depth)
+                )
+    return leaves
 
 
 def _validate_mcp_metadata(value: object, max_depth: int) -> None:

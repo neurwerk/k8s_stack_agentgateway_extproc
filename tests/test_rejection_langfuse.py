@@ -96,6 +96,8 @@ async def test_otlp_redaction_bounds_and_safe_failure(caplog):
             {
                 "messages": [{"content": "private prose", "api_key": "hidden"}],
                 "headers": {"Authorization": "Bearer hidden"},
+                "x-neurwerk-authorization": "Bearer hidden",
+                "x-goog-api-key": "hidden",
                 "nested": {"clientSecret": "hidden"},
             }
         ).encode()

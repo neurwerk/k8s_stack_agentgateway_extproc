@@ -24,6 +24,8 @@ _CREDENTIAL_FIELDS = frozenset(
         "proxyauthorization",
         "apikey",
         "xapikey",
+        "xgoogapikey",
+        "xneurwerkauthorization",
         "apitoken",
         "secret",
         "secretkey",

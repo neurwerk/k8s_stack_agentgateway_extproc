@@ -27,6 +27,7 @@ from agentgateway_extproc.lib.pipeline.mcp import (
     parse_mcp_message,
     strict_json_loads,
 )
+from agentgateway_extproc.lib.pipeline.profiles import model_profile
 from agentgateway_extproc.lib.pipeline.reply_validation import (
     validate_request_mutation,
     validate_reversal,
@@ -52,6 +53,7 @@ from agentgateway_extproc.models.engine import (
 from agentgateway_extproc.models.exceptions import (
     EnginePolicyError,
     EngineUnavailableError,
+    GatewayPolicyError,
     InvalidEngineReplyError,
     LimitDetail,
 )
@@ -112,12 +114,20 @@ async def process_request(
     policy = handler.destination_policy
     if policy is None:
         raise ValueError("trusted destination policy is unavailable")  # noqa: TRY003
+    if handler.admission is not None and model_profile(handler.admission).request_kind in {
+        "anthropic",
+        "google",
+    }:
+        from agentgateway_extproc.lib.pipeline.native_request import process_native_request
+
+        return await process_native_request(handler, payload)
     opaque_reasoning: OpaqueReasoning = {}
     converted = False
     image_locations: dict[tuple[int, int], str] = {}
     unchecked_image_locations: dict[tuple[int, int], str] = {}
     image_forwarding = "none"
     images: ImageBatch | None = None
+    model_id: str | None = None
     visual_findings: VisualFindings | None = None
     if policy.destination_kind == "mcp":
         handler.response_api_kind = "mcp"
@@ -162,7 +172,8 @@ async def process_request(
         handler.record_dispatch("mcp_analyzed")
     else:
         try:
-            opaque_reasoning = _extract_opaque_chat_reasoning(payload)
+            if handler.admission is None:
+                opaque_reasoning = _extract_opaque_chat_reasoning(payload)
         except ValueError:
             handler.record_dispatch("protocol_failure")
             return immediate_response(400, '{"error":"invalid model request"}')
@@ -175,6 +186,10 @@ async def process_request(
                 if path.endswith("/chat/completions")
                 else None
             )
+            if handler.admission is not None:
+                kind = model_profile(handler.admission).request_kind
+                if kind == "responses" and isinstance(payload, dict) and payload.get("background"):
+                    raise GatewayPolicyError("unsupported_feature")
             request = parse_request(
                 payload, kind=kind, controls=getattr(handler, "compatibility", None)
             )
@@ -214,12 +229,24 @@ async def process_request(
         if not isinstance(request, EngineChatRequest | EngineResponsesRequest):
             handler.record_dispatch("protocol_failure")
             return immediate_response(400, '{"error":"invalid model request"}')
-        if request.model not in policy.models:
+        model_id = request.model
+        if handler.admission is not None:
+            handler.request_context = handler.admission.resolve_model(request.model)
+            model_id = handler.request_context.destination_id
+            handler.response_api_kind = model_profile(handler.admission).request_kind
+            handler.expected_response_format = "sse" if request.stream else "json"
+        if model_id not in policy.models:
             return immediate_response(400, '{"error":"unknown model"}')
-        handler.text_pii_enabled = policy.models[request.model]
+        handler.text_pii_enabled = (
+            handler.request_context.pii_policy.enabled
+            if handler.request_context is not None
+            else policy.models[model_id]
+        )
         attachments = _model_attachments(request)
-        attachment_mode = policy.attachment_modes.get(request.model, "block")
-        image_forwarding = policy.image_forwarding.get(request.model, "none")
+        attachment_mode = policy.attachment_modes.get(model_id, "block")
+        if handler.admission is not None and attachments and attachment_mode == "passthrough":
+            raise GatewayPolicyError("unsupported_feature")
+        image_forwarding = policy.image_forwarding.get(model_id, "none")
         unchecked_without_documents = False
         if attachments and policy.contract_version in {4, "4.1"}:
             document_indexes = {
@@ -245,20 +272,20 @@ async def process_request(
                     for index, part in enumerate(attachments)
                 ):
                     raise DocumentError(400, reason="unsupported_format")  # noqa: TRY301
-                if (document_indexes and policy.document_mode(request.model) == "block") or (
-                    image_indexes and policy.image_mode(request.model) == "block"
+                if (document_indexes and policy.document_mode(model_id) == "block") or (
+                    image_indexes and policy.image_mode(model_id) == "block"
                 ):
                     raise DocumentError(403, reason="attachments_disabled")  # noqa: TRY301
                 unchecked = bool(image_indexes) and image_forwarding == "pii-unchecked"
                 inspect_images = (
                     image_indexes
                     if policy.contract_version == "4.1"
-                    and policy.image_inspection[request.model] == "document-and-vision"
+                    and policy.image_inspection[model_id] == "document-and-vision"
                     else set()
                 )
                 images = (
                     ImageBatch(
-                        protect_faces=not unchecked and policy.protects_faces(request.model),
+                        protect_faces=not unchecked and policy.protects_faces(model_id),
                         defer_face_inspection=bool(inspect_images),
                         policy_version=4,
                     )
@@ -339,7 +366,7 @@ async def process_request(
                 if any(part.type == expected_image for part in attachments):
                     images = ImageBatch(
                         protect_faces=(policy.contract_version == 3 or image_forwarding != "none")
-                        and policy.protects_faces(request.model),
+                        and policy.protects_faces(model_id),
                         policy_version=cast(int, policy.contract_version),
                     )
                     texts = await handler.docling.convert(attachments, images=images)
@@ -372,10 +399,10 @@ async def process_request(
                 try:
                     image_output(
                         policy,
-                        request.model,
+                        model_id,
                         images,
                         None,
-                        allow_textless=_allow_inspected_textless(policy, request.model, images),
+                        allow_textless=_allow_inspected_textless(policy, model_id, images),
                     )
                 except DocumentError as exc:
                     return _image_policy_block(handler, exc)
@@ -401,9 +428,11 @@ async def process_request(
                     _clear_request(handler)
                     return immediate_response(exc.status, json.dumps({"error": exc.message}))
             _clear_request(handler)
-            handler.response_processing_enabled = False
+            handler.response_processing_enabled = handler.admission is not None
+            handler.response_notice_allowed = handler.admission is None
+            body, alias_changed = _upstream_model_body(handler, body)
             handler.record_dispatch("model_bypass")
-            return request_mutation(body, {}, converted)
+            return request_mutation(body, {}, converted or alias_changed)
         conversation_id = handler.request_headers.get(
             "x-session-id"
         ) or handler.request_headers.get("x-conversation-id")
@@ -413,7 +442,9 @@ async def process_request(
             handler.request_nonce = secrets.token_bytes(32)
         session_key = make_session_key(
             policy,
-            request,
+            request.model_copy(update={"model": model_id})
+            if handler.admission is not None
+            else request,
             conversation_id=conversation_id[:256] if conversation_id else None,
             request_nonce=handler.request_nonce,
         )
@@ -442,6 +473,11 @@ async def process_request(
         validate_request_mutation(request, reply)
         if handler.text_pii_enabled:
             validate_reversal(request, reply)
+        if handler.admission is not None and (
+            reply.decision == "reroute" or reply.route_class is not None
+        ):
+            _clear_request(handler)
+            raise GatewayPolicyError("unsupported_reroute")
     except (EngineUnavailableError, InvalidEngineReplyError):
         if images is None:
             raise
@@ -539,6 +575,7 @@ async def process_request(
         )
     if (
         images is not None
+        and model_id is not None
         and isinstance(policy, ModelDestinationPolicy)
         and isinstance(request, EngineChatRequest | EngineResponsesRequest)
         and policy.contract_version in {3, 4, "4.1"}
@@ -546,10 +583,10 @@ async def process_request(
         try:
             output = image_output(
                 policy,
-                request.model,
+                model_id,
                 images,
                 reply,
-                allow_textless=_allow_inspected_textless(policy, request.model, images),
+                allow_textless=_allow_inspected_textless(policy, model_id, images),
             )
             handler.request_stats.images_forwarded = output.forward_pixels
             if not output.forward_pixels:
@@ -568,6 +605,8 @@ async def process_request(
         dict[str, object],
         transformed.model_dump(mode="json", by_alias=True, exclude_unset=True),
     )
+    if handler.request_context is not None:
+        serialized["model"] = handler.request_context.destination_id
     if isinstance(request, EngineChatRequest):
         for message in _dict_list(serialized.get("messages")):
             if message.get("tool_calls") == []:
@@ -621,6 +660,21 @@ async def process_request(
         if reply.entities:
             headers["x-pii-entities"] = ",".join(reply.entities)
     return request_mutation(mutated, headers, converted or mutated != body)
+
+
+def _upstream_model_body(handler: StreamHandler, body: bytes) -> tuple[bytes, bool]:
+    """Rewrite bypassed bodies using the same authorized selection as inspected bodies."""
+    context = handler.request_context
+    if context is None or context.requested_model == context.destination_id:
+        return body, False
+    payload = strict_json_loads(body.decode())
+    payload["model"] = context.destination_id
+    rewritten = json.dumps(
+        payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+    ).encode()
+    if len(rewritten) > handler.max_transformed_request_bytes:
+        _raise_output_limit(len(rewritten), handler.max_transformed_request_bytes)
+    return rewritten, True
 
 
 def _literalize_request_placeholders(request: EngineRequest) -> EngineRequest:

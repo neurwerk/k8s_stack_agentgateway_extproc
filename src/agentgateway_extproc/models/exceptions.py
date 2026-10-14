@@ -168,6 +168,37 @@ class TrustedMetadataError(Exception):
     """Indicate missing, malformed, or changing trusted destination metadata."""
 
 
+type GatewayErrorCode = Literal[
+    "unsupported_feature",
+    "invalid_request",
+    "unknown_model",
+    "permission_denied",
+    "provider_credential_required",
+    "invalid_provider_credential",
+    "unsupported_reroute",
+]
+
+_GATEWAY_ERRORS: dict[GatewayErrorCode, tuple[int, str]] = {
+    "unsupported_feature": (400, "This profile operation is not supported."),
+    "invalid_request": (400, "The profile request is invalid."),
+    "unknown_model": (400, "The model is not available on this binding."),
+    "permission_denied": (403, "The selected destination or credential mode is not permitted."),
+    "provider_credential_required": (401, "A provider credential is required."),
+    "invalid_provider_credential": (400, "The provider credential does not match this profile."),
+    "unsupported_reroute": (403, "Rerouting is not supported on this binding."),
+}
+
+
+class GatewayPolicyError(Exception):
+    """Carry only a fixed, content-free profile rejection."""
+
+    def __init__(self, code: GatewayErrorCode) -> None:
+        """Derive the status and public message from a closed vocabulary."""
+        super().__init__()
+        self.code = code
+        self.status_code, self.message = _GATEWAY_ERRORS[code]
+
+
 class ContextForgeAccountRequiredError(Exception):
     """Reject a ContextForge destination without a valid verified account email."""
 

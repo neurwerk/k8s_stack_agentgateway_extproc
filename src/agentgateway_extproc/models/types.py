@@ -28,6 +28,8 @@ REQUEST_HEADERS = {
     "authorization",
     "proxy-authorization",
     "x-api-key",
+    "x-goog-api-key",
+    "x-neurwerk-authorization",
     "api-key",
     "cookie",
     "x-agentgateway-auth-context",
@@ -43,6 +45,14 @@ REQUEST_HEADERS = {
     "x-pii-session-key",
     PRESIDIO_RESPONSE_HEADER,
 }
+
+PROVIDER_CREDENTIAL_HEADERS = frozenset(
+    {"authorization", "x-api-key", "api-key", "x-goog-api-key", "cookie"}
+)
+SENSITIVE_RESPONSE_HEADERS = frozenset(
+    REQUEST_HEADERS
+    | {"set-cookie", "www-authenticate", "proxy-authenticate", "authentication-info"}
+)
 
 
 @dataclass

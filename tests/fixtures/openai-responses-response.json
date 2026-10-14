@@ -1,0 +1,39 @@
+{
+  "id": "resp-example",
+  "object": "response",
+  "created_at": 1700000000,
+  "model": "provider-chat",
+  "status": "completed",
+  "output": [
+    {
+      "id": "msg-example",
+      "type": "message",
+      "role": "assistant",
+      "status": "completed",
+      "content": [{"type": "output_text", "text": "Jane Doe", "annotations": [], "logprobs": []}]
+    }
+  ],
+  "error": null,
+  "incomplete_details": null,
+  "usage": {
+    "input_tokens": 20,
+    "output_tokens": 10,
+    "total_tokens": 30,
+    "input_tokens_details": {"cached_tokens": 0},
+    "output_tokens_details": {"reasoning_tokens": 0}
+  },
+  "instructions": null,
+  "max_output_tokens": null,
+  "parallel_tool_calls": true,
+  "previous_response_id": null,
+  "reasoning": {"effort": null, "summary": null},
+  "store": false,
+  "temperature": 1,
+  "text": {"format": {"type": "text"}},
+  "tool_choice": "auto",
+  "tools": [],
+  "top_p": 1,
+  "truncation": "disabled",
+  "user": null,
+  "metadata": {}
+}

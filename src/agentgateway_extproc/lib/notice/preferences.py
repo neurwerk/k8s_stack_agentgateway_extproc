@@ -12,6 +12,7 @@ import httpx
 from pydantic import BaseModel, ConfigDict
 
 from agentgateway_extproc.config.settings import NoticePreferencesSettings
+from agentgateway_extproc.models.admission import AdmissionContext
 from agentgateway_extproc.models.destination import ModelDestinationPolicy
 
 _PATH = "/internal/v1/notice-preferences"
@@ -68,7 +69,7 @@ class NoticePreferencesClient:
         if self._owns_client and self._client is not None:
             await self._client.aclose()
 
-    async def get(self, policy: ModelDestinationPolicy) -> NoticePreferences:
+    async def get(self, policy: ModelDestinationPolicy | AdmissionContext) -> NoticePreferences:
         """Fetch at most once per stream; errors never delay model traffic beyond the timeout."""
         if not self._settings.enabled or self._client is None:
             return DEFAULT_PREFERENCES

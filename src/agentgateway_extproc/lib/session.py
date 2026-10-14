@@ -42,6 +42,8 @@ def make_session_key(
         else:
             raise ValueError("model request requires a conversation or request nonce")  # noqa: TRY003
         destination_id = request.model
+        if destination_id is None:
+            raise ValueError("model request requires a resolved model")  # noqa: TRY003
     encoded = _length_frame(
         (
             ("version", _SESSION_KEY_VERSION.encode()),

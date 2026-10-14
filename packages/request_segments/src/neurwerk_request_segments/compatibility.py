@@ -8,6 +8,7 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 type RequestKind = Literal["chat", "responses", "mcp"]
+type ProtocolKind = Literal["chat", "responses", "mcp", "anthropic", "google"]
 type ControlLocation = Literal[
     "request", "message", "tool", "function", "stream_options", "text", "text_format", "input_item"
 ]

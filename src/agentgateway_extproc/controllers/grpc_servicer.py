@@ -27,10 +27,12 @@ from agentgateway_extproc.lib.rejection_capture import RejectionCapture, Rejecti
 from agentgateway_extproc.lib.rejection_langfuse import RejectionLangfuse
 from agentgateway_extproc.lib.rejections import annotate_rejection, log_limit_rejection
 from agentgateway_extproc.metrics import active_streams, errors_total, response_failures_total
+from agentgateway_extproc.models.admission import is_admission_request
 from agentgateway_extproc.models.exceptions import (
     ContextForgeAccountRequiredError,
     EnginePolicyError,
     EngineUnavailableError,
+    GatewayPolicyError,
     InvalidEngineReplyError,
     InvalidReversalError,
     McpHttpError,
@@ -107,7 +109,11 @@ class ExtProcServicer(ext_proc_pb2_grpc.ExternalProcessorServicer):
         self._buffered_bytes += size
         return size
 
-    def _capture_input(self, request: ext_proc_pb2.ProcessingRequest) -> tuple[bytes, int, bool]:
+    def _capture_input(
+        self, request: ext_proc_pb2.ProcessingRequest, handler: StreamHandler
+    ) -> tuple[bytes, int, bool]:
+        if handler.admission is not None or is_admission_request(request):
+            return b"", 0, False
         if not request.HasField("request_body"):
             return b"", 0, False
         maximum = max(
@@ -138,7 +144,7 @@ class ExtProcServicer(ext_proc_pb2_grpc.ExternalProcessorServicer):
         try:
             async for request in request_iterator:
                 kind = request.WhichOneof("request") or "unknown"
-                original_body, observed_bytes, body_complete = self._capture_input(request)
+                original_body, observed_bytes, body_complete = self._capture_input(request, handler)
                 size = self._reserve_body(request)
                 if size is None:
                     yield self._body_overloaded(
@@ -224,6 +230,8 @@ class ExtProcServicer(ext_proc_pb2_grpc.ExternalProcessorServicer):
         ):
             annotate_rejection(response, handler.correlation_id, limit=limit)
         status = response.immediate_response.status.code
+        if handler.admission is not None:
+            return
         if (
             status in {400, 413, 403, 503}
             and observed_bytes > 0
@@ -341,6 +349,13 @@ async def _handle_message(
 
 def _failure_response(phase: str, exc: Exception) -> ext_proc_pb2.ProcessingResponse:
     """Record only bounded response failure context and fail the stream closed."""
+    if isinstance(exc, GatewayPolicyError):
+        return immediate_response(
+            exc.status_code,
+            json.dumps(
+                {"error": {"code": exc.code, "message": exc.message}}, separators=(",", ":")
+            ),
+        )
     if isinstance(exc, ContextForgeAccountRequiredError):
         return immediate_response(
             403,
