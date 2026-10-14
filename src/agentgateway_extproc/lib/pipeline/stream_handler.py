@@ -25,19 +25,27 @@ from agentgateway_extproc.lib.pipeline.mcp import (
     McpUnsupportedFeatureError,
     validate_mcp_headers,
 )
+from agentgateway_extproc.lib.pipeline.profiles import header_value
+from agentgateway_extproc.lib.pipeline.profiles import request_headers as profile_request_headers
 from agentgateway_extproc.lib.pipeline.request import immediate_response, process_request
 from agentgateway_extproc.lib.pipeline.response import process_response_chunk
 from agentgateway_extproc.metrics import dispatcher_total, response_transport_total
+from agentgateway_extproc.models.admission import (
+    AdmissionEnvelope,
+    RequestContext,
+    admission_snapshot,
+    metadata_from_request,
+)
 from agentgateway_extproc.models.destination import (
     DESTINATION_POLICY_NAMESPACE,
     DestinationPolicy,
     McpDestinationPolicy,
     ModelDestinationPolicy,
-    destination_policy_from_request,
 )
 from agentgateway_extproc.models.exceptions import (
     ContextForgeAccountRequiredError,
     EnginePolicyError,
+    GatewayPolicyError,
     InvalidEngineReplyError,
     LimitDetail,
     McpHttpError,
@@ -47,6 +55,7 @@ from agentgateway_extproc.models.types import (
     CONTEXTFORGE_ACCOUNT_HEADER,
     PRESIDIO_RESPONSE_HEADER,
     REQUEST_HEADERS,
+    SENSITIVE_RESPONSE_HEADERS,
     RequestStats,
 )
 
@@ -54,6 +63,7 @@ if TYPE_CHECKING:
     from agentgateway_extproc.lib.masking.reversal import PlaceholderStreamRewriter
     from agentgateway_extproc.lib.pipeline.guard import GuardStreamStripper
     from agentgateway_extproc.lib.pipeline.mcp import McpSseResponseProcessor
+    from agentgateway_extproc.lib.pipeline.native_response import NativeSseProcessor
     from agentgateway_extproc.lib.pipeline.response import SseResponseProcessor
 
 
@@ -104,6 +114,7 @@ class StreamHandler:
         self.response_buffer = ""
         self.response_content_type = ""
         self.response_format = "text"
+        self.expected_response_format: Literal["json", "sse"] | None = None
         self.response_status = 200
         self.response_api_kind = "chat"
         self.response_is_gzip = False
@@ -119,6 +130,7 @@ class StreamHandler:
         self.restored_counts: dict[str, int] = {}
         self.reversal_misses = 0
         self.sse_processor: SseResponseProcessor | McpSseResponseProcessor | None = None
+        self.native_sse_processor: NativeSseProcessor | None = None
         self.plain_rewriter: PlaceholderStreamRewriter | None = None
         self.plain_guard_stripper: GuardStreamStripper | None = None
         self.guard_injected = False
@@ -138,6 +150,10 @@ class StreamHandler:
         self.response_decoder = _utf8_decoder()
         self.pending_response_headers: ext_proc_pb2.ProcessingResponse | None = None
         self.destination_policy: DestinationPolicy | None = None
+        self.admission: AdmissionEnvelope | None = None
+        self.request_context: RequestContext | None = None
+        self._destination_metadata: DestinationPolicy | AdmissionEnvelope | None = None
+        self._admission_snapshot: str | None = None
         self.mcp_headers: McpHeaderContext | None = None
         self.mcp_context: McpMessageContext | None = None
         self.request_nonce: bytes | None = None
@@ -159,14 +175,20 @@ class StreamHandler:
         self.response_buffer = ""
         self.response_api_kind = "chat"
         self.response_body_chunks.clear()
+        self.expected_response_format = None
         self.response_passthrough_chunks.clear()
         self.sse_processor = None
+        self.native_sse_processor = None
         self.plain_rewriter = None
         self.plain_guard_stripper = None
         self.guard_injected = False
         self.gzip_decompressor = None
         self.response_decoder = _utf8_decoder()
         self.destination_policy = None
+        self.admission = None
+        self.request_context = None
+        self._destination_metadata = None
+        self._admission_snapshot = None
         self.mcp_headers = None
         self.mcp_context = None
         self.request_nonce = None
@@ -216,14 +238,28 @@ class StreamHandler:
             self.record_dispatch("metadata_eos_compat")
             return
         try:
-            policy = destination_policy_from_request(request)
+            metadata = metadata_from_request(request)
         except TrustedMetadataError:
             self.record_dispatch("metadata_failure")
             raise
-        if self.destination_policy is not None and policy != self.destination_policy:
+        if self._destination_metadata is not None and metadata != self._destination_metadata:
             self.record_dispatch("metadata_failure")
             raise TrustedMetadataError
-        self.destination_policy = policy
+        if isinstance(metadata, AdmissionEnvelope):
+            snapshot = admission_snapshot(request)
+            if self._admission_snapshot is not None and snapshot != self._admission_snapshot:
+                self.record_dispatch("metadata_failure")
+                raise TrustedMetadataError
+            self._admission_snapshot = snapshot
+        if self._destination_metadata is not None:
+            return
+        self._destination_metadata = metadata
+        if isinstance(metadata, AdmissionEnvelope):
+            self.admission = metadata
+            self.destination_policy = metadata.destination_policy
+            self.correlation_id = metadata.request_context.request_id
+        else:
+            self.destination_policy = metadata
 
     def _is_metadata_eos_compat(self, request: ext_proc_pb2.ProcessingRequest) -> bool:
         """Accept AgentGateway's metadata-less empty final response callback."""
@@ -235,6 +271,7 @@ class StreamHandler:
             and request.response_body.end_of_stream
             and not request.response_body.body
             and DESTINATION_POLICY_NAMESPACE not in request.metadata_context.filter_metadata
+            and (self.admission is None or not request.metadata_context.filter_metadata)
         )
 
     async def _request_headers(  # noqa: C901
@@ -242,18 +279,19 @@ class StreamHandler:
     ) -> ext_proc_pb2.ProcessingResponse:
         """Remove adapter-owned headers before forwarding the request upstream."""
         header_items = request.request_headers.headers.headers
-        headers = {
-            item.key.lower(): (
-                item.raw_value.decode(errors="replace") if item.raw_value else item.value
-            )
-            for item in header_items
-        }
-        removed = [key for key in headers if key.lower() in REQUEST_HEADERS]
-        self.request_headers = {
-            key.lower(): value
-            for key, value in headers.items()
-            if key.lower() not in REQUEST_HEADERS
-        }
+        if self.admission is not None:
+            headers, removed = profile_request_headers(request, self.admission)
+        else:
+            # Filter before decoding or retaining credential values, including legacy traffic.
+            headers = {
+                item.key.lower(): header_value(item)
+                for item in header_items
+                if item.key.lower() not in REQUEST_HEADERS
+            }
+            removed = [
+                item.key.lower() for item in header_items if item.key.lower() in REQUEST_HEADERS
+            ]
+        self.request_headers = headers
         self.request_started = True
         policy = self.destination_policy
         if policy is None:
@@ -310,19 +348,25 @@ class StreamHandler:
                 return immediate_response(400, '{"error":"MCP request body required"}')
             return _request_headers_response(removed, policy=policy)
         if self.preferences_client is not None:
-            self.notice_preferences = await self.preferences_client.get(policy)
+            self.notice_preferences = await self.preferences_client.get(
+                self.admission.request_context if self.admission is not None else policy
+            )
         if request.request_headers.end_of_stream:
             self.request_processed = True
             return immediate_response(400, '{"error":"request body required"}')
-        disable_response = isinstance(policy, ModelDestinationPolicy) and not (
-            any(policy.models.values())
-            or (
-                policy.contract_version in {3, 4, "4.1"}
-                and any(
-                    policy.image_mode(model)
-                    in {"extract", "process", "extract-text", "forward-normalized"}
-                    and policy.protects_faces(model)
-                    for model in policy.models
+        disable_response = (
+            self.admission is None
+            and isinstance(policy, ModelDestinationPolicy)
+            and not (
+                any(policy.models.values())
+                or (
+                    policy.contract_version in {3, 4, "4.1"}
+                    and any(
+                        policy.image_mode(model)
+                        in {"extract", "process", "extract-text", "forward-normalized"}
+                        and policy.protects_faces(model)
+                        for model in policy.models
+                    )
                 )
             )
         )
@@ -337,6 +381,14 @@ class StreamHandler:
             return immediate_response(400, '{"error":"request headers required"}')
         if self.request_processed:
             return immediate_response(400, '{"error":"unexpected request body"}')
+        if self.admission is not None and (
+            not request.request_body.end_of_stream
+            or (
+                "content-length" in self.request_headers
+                and int(self.request_headers["content-length"]) != len(request.request_body.body)
+            )
+        ):
+            raise GatewayPolicyError("invalid_request")
         size = sum(map(len, self.request_body_chunks)) + len(request.request_body.body)
         if size > self.max_request_bytes:
             raise EnginePolicyError(
@@ -354,13 +406,18 @@ class StreamHandler:
         self.request_body_chunks.append(request.request_body.body)
         self.request_trailers_expected = not request.request_body.end_of_stream
         self.request_processed = True
-        return await process_request(self, self.client)
+        response = await process_request(self, self.client)
+        if self.request_context is not None and response.HasField("request_body"):
+            response.dynamic_metadata.update(
+                {"neurwerk.request_context": self.request_context.model_dump(mode="json")}
+            )
+        return response
 
-    def _response_headers(
+    def _response_headers(  # noqa: C901
         self, request: ext_proc_pb2.ProcessingRequest
     ) -> ext_proc_pb2.ProcessingResponse | None:
         """Capture response format and remove encoding headers when decoding gzip."""
-        if not self.response_processing_enabled:
+        if not self.response_processing_enabled and self.admission is None:
             self.response_started = True
             self.response_headers_accepted = True
             self.response_processed = request.response_headers.end_of_stream
@@ -373,12 +430,12 @@ class StreamHandler:
         _validate_response_header_cardinality(
             self.response_api_kind,
             [item.key.lower() for item in header_items],
+            strict=self.admission is not None,
         )
         headers = {
-            item.key.lower(): (
-                item.raw_value.decode(errors="replace") if item.raw_value else item.value
-            )
+            item.key.lower(): header_value(item)
             for item in header_items
+            if item.key.lower() not in SENSITIVE_RESPONSE_HEADERS
         }
         self.response_content_type = headers.get("content-type", "")
         self.response_started = True
@@ -386,10 +443,30 @@ class StreamHandler:
             self.response_status = int(headers.get(":status", "200"))
         except ValueError as exc:
             raise ValueError("invalid response status") from exc
+        if self.admission is not None and 400 <= self.response_status <= 599:
+            # Do not consume provider error bodies or echo challenges/cookies with credentials.
+            return immediate_response(
+                self.response_status,
+                '{"error":{"code":"provider_error","message":"Provider request failed."}}',
+            )
         if not 200 <= self.response_status < 300:
             self.notice_messages.clear()
             self.response_notice_allowed = False
         media_type = self.response_content_type.partition(";")[0].strip().casefold()
+        if self.admission is not None and (
+            not 200 <= self.response_status < 300
+            or media_type not in {"application/json", "text/event-stream"}
+            or (
+                self.expected_response_format is not None
+                and media_type
+                != (
+                    "text/event-stream"
+                    if self.expected_response_format == "sse"
+                    else "application/json"
+                )
+            )
+        ):
+            raise ValueError("unsupported profile response")
         self.response_format = (
             "sse"
             if media_type == "text/event-stream"
@@ -414,6 +491,12 @@ class StreamHandler:
         ).inc()
         preserve_mcp_bytes = self._preserve_mcp_response_bytes()
         removed = self._response_removed_headers(headers, preserve=preserve_mcp_bytes)
+        if self.admission is not None or self._modern_protocol_error():
+            removed.extend(
+                item.key.lower()
+                for item in header_items
+                if item.key.lower() in SENSITIVE_RESPONSE_HEADERS
+            )
         if self.response_is_gzip:
             self.gzip_decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
         set_headers = []
@@ -550,7 +633,7 @@ class StreamHandler:
                 raise McpProtocolError("MCP empty response status cannot contain a body")
             if not request.response_body.end_of_stream:
                 return None
-        if not self.response_processing_enabled:
+        if not self.response_processing_enabled and self.admission is None:
             self.response_processed = request.response_body.end_of_stream
             return ext_proc_pb2.ProcessingResponse(
                 response_body=ext_proc_pb2.BodyResponse(
@@ -732,6 +815,8 @@ class StreamHandler:
             if self.response_processing_enabled and not self._preserve_mcp_response_bytes()
             else []
         )
+        if self.admission is not None:
+            removed.extend(sorted(names & SENSITIVE_RESPONSE_HEADERS))
         return ext_proc_pb2.ProcessingResponse(
             response_trailers=ext_proc_pb2.TrailersResponse(
                 header_mutation={"remove_headers": removed}
@@ -773,9 +858,11 @@ def _request_headers_response(
     return response
 
 
-def _validate_response_header_cardinality(api_kind: str, names: list[str]) -> None:
+def _validate_response_header_cardinality(
+    api_kind: str, names: list[str], *, strict: bool = False
+) -> None:
     """Reject ambiguous MCP response controls before collapsing header values."""
-    if api_kind == "mcp" and any(
+    if (api_kind == "mcp" or strict) and any(
         names.count(name) > 1
         for name in {
             ":status",

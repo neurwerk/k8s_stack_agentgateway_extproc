@@ -17,6 +17,7 @@ from pydantic import (
 from pydantic.json_schema import JsonDict, SkipJsonSchema
 
 from .compatibility import CompatibilitySettings, UnsupportedFeatureError
+from .native import AnthropicRequest, GoogleRequest
 
 type JsonScalar = str | int | float | bool | None
 type JsonValue = JsonScalar | list[JsonValue] | dict[str, JsonValue]
@@ -470,7 +471,9 @@ class EngineMcpRequest(RequestModel):
     params: EngineMcpParams
 
 
-type SupportedRequest = EngineChatRequest | EngineResponsesRequest | EngineMcpRequest
+type SupportedRequest = (
+    EngineChatRequest | EngineResponsesRequest | EngineMcpRequest | AnthropicRequest | GoogleRequest
+)
 type EngineRequest = SupportedRequest
 ENGINE_REQUEST_ADAPTER: TypeAdapter[SupportedRequest] = TypeAdapter(SupportedRequest)
 

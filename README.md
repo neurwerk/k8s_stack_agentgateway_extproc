@@ -18,6 +18,86 @@ AgentGateway External Processor adapts gateway requests and responses for the PI
 
 ## Contributing and support
 
+### AI Gateway admission, version 5
+
+The `neurwerk.destination_policy` metadata namespace accepts the immutable v5
+envelope in [`tests/fixtures/admission-v5.json`](tests/fixtures/admission-v5.json).
+Send the same complete envelope on every callback. Its model catalog must contain
+only models on the admitted `binding_id` and `provider_id`. The only metadata-less
+exception is an empty final response-body callback after validated response headers;
+partial or changed metadata is rejected even on that callback.
+
+Supported native operations (all `POST`):
+
+| Profile | Operation | Exact path | Caller credential |
+| --- | --- | --- | --- |
+| `openai-chat-completions-v1` | `create` | `/v1/chat/completions` | Bearer `authorization` |
+| `openai-responses-v1` | `create` | `/v1/responses` | Bearer `authorization` |
+| `anthropic-messages-v1` | `create` | `/v1/messages` | `x-api-key` |
+| `google-generate-content-v1` | `generateContent` | `/v1beta/models/<model>:generateContent` | `x-goog-api-key` |
+| `google-generate-content-v1` | `streamGenerateContent` | `/v1beta/models/<model>:streamGenerateContent?alt=sse` | `x-goog-api-key` |
+
+For `entry_mode: api`, the exact prefix `/bindings/<verified binding_id>` may
+precede one of these operation paths. This mount is removed for validation only;
+extProc retains the incoming path and the native gateway owns its upstream
+rewrite. `forward_proxy` accepts only the exact operation path. Other bindings,
+arbitrary prefixes, encoded separators and binding dot segments are rejected.
+
+Requests require JSON, identity encoding and one complete buffered body without
+trailers. Other profiles/operations, opaque reasoning input, background Responses,
+stored prior Responses and legacy raw attachment passthrough are rejected.
+Anthropic requires `anthropic-version: 2023-06-01`; beta headers are unqualified.
+Google query credentials are rejected; an optional body model must match the URL.
+Anthropic/Google support text and client function tools, native JSON and SSE
+restoration, including split text tokens and Anthropic tool-JSON fragments.
+Google streamed calls must contain complete, nonrepeated function objects per
+candidate/part position. Native media, hosted tools, cached context, thinking and
+thought signatures are unqualified and rejected, as are all website operations.
+Provider response fields/events use closed schemas; unknown shapes fail closed.
+OpenAI output support covers assistant text/refusals, client function `tool_calls`,
+and known usage/control fields. Opaque reasoning, nonempty citations/logprobs,
+hosted tools and media output are unqualified. JSON responses require complete
+envelopes. Responses SSE requires its created/item/part/done lifecycle and an
+explicit `response.completed` or `response.incomplete` terminal with closed items.
+Chat SSE requires a finish reason for every choice followed by `[DONE]`. Function
+arguments must close as a valid JSON object, and repeated snapshots must agree.
+EOF is not protocol completion; a failure after response headers aborts the stream.
+OpenAI response media type must match the admitted request's `stream` flag.
+Responses reflections of `instructions`, function descriptions/parameter schemas,
+and `text.format` reuse canonical request extraction for restoration in JSON and
+lifecycle snapshots. Only those text leaves use the current request's reversal
+map; schema keys, enums, refs and other protocol controls remain protected.
+
+One body-resolved selection controls all-of permissions, PII, content-tracing
+selection and the final provider model rewrite, including PII-disabled requests.
+extProc keeps the canonical ID in the body `model`, so the native
+gateway selects that exact configured Model and then rewrites to the approved
+binding's `upstream_model`. Only the canonical ID and unique `upstream_model` alias
+are accepted. The gateway must retain the same approved binding. All v5 reroutes
+are rejected.
+In output metadata, `destination_id` is that canonical ID and `resolved_model` is
+the selected binding's upstream model name.
+
+Successful buffered request-body replies emit the separate resolved context under
+`neurwerk.request_context`; see the exact
+[output fixture](tests/fixtures/resolved-context-v5.json). It contains admitted
+identity IDs, selection, policy and tracing facts, never credential values or
+reversal material. `billing_classification` is `company_api` for company mode and
+`unknown` otherwise: caller credentials cannot prove personal API or subscription
+billing. `usage_completeness` is `unknown` at admission. The native gateway extracts
+usage from provider responses; late full-duplex metadata is not relied on. Normal
+content tracing remains the gateway's responsibility.
+
+`caller_supplied` preserves the profile's approved credential header unchanged
+upstream while excluding its value from processing state. `company` strips caller
+credentials and requires `provider:<provider-id>:company-use`; the gateway supplies
+its approved company credential afterward. `none` rejects provider credentials.
+Neurwerk credentials and reserved identity headers are removed upstream. Provider
+error replies have fixed safe content; credential response headers and trailers,
+including `Set-Cookie`, are stripped. V5 requests never enter raw rejection capture
+or the rejection debug exporter, including malformed admission and capacity errors.
+Existing unwrapped policy versions keep their wire contracts and routing behavior.
+
 ### Optional rejection debug project
 
 `EXTPROC_REJECTION_LANGFUSE__ENABLED` defaults to `false`. When enabled, configure

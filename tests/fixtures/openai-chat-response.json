@@ -1,0 +1,17 @@
+{
+  "id": "chatcmpl-example",
+  "object": "chat.completion",
+  "created": 1700000000,
+  "model": "provider-chat",
+  "choices": [
+    {
+      "index": 0,
+      "message": {"role": "assistant", "content": "Jane Doe", "refusal": null},
+      "finish_reason": "stop",
+      "logprobs": null
+    }
+  ],
+  "usage": {"prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30},
+  "system_fingerprint": "fp-example",
+  "service_tier": "default"
+}

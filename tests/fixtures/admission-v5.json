@@ -1,0 +1,40 @@
+{
+  "contract_version": 5,
+  "request_context": {
+    "request_id": "example-request",
+    "principal_id": "example-subject",
+    "credential_context_version": null,
+    "credential_id": null,
+    "credential_kind": null,
+    "entry_mode": "api",
+    "destination_kind": "model",
+    "provider_id": "openai",
+    "binding_id": "openai-api",
+    "protocol_profile": "openai-chat-completions-v1",
+    "operation_id": "create",
+    "provider_credential_source": "caller_supplied",
+    "policy_revision": "example-revision",
+    "permissions": ["llm:invoke", "model:example-chat:invoke"]
+  },
+  "destination_policy": {
+    "contract_version": "4.1",
+    "destination_kind": "model",
+    "principal_id": "example-subject",
+    "models": {"example-chat": true},
+    "document_modes": {"example-chat": "block"},
+    "image_modes": {"example-chat": "block"},
+    "image_forwarding": {"example-chat": "none"},
+    "face_protection": {"example-chat": false},
+    "local_models": {"example-chat": false},
+    "image_models": {"example-chat": false},
+    "image_inspection": {"example-chat": "document-only"},
+    "image_textless": {"example-chat": "block"}
+  },
+  "model_bindings": {
+    "example-chat": {
+      "upstream_model": "provider-chat",
+      "required_permissions": ["llm:invoke", "model:example-chat:invoke"],
+      "content_tracing_enabled": false
+    }
+  }
+}

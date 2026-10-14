@@ -8,6 +8,8 @@ import json
 import math
 from typing import TYPE_CHECKING, Any
 
+from neurwerk_request_segments import extract_request, parse_request
+
 from agentgateway_extproc.gen import ext_proc_pb2
 from agentgateway_extproc.lib.masking.reversal import PlaceholderStreamRewriter
 from agentgateway_extproc.lib.notice.inject import render_notice
@@ -16,6 +18,10 @@ from agentgateway_extproc.lib.pipeline.guard import GuardStreamStripper, strip_g
 from agentgateway_extproc.lib.pipeline.mcp import (
     McpSseResponseProcessor,
     process_mcp_json_response,
+)
+from agentgateway_extproc.lib.pipeline.openai_response import (
+    OpenAIStreamValidator,
+    validate_json_response,
 )
 from agentgateway_extproc.lib.pipeline.sse import SseDecoder, SseEvent
 from agentgateway_extproc.metrics import invalid_placeholder_total
@@ -30,6 +36,7 @@ _RESPONSES_ITEM_DONE = {
     "response.content_part.done",
     "response.output_item.done",
     "response.function_call_arguments.done",
+    "response.refusal.done",
 }
 _RESPONSES_TERMINALS = {
     "response.completed",
@@ -166,9 +173,27 @@ def _reverse_json_values(
     if isinstance(value, dict):
         if any(RESERVED_PLACEHOLDER_PREFIX_RE.search(key) for key in value):
             raise InvalidReversalError("response contains a placeholder-shaped JSON key")
+        reflections = _reverse_response_reflections(handler, value, path) if protocol_fields else {}
         transformed: dict[str, Any] = {}
         for key, item in value.items():
-            if (
+            if key in reflections:
+                transformed[key] = reflections[key]
+            elif (
+                protocol_fields
+                and handler.admission is not None
+                and key == "refusal"
+                and isinstance(item, str)
+                and (
+                    value.get("type") in {"refusal", "response.refusal.done"}
+                    or (
+                        handler.response_api_kind == "chat"
+                        and path
+                        and path[-1] in {"message", "delta"}
+                    )
+                )
+            ):
+                transformed[key] = _reverse_complete(handler, item)
+            elif (
                 protocol_fields
                 and isinstance(item, str)
                 and _is_nested_json_field(handler, value, key, path)
@@ -183,6 +208,38 @@ def _reverse_json_values(
                 )
         return transformed
     return value
+
+
+def _reverse_response_reflections(
+    handler: StreamHandler, value: dict[str, Any], path: tuple[str | int, ...]
+) -> dict[str, Any]:
+    """Restore qualified reflected text through the same extractor as request masking."""
+    if (
+        handler.admission is None
+        or handler.response_api_kind != "responses"
+        or path not in {(), ("response",)}
+        or value.get("object") != "response"
+    ):
+        return {}
+    fields = {key: value[key] for key in ("instructions", "tools", "text") if key in value}
+    if not fields:
+        return {}
+    # A reflection-only local view reuses the canonical schema traversal and rebuild.
+    # Its empty input is not provider traffic or a new Engine analysis request.
+    extracted = extract_request(
+        parse_request({"model": value["model"], "input": "", **fields}, kind="responses")
+    )
+    # Canonical control_shape removes only eligible text leaves, retaining schema
+    # keys, enums, refs, identifiers and uninspected extensions for this strict check.
+    if RESERVED_PLACEHOLDER_PREFIX_RE.search(_json_dumps(extracted.control_shape())):
+        raise InvalidReversalError("reflected protocol field contains a placeholder")
+    restored = extracted.rebuild(
+        [
+            segment.model_copy(update={"text": _reverse_complete(handler, segment.text)})
+            for segment in extracted.segments
+        ]
+    ).model_dump(mode="json", by_alias=True, exclude_unset=True)
+    return {key: restored[key] for key in fields}
 
 
 def _is_nested_json_field(
@@ -258,6 +315,7 @@ def _reverse_structured_chat_content(handler: StreamHandler, payload: Any) -> No
 def process_json_response(handler: StreamHandler, text: str) -> str:
     """Transform one complete JSON document and insert one valid notice carrier."""
     payload = strict_json_loads(text)
+    _validate_profile_response(handler, payload)
     opaque_reasoning = _take_opaque_chat_reasoning(handler, payload, "message")
     if handler.response_api_kind == "chat":
         _reverse_structured_chat_content(handler, payload)
@@ -307,6 +365,13 @@ def _take_opaque_chat_reasoning(
         if values:
             detached.append((index, values))
     return detached
+
+
+def _validate_profile_response(handler: StreamHandler, payload: Any) -> None:
+    """Validate every v5 envelope field before legacy restoration can detach any content."""
+    if handler.admission is None:
+        return
+    validate_json_response(handler.response_api_kind, payload)
 
 
 def _restore_opaque_chat_reasoning(
@@ -494,11 +559,18 @@ class SseResponseProcessor:
         self._responses_tail_held = False
         self._responses_terminal_type: str | None = None
         self._plain_sse = False
+        self._profile = (
+            OpenAIStreamValidator(handler.response_api_kind)
+            if handler.admission is not None
+            else None
+        )
 
     def feed(self, text: str, *, final: bool) -> str:
         """Transform complete SSE events and retain terminal frames for notices."""
         output: list[str] = []
         for event in self._decoder.feed(text, final=final):
+            if self._profile is not None and not self._profile.frame(event):
+                continue
             self._reject_event_metadata(event)
             if self._terminal_seen:
                 if event.data != "[DONE]":
@@ -517,6 +589,8 @@ class SseResponseProcessor:
                 output.append(notice_event.render())
             output.append(event.render())
         if final:
+            if self._profile is not None:
+                self._profile.finish()
             detached: list[tuple[str, str]] = []
             for key, rewriter in self._rewriters.items():
                 guarded = ""
@@ -551,16 +625,22 @@ class SseResponseProcessor:
         if not event.data:
             return
         if event.data == "[DONE]":
+            if self._profile is not None:
+                self._profile.done(event)
             return
         try:
             payload = strict_json_loads(event.data)
         except (ValueError, json.JSONDecodeError):
+            if self._handler.admission is not None:
+                raise InvalidReversalError("profile SSE data must be JSON") from None
             if self._handler.text_pii_enabled and RESERVED_PLACEHOLDER_PREFIX_RE.search(event.data):
                 raise InvalidReversalError(
                     "SSE response has unstructured placeholder output"
                 ) from None
             self._plain_sse = True
             return
+        if self._profile is not None:
+            self._profile.accept(event, payload)
         if not isinstance(payload, dict):
             raise InvalidReversalError("SSE event data must be a JSON object")
         opaque_reasoning = _take_opaque_chat_reasoning(self._handler, payload, "delta")
@@ -608,6 +688,8 @@ class SseResponseProcessor:
                 allow_invalid=not self._handler.response_structured_json,
             )
             self._transform_chat_tools(delta, index)
+            if self._profile is not None:
+                self._transform_stream_string(delta, "refusal", f"chat:{index}:refusal")
 
     def _transform_chat_tools(self, delta: dict[str, Any], choice_index: int) -> None:
         tools = delta.get("tool_calls")
@@ -655,6 +737,10 @@ class SseResponseProcessor:
                     and _notice_configured(self._handler)
                 ),
                 allow_invalid=not self._handler.response_structured_json,
+            )
+        elif event_type == "response.refusal.delta" and self._profile is not None:
+            self._transform_stream_string(
+                payload, "delta", f"responses:{item_id}:{output_index}:{content_index}:refusal"
             )
         elif event_type == "response.function_call_arguments.delta" and isinstance(item_id, str):
             self._transform_stream_string(
@@ -1075,7 +1161,19 @@ def process_response_chunk(
     handler: StreamHandler, chunk: str, end_of_stream: bool
 ) -> ext_proc_pb2.ProcessingResponse:
     """Transform a decoded body chunk according to the negotiated response format."""
-    if handler.response_api_kind == "mcp" and handler.response_format == "json":
+    if handler.response_api_kind in {"anthropic", "google"}:
+        from agentgateway_extproc.lib.pipeline.native_response import (
+            NativeSseProcessor,
+            process_native_json,
+        )
+
+        if handler.response_format == "sse":
+            if handler.native_sse_processor is None:
+                handler.native_sse_processor = NativeSseProcessor(handler)
+            transformed = handler.native_sse_processor.feed(chunk, final=end_of_stream)
+        else:
+            transformed = process_native_json(handler, chunk)
+    elif handler.response_api_kind == "mcp" and handler.response_format == "json":
         transformed = process_mcp_json_response(handler, chunk)
     elif handler.response_api_kind == "mcp" and handler.response_format == "sse":
         if handler.sse_processor is None:

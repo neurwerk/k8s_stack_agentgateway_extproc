@@ -1,0 +1,140 @@
+"""Small, complete native protocol fixtures for the v5 response boundary."""
+
+import json
+from copy import deepcopy
+from pathlib import Path
+
+from .conftest import REVERSIBLE_TOKEN
+
+
+def response_payload(kind, text=REVERSIBLE_TOKEN, *, tools=False):
+    payload = json.loads(
+        (Path(__file__).parent / f"fixtures/openai-{kind}-response.json").read_text()
+    )
+    arguments = json.dumps({"person": text, "count": 1}, separators=(",", ":"))
+    if kind == "chat":
+        choice = payload["choices"][0]
+        choice["message"]["content"] = text
+        if tools:
+            choice["finish_reason"] = "tool_calls"
+            choice["message"]["tool_calls"] = [
+                {
+                    "id": "call-example",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": arguments},
+                }
+            ]
+    else:
+        payload["output"][0]["content"][0]["text"] = text
+        if tools:
+            payload["output"].append(
+                {
+                    "id": "fc-example",
+                    "type": "function_call",
+                    "call_id": "call-example",
+                    "name": "lookup",
+                    "arguments": arguments,
+                    "status": "completed",
+                }
+            )
+    return payload
+
+
+def stream_events(kind, text=REVERSIBLE_TOKEN, *, tools=False):
+    payload = response_payload(kind, text, tools=tools)
+    if kind == "chat":
+        envelope = {key: value for key, value in payload.items() if key not in {"choices", "usage"}}
+        envelope["object"] = "chat.completion.chunk"
+        envelope["obfuscation"] = "aB3dE4"
+
+        def chunk(delta, finish=None):
+            return {**envelope, "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+
+        events = [chunk({"role": "assistant", "content": ""})]
+        events += [chunk({"content": part}) for part in [text[:12], text[12:]]]
+        if tools:
+            tool = payload["choices"][0]["message"]["tool_calls"][0]
+            arguments = tool["function"]["arguments"]
+            events += [
+                chunk(
+                    {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                **tool,
+                                "function": {"name": "lookup", "arguments": arguments[:16]},
+                            }
+                        ]
+                    }
+                ),
+                chunk({"tool_calls": [{"index": 0, "function": {"arguments": arguments[16:]}}]}),
+            ]
+        return [
+            *events,
+            chunk({}, "tool_calls" if tools else "stop"),
+            {**envelope, "choices": [], "usage": payload["usage"]},
+            "[DONE]",
+        ]
+
+    message = payload["output"][0]
+    part = message["content"][0]
+    coordinates = {"item_id": message["id"], "output_index": 0, "content_index": 0}
+    events = [
+        {
+            "type": "response.created",
+            "response": {**payload, "status": "in_progress", "output": [], "usage": None},
+        },
+        {
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {**message, "status": "in_progress", "content": []},
+        },
+        {"type": "response.content_part.added", **coordinates, "part": {**part, "text": ""}},
+        *[
+            {"type": "response.output_text.delta", **coordinates, "delta": fragment}
+            for fragment in [text[:12], text[12:]]
+        ],
+        {"type": "response.output_text.done", **coordinates, "text": text},
+        {"type": "response.content_part.done", **coordinates, "part": part},
+        {"type": "response.output_item.done", "output_index": 0, "item": message},
+    ]
+    if tools:
+        tool = payload["output"][1]
+        arguments = tool["arguments"]
+        coordinates = {"item_id": tool["id"], "output_index": 1}
+        events += [
+            {
+                "type": "response.output_item.added",
+                "output_index": 1,
+                "item": {**tool, "status": "in_progress", "arguments": ""},
+            },
+            *[
+                {"type": "response.function_call_arguments.delta", **coordinates, "delta": fragment}
+                for fragment in [arguments[:16], arguments[16:]]
+            ],
+            {
+                "type": "response.function_call_arguments.done",
+                **coordinates,
+                "arguments": arguments,
+            },
+            {"type": "response.output_item.done", "output_index": 1, "item": tool},
+        ]
+    events.append({"type": "response.completed", "response": payload})
+    return [
+        deepcopy(event)
+        | {"sequence_number": index}
+        | (
+            {"obfuscation": "aB3dE4"}
+            if event["type"]
+            in ("response.output_text.delta", "response.function_call_arguments.delta")
+            else {}
+        )
+        for index, event in enumerate(events)
+    ]
+
+
+def event_bytes(kind, event):
+    if isinstance(event, str):
+        return f"data: {event}\n\n".encode()
+    prefix = f"event: {event['type']}\n" if kind == "responses" else ""
+    return (prefix + f"data: {json.dumps(event, ensure_ascii=False)}\n\n").encode()
