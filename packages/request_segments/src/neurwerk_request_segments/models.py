@@ -257,7 +257,8 @@ class EngineChatRequest(RequestModel):
     endpoint = "chat"
     location = "request"
     model: str = Field(min_length=1, max_length=256, pattern=r"^[A-Za-z0-9_./:-]+$")
-    messages: list[EngineMessage] = Field(min_length=1, max_length=256)
+    # Message history is bounded by body admission and the Engine's configured leaf limit.
+    messages: list[EngineMessage] = Field(min_length=1)
     temperature: float | None = Field(default=None, ge=0, le=2)
     top_p: float | None = Field(default=None, ge=0, le=1)
     max_tokens: int | None = Field(default=None, ge=1)
@@ -388,9 +389,7 @@ class ResponseStreamOptions(RequestModel):
 type EngineResponseInputItem = (
     EngineResponseMessage | EngineResponseFunctionCall | EngineResponseFunctionOutput
 )
-type EngineResponseInput = (
-    str | Annotated[list[EngineResponseInputItem], Field(min_length=1, max_length=256)]
-)
+type EngineResponseInput = str | Annotated[list[EngineResponseInputItem], Field(min_length=1)]
 
 
 class EngineResponsesRequest(RequestModel):

@@ -109,7 +109,7 @@ class AnthropicRequest(NativeModel):
     _controls: CompatibilitySettings | None = PrivateAttr(default=None)
     model: NativeModelId
     max_tokens: int = Field(ge=1)
-    messages: list[AnthropicMessage] = Field(min_length=1, max_length=256)
+    messages: list[AnthropicMessage] = Field(min_length=1)
     system: str | Annotated[list[AnthropicText], Field(max_length=64)] | None = None
     tools: list[AnthropicTool] | None = Field(default=None, max_length=128)
     tool_choice: AnthropicToolChoice | None = None
@@ -244,7 +244,7 @@ class GoogleRequest(NativeModel):
 
     _controls: CompatibilitySettings | None = PrivateAttr(default=None)
     model: NativeModelId | None = None
-    contents: list[GoogleContent] = Field(min_length=1, max_length=256)
+    contents: list[GoogleContent] = Field(min_length=1)
     systemInstruction: GoogleSystem | None = None
     tools: list[GoogleTools] | None = Field(default=None, max_length=32)
     toolConfig: GoogleToolConfig | None = None
