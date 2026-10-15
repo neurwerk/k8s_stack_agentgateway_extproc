@@ -1,68 +1,36 @@
-# AgentGateway External Processor
+# neurwerk.base - AgentGateway External Processor
 
-extProc adapts approved API and proxy traffic for PII Engine, validates provider
-responses and restores protected text within the current request.
+AgentGateway External Processor adapts gateway requests and responses for the PII Engine in neurwerk.base. See the [neurwerk.base website](https://base.neurwerk.com/) for more information.
 
-## Request contract
+| Repository | Description |
+| --- | --- |
+| [Base chart](https://github.com/neurwerk/k8s_stack_base) | Shared platform charts and release packages that form the foundation of the stack. |
+| [Studio](https://github.com/neurwerk/k8s_stack_studio) | Web dashboard and API for operating AI platform services. |
+| [Tooling](https://github.com/neurwerk/k8s_stack_tooling) | One container image plus separate CLI tools for setup and operations. |
+| [PII Engine](https://github.com/neurwerk/k8s_stack_pii_engine) | Service that uses Presidio to evaluate PII and apply safety policies. |
+| [AgentGateway External Processor](https://github.com/neurwerk/k8s_stack_agentgateway_extproc) | Adapter that processes gateway requests and responses with the PII Engine (**this repo**). |
+| [Keycloak API Key Bridge](https://github.com/neurwerk/k8s_stack_keycloak_api_key_bridge) | Separate service that issues and validates API keys using Keycloak permissions. |
+| [Keycloak Theme](https://github.com/neurwerk/k8s_stack_keycloak_theme) | Customized Keycloak login pages and emails. |
+|  |  |
+| [Example client chart](https://github.com/neurwerk/k8s_stack_client_example_com) | Reference client configuration and Flux deployment setup to adapt for a new client. |
+|  |  |
+| [Dify Add-on](https://github.com/neurwerk/k8s_stack_addon_dify) | Optional Dify package with API and web customizations, including single-workspace enforcement. |
 
-The clean cutover requires the version-5 `neurwerk.destination_policy` envelope.
-See [`models/admission.py`](src/agentgateway_extproc/models/admission.py) and the
-[wire fixture](tests/fixtures/admission-v5.json). Unwrapped metadata is rejected.
-Send identical admission on every callback; only an empty final response-body
-callback may omit all metadata after accepted response headers.
+## Documentation
 
-API model paths require `/bindings/<verified binding_id>` before the provider
-operation. Proxy paths retain their exact provider path. MCP uses
-`/bindings/mcp-<server-id>/mcp` and stateless exchanges.
+See [Repository documentation](docs/README.md).
 
-Supported model profiles are OpenAI Chat/Responses, Anthropic Messages and Google
-generateContent. Requests use JSON and complete buffered bodies. Responses use
-JSON/SSE content validation with explicit completion; EOF alone is not completion.
-See [`profiles.py`](src/agentgateway_extproc/lib/pipeline/profiles.py) for paths and
-[`openai_response.py`](src/agentgateway_extproc/models/openai_response.py) for OpenAI shapes.
+## Contributing and support
 
-OpenAI envelopes preserve new numeric, boolean and null metadata. Reviewed usage
-namespaces accept bounded numeric breakdowns; reasoning settings and access programs
-accept bounded control labels. Content carriers, reflected instructions/tools and
-stream lifecycles stay strict. New text, objects or event types need classification;
-AgentGateway owns provider compatibility and accounting.
+- **Contributions:** Read [CONTRIBUTING.md](.github/CONTRIBUTING.md) before proposing a change.
+- **Bug reports and feature requests:** Use [GitHub Issues](https://github.com/neurwerk/k8s_stack_agentgateway_extproc/issues) for reproducible bugs and clearly scoped feature requests.
 
-Opaque reasoning continuation, stored prior Responses, background execution,
-website adapters and unqualified transports are rejected.
+## Security
 
-## Identity and dispatch
-
-- Employee identity and permissions come from trusted gateway admission.
-- Personal provider credentials remain outside retained state and Engine requests.
-  Invalid personal credentials never trigger company fallback.
-- Company mode requires its company-use grant. The gateway injects the company
-  credential after processing; credential-free local targets receive none.
-- A company request may reroute before dispatch only to an explicitly approved
-  local target whose invocation grant is also present. Personal credentials cannot.
-- `neurwerk.request_context` records the selected model and actual dispatch target.
-  Credentials, cookies and restoration maps are excluded. Raw request capture is removed.
-- PII and content tracing are independent. Restoration is request-scoped; usage
-  completeness remains unknown until the gateway has sufficient provider evidence.
-
-Rejections log their request ID, binding, model, HTTP status and fixed reason.
-Plain JSON provider HTTP 400 bodies are inspected up to 8 KiB for recognized
-model/parameter errors; raw bodies and headers never enter logs or client errors.
-Other provider errors are rejected at headers. Search OpenSearch by the request ID
-returned in the client error; stream failures carry the same ID in processor logs.
-The standalone `lib.rejection_retention` command remains for historical debug-data cleanup.
-
-## Development
-
-```sh
-uv sync --frozen --extra dev
-make check
-```
-
-Deployment belongs to the [Base chart](https://github.com/neurwerk/k8s_stack_base/tree/main/charts/agentgateway).
-Read [CONTRIBUTING.md](.github/CONTRIBUTING.md) for contribution workflow and
-[SECURITY.md](SECURITY.md) for private vulnerability reports.
+Report vulnerabilities privately by following the instructions in [SECURITY.md](SECURITY.md).
 
 ## Licensing
 
-Project-owned content uses the [MIT License](LICENSE). See
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for bundled third-party licenses.
+Project-owned content is licensed under the [MIT License](LICENSE). Third-party content retains its upstream license.
+
+See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for bundled third-party licenses.
