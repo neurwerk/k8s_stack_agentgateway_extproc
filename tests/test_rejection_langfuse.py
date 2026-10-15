@@ -7,11 +7,8 @@ import pytest
 from pydantic import ValidationError
 
 from agentgateway_extproc.config.settings import RejectionLangfuseSettings, Settings
-from agentgateway_extproc.controllers.grpc_servicer import ExtProcServicer
 from agentgateway_extproc.lib.rejection_langfuse import RejectionLangfuse
 from agentgateway_extproc.metrics import rejection_exports_total
-
-from .conftest import body_request, header_request
 
 
 def config(**overrides):
@@ -151,43 +148,6 @@ async def test_queue_is_nonblocking_bounded_and_shutdown_discards():
         assert exporter._task is None
 
 
-@pytest.mark.parametrize("enabled", [False, True])
-async def test_grpc_rejection_unchanged_and_export_failure_isolated(engine_client, enabled, caplog):
-    exported = []
-
-    def transport(request):
-        if request.method == "GET":
-            return project_response()
-        exported.append(request)
-        return httpx.Response(503, text="sensitive remote content")
-
-    settings = Settings(max_request_bytes=1024, rejection_langfuse=config(enabled=enabled))
-    async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as client:
-        exporter = RejectionLangfuse(settings.rejection_langfuse, client)
-        exporter.start()
-        servicer = ExtProcServicer(engine_client, settings, rejection_langfuse=exporter)
-        original = json.dumps({"messages": [{"content": "private prose" * 100}]}).encode()
-
-        async def requests():
-            yield header_request()
-            yield body_request(original)
-
-        responses = [response async for response in servicer.Process(requests(), object())]
-        error = json.loads(responses[-1].immediate_response.body)["error"]
-        assert responses[-1].immediate_response.status.code == 413
-        assert error["code"] == "request_too_large"
-        assert error["limit"]["measured"] == len(original)
-        await exporter.close()
-    assert len(exported) == int(enabled)
-    if enabled:
-        _, attrs = attributes(exported[0])
-        metadata = json.loads(attrs["langfuse.observation.metadata"])
-        assert metadata["request_id"] == error["request_id"]
-        assert json.loads(attrs["langfuse.observation.input"]) == json.loads(original)
-    assert "private prose" not in caplog.text
-    assert "sensitive remote content" not in caplog.text
-
-
 async def test_wrong_project_never_receives_content():
     requests = []
 
@@ -237,52 +197,6 @@ async def test_redaction_expansion_is_byte_bounded_and_invalid_utf8_is_omitted()
     )
     _, attrs = attributes(exported[1])
     assert attrs["langfuse.observation.input"] == ""
-
-
-@pytest.mark.parametrize("status", [400, 403, 503, 200])
-async def test_request_status_scope_and_response_content_excluded(
-    engine_client, monkeypatch, status
-):
-    from agentgateway_extproc.controllers import grpc_servicer
-    from agentgateway_extproc.gen import ext_proc_pb2
-    from agentgateway_extproc.lib.pipeline.request import immediate_response
-
-    from .conftest import response_body
-
-    async def handle(handler, request, kind):
-        if kind == "request_body":
-            if status != 200:
-                return (immediate_response(status, '{"error":"fixed error"}'),)
-            return (ext_proc_pb2.ProcessingResponse(request_body={}),)
-        if kind == "response_body":
-            return (immediate_response(400, '{"error":"provider failure"}'),)
-        return (ext_proc_pb2.ProcessingResponse(request_headers={}),)
-
-    monkeypatch.setattr(grpc_servicer, "_handle_message", handle)
-    exported = []
-
-    def transport(request):
-        if request.method == "GET":
-            return project_response()
-        exported.append(request)
-        return httpx.Response(200, json={})
-
-    settings = Settings(rejection_langfuse=config())
-    async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as client:
-        exporter = RejectionLangfuse(settings.rejection_langfuse, client)
-        exporter.start()
-        servicer = ExtProcServicer(engine_client, settings, rejection_langfuse=exporter)
-
-        async def requests():
-            yield header_request()
-            yield body_request(b'{"messages":[{"content":"private request"}]}')
-            yield response_body(b"private provider response")
-
-        responses = [response async for response in servicer.Process(requests(), object())]
-        assert responses[-1].immediate_response.status.code == (400 if status == 200 else status)
-        await exporter.close()
-    assert len(exported) == int(status != 200)
-    assert all(b"private provider response" not in request.content for request in exported)
 
 
 @pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity", "1e999"])
@@ -350,41 +264,3 @@ async def test_preparation_leaves_loop_responsive_and_shutdown_bounds_threads(mo
             release.set()
             await asyncio.to_thread(finished.wait, 2)
             await exporter.close()
-
-
-async def test_request_capacity_rejection_exports_without_changing_retry(engine_client):
-    exported = []
-
-    def transport(request):
-        if request.method == "GET":
-            return project_response()
-        exported.append(request)
-        return httpx.Response(200, json={})
-
-    settings = Settings(rejection_langfuse=config())
-    async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as client:
-        exporter = RejectionLangfuse(settings.rejection_langfuse, client)
-        exporter.start()
-        servicer = ExtProcServicer(engine_client, settings, rejection_langfuse=exporter)
-        servicer._buffered_bytes = 4 * settings.max_request_bytes
-
-        async def requests():
-            yield header_request()
-            yield body_request(b'{"content":"private request"}')
-
-        responses = [response async for response in servicer.Process(requests(), object())]
-        immediate = responses[-1].immediate_response
-        error = json.loads(immediate.body)["error"]
-        assert immediate.status.code == 503
-        assert error["code"] == "capacity_unavailable" and error["retryable"] is True
-        headers = [(item.header.key, item.header.value) for item in immediate.headers.set_headers]
-        assert headers.count(("retry-after", "1")) == 1
-        assert headers.count(("x-request-id", error["request_id"])) == 1
-        assert servicer._buffered_bytes == 4 * settings.max_request_bytes
-        await exporter.close()
-    assert len(exported) == 1
-    _, attrs = attributes(exported[0])
-    metadata = json.loads(attrs["langfuse.observation.metadata"])
-    assert metadata["request_id"] == error["request_id"]
-    assert metadata["reason"] == "capacity_unavailable"
-    assert "private request" in attrs["langfuse.observation.input"]

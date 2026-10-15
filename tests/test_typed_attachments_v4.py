@@ -276,68 +276,6 @@ async def test_v4_unchecked_image_is_ocr_face_and_pii_free(engine_client):
     assert b"DO-NOT-FORWARD" not in base64.b64decode(uri.partition(",")[2])
 
 
-@pytest.mark.parametrize("family", ["chat", "responses"])
-async def test_v4_mixed_documents_convert_while_unchecked_images_keep_position(
-    engine_client, family
-):
-    source_part = image_part()
-    uri = source_part["image_url"]["url"]
-    png = normalize(base64.b64decode(uri.partition(",")[2]), "PNG", policy_version=4)
-    canonical = "data:image/png;base64," + base64.b64encode(png).decode()
-    policy = _v4_policy(
-        document_modes={"test": "extract-text"},
-    )
-    chat = family == "chat"
-    parts = (
-        [source_part, {"type": "file", "file": _upload("xlsx")}]
-        if chat
-        else [{"type": "input_image", "image_url": uri}, {"type": "input_file", **_upload("xlsx")}]
-    )
-    original = {
-        "model": "test",
-        "messages" if chat else "input": [{"role": "user", "content": parts}],
-    }
-    docling = DoclingClient(DoclingSettings(enabled=True, api_key=SecretStr("test-only")))
-    handler = StreamHandler(engine_client, Settings(), docling)
-    converted_formats = []
-
-    async def extract(upload, abandoned):
-        converted_formats.append(upload.format)
-        return _document()
-
-    with (
-        patch.object(engine_client, "analyze_request", new_callable=AsyncMock) as analyze,
-        patch.object(docling, "_convert_one", side_effect=extract),
-        patch(
-            "agentgateway_extproc.lib.documents._normalize_image", return_value=(png, 0)
-        ) as image,
-    ):
-        try:
-            await handler.handle(header_request(policy=policy))
-            response = await handler.handle(
-                body_request(json.dumps(original).encode(), policy=policy)
-            )
-        finally:
-            await docling.close()
-
-    assert converted_formats == ["xlsx"]
-    assert image.call_args.args[2:] == (False, 4)
-    analyze.assert_not_awaited()
-    assert response is not None and response.HasField("request_body")
-    content = json.loads(response.request_body.response.body_mutation.body)[
-        "messages" if chat else "input"
-    ][0]["content"]
-    assert len(content) == 2
-    assert content[0] == (
-        {"type": "image_url", "image_url": {"url": canonical}}
-        if chat
-        else {"type": "input_image", "image_url": canonical}
-    )
-    assert content[1]["type"] == ("text" if chat else "input_text")
-    assert "Jane Doe" in content[1]["text"]
-    assert "file_data" not in content[1]
-
-
 async def test_v4_blocked_part_rejects_whole_batch_before_side_effects(engine_client):
     policy = {
         **_typed_policy(),

@@ -27,7 +27,6 @@ from agentgateway_extproc.lib.rejection_capture import RejectionCapture, Rejecti
 from agentgateway_extproc.lib.rejection_langfuse import RejectionLangfuse
 from agentgateway_extproc.lib.rejections import annotate_rejection, log_limit_rejection
 from agentgateway_extproc.metrics import active_streams, errors_total, response_failures_total
-from agentgateway_extproc.models.admission import is_admission_request
 from agentgateway_extproc.models.exceptions import (
     ContextForgeAccountRequiredError,
     EnginePolicyError,
@@ -109,26 +108,6 @@ class ExtProcServicer(ext_proc_pb2_grpc.ExternalProcessorServicer):
         self._buffered_bytes += size
         return size
 
-    def _capture_input(
-        self, request: ext_proc_pb2.ProcessingRequest, handler: StreamHandler
-    ) -> tuple[bytes, int, bool]:
-        if handler.admission is not None or is_admission_request(request):
-            return b"", 0, False
-        if not request.HasField("request_body"):
-            return b"", 0, False
-        maximum = max(
-            self._capture.config.max_file_bytes if self._capture.config.enabled else 0,
-            self._settings.rejection_langfuse.max_capture_bytes
-            if self._settings.rejection_langfuse.enabled
-            else 0,
-        )
-        if maximum == 0:
-            return b"", 0, False
-        inbound = request.request_body.body
-        original = inbound[:maximum]
-        complete = request.request_body.end_of_stream and len(original) == len(inbound)
-        return original, len(inbound), complete
-
     async def _process(
         self, request_iterator: AsyncIterator[ext_proc_pb2.ProcessingRequest], context: object
     ) -> AsyncGenerator[ext_proc_pb2.ProcessingResponse, None]:
@@ -144,7 +123,6 @@ class ExtProcServicer(ext_proc_pb2_grpc.ExternalProcessorServicer):
         try:
             async for request in request_iterator:
                 kind = request.WhichOneof("request") or "unknown"
-                original_body, observed_bytes, body_complete = self._capture_input(request, handler)
                 size = self._reserve_body(request)
                 if size is None:
                     yield self._body_overloaded(

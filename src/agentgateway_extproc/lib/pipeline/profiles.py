@@ -37,6 +37,12 @@ _RETAINED_HEADERS = frozenset(
         "x-session-id",
         "x-conversation-id",
         "anthropic-version",
+        "accept",
+        "mcp-protocol-version",
+        "mcp-session-id",
+        "mcp-method",
+        "mcp-name",
+        "last-event-id",
     }
 )
 
@@ -72,7 +78,9 @@ def operation_path(path: str, admission: AdmissionEnvelope) -> str:
     """Normalize only the verified API mount for validation, never an upstream mutation."""
     context = admission.request_context
     prefix = f"/bindings/{context.binding_id}"
-    if context.entry_mode == "api" and path.startswith(prefix + "/"):
+    if context.entry_mode == "api":
+        if not path.startswith(prefix + "/"):
+            raise GatewayPolicyError("invalid_request")
         return path[len(prefix) :]
     return path
 
@@ -86,11 +94,11 @@ def request_headers(  # noqa: C901
     request: ext_proc_pb2.ProcessingRequest, admission: AdmissionEnvelope
 ) -> tuple[dict[str, str], list[str]]:
     """Validate transport while keeping credential values out of retained state."""
-    profile = model_profile(admission)
     items = request.request_headers.headers.headers
     names = [item.key.lower() for item in items]
-    if any(item.raw_value and item.value for item in items) or any(
-        names.count(name) > 1 for name in _RETAINED_HEADERS | REQUEST_HEADERS
+    if any(item.raw_value and item.value for item in items) or (
+        admission.request_context.destination_kind == "model"
+        and any(names.count(name) > 1 for name in _RETAINED_HEADERS | REQUEST_HEADERS)
     ):
         raise GatewayPolicyError("invalid_request")
     headers: dict[str, str] = {
@@ -98,6 +106,13 @@ def request_headers(  # noqa: C901
         for item in items
         if item.key.lower() in _RETAINED_HEADERS
     }
+    if admission.request_context.destination_kind == "mcp":
+        admission.resolve_mcp()
+        # The MCP validator rejects mirrored parameter headers when inspection is
+        # enabled. Retain their presence, never their uninspected values.
+        headers.update({name: "" for name in names if name.startswith("mcp-param-")})
+        return headers, [name for name in names if name in REQUEST_HEADERS]
+    profile = model_profile(admission)
     path = operation_path(headers.get(":path", ""), admission)
     if (
         headers.get(":method") != "POST"

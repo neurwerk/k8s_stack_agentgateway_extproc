@@ -166,9 +166,12 @@ class _Item:
 class OpenAIStreamValidator:
     """Track bounded v5 choices/items and require a real protocol terminal at EOF."""
 
-    def __init__(self, kind: str) -> None:
+    def __init__(self, kind: str, *, openrouter: bool = False) -> None:
         """Keep only stream-local identities, hashes and incomplete tool arguments."""
         self.kind = kind
+        self.openrouter = openrouter
+        self._router_usage_seen = False
+        self._finish_reasons: dict[int, str] = {}
         self.terminal = False
         self.identity: tuple[str, str, int] | None = None
         self.choices: set[int] = set()
@@ -225,6 +228,8 @@ class OpenAIStreamValidator:
             raise InvalidReversalError("Chat response identity changed")
         self.identity = identity
         _unique([choice.index for choice in chunk.choices])
+        if self._router_usage_echo(chunk):
+            return
         if not chunk.choices and (
             chunk.usage is None or not self.choices or self.choices != self.finished_choices
         ):
@@ -244,6 +249,35 @@ class OpenAIStreamValidator:
                 for call in calls:
                     call.arguments.finish()
                 self.finished_choices.add(choice.index)
+                self._finish_reasons[choice.index] = choice.finish_reason
+        self._record_router_usage(chunk)
+
+    def _router_usage_echo(self, chunk: ChatChunk) -> bool:
+        # OpenRouter's final usage frame repeats finish reasons with no content.
+        if not self.openrouter or not any(c.index in self.finished_choices for c in chunk.choices):
+            return False
+        if (
+            self._router_usage_seen
+            or chunk.usage is None
+            or self.choices != self.finished_choices
+            or {c.index for c in chunk.choices} != self.finished_choices
+            or any(
+                c.finish_reason != self._finish_reasons[c.index]
+                or c.delta.content
+                or c.delta.refusal
+                or c.delta.tool_calls
+                for c in chunk.choices
+            )
+        ):
+            raise InvalidReversalError("invalid OpenRouter usage completion")
+        self._router_usage_seen = True
+        return True
+
+    def _record_router_usage(self, chunk: ChatChunk) -> None:
+        if self.openrouter and chunk.usage is not None:
+            if self._router_usage_seen or self.choices != self.finished_choices:
+                raise InvalidReversalError("invalid OpenRouter usage completion")
+            self._router_usage_seen = True
 
     def _chat_tool(self, choice_index: int, tool: ToolDelta) -> None:
         key = (choice_index, tool.index)

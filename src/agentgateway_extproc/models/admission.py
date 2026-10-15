@@ -12,6 +12,7 @@ from agentgateway_extproc.gen import ext_proc_pb2
 from agentgateway_extproc.models.destination import (
     DESTINATION_POLICY_NAMESPACE,
     DestinationPolicy,
+    McpDestinationPolicy,
     ModelDestinationPolicy,
     ModelId,
     _validated_principal,
@@ -31,6 +32,7 @@ type ProfileId = Literal[
     "google-generate-content-v1",
     "chatgpt-web-v1",
     "gamma-web-v1",
+    "mcp-streamable-http-v1",
 ]
 
 
@@ -110,6 +112,13 @@ class ModelBinding(AdmissionModel):
     upstream_model: ModelId
     required_permissions: tuple[Permission, ...] = Field(min_length=2, max_length=64)
     content_tracing_enabled: bool
+    allowed_reroutes: tuple[ModelId, ...] = Field(default=(), max_length=32)
+
+    @field_validator("allowed_reroutes", mode="before")
+    @classmethod
+    def validate_reroutes(cls, value: object) -> object:
+        """Freeze the explicit local routing allowlist."""
+        return _permission_tuple(value)
 
     @field_validator("required_permissions", mode="before")
     @classmethod
@@ -124,16 +133,43 @@ class PiiPolicy(AdmissionModel):
     enabled: bool
 
 
+class LocalDispatchTarget(AdmissionModel):
+    """An explicitly approved, credential-free local execution destination."""
+
+    binding_id: Identifier
+    upstream_model: ModelId
+    required_permissions: tuple[Permission, ...] = Field(min_length=2, max_length=64)
+    content_tracing_enabled: bool
+
+    @field_validator("required_permissions", mode="before")
+    @classmethod
+    def validate_permissions(cls, value: object) -> object:
+        """Freeze the exact target's invocation grant."""
+        return _permission_tuple(value)
+
+
 class RequestContext(AdmissionContext):
     """Freeze one authorized selection after body validation."""
 
     destination_id: ModelId
     requested_model: ModelId
     resolved_model: ModelId
+    dispatch_binding_id: Identifier
+    dispatch_destination_id: ModelId
     pii_policy: PiiPolicy
     content_tracing_enabled: bool
     billing_classification: Literal["company_api", "personal_api", "subscription", "unknown"]
     usage_completeness: Literal["known", "partial", "unknown"] = "unknown"
+
+
+class McpRequestContext(AdmissionContext):
+    """Resolved MCP identity and policy without invented model usage."""
+
+    destination_id: str
+    pii_policy: PiiPolicy
+    content_tracing_enabled: bool
+    billing_classification: Literal["unknown"] = "unknown"
+    usage_completeness: Literal["unknown"] = "unknown"
 
 
 class AdmissionEnvelope(AdmissionModel):
@@ -143,11 +179,14 @@ class AdmissionEnvelope(AdmissionModel):
     request_context: AdmissionContext
     destination_policy: Annotated[DestinationPolicy, Field(discriminator="destination_kind")]
     model_bindings: FrozenMap[ModelId, ModelBinding] = Field(max_length=256)
+    reroute_targets: FrozenMap[ModelId, LocalDispatchTarget] = Field(
+        default_factory=dict, validate_default=True, max_length=32
+    )
 
     @field_validator("destination_policy", mode="before")
     @classmethod
     def validate_inner_policy(cls, value: object) -> object:
-        """Reuse legacy validation, including protobuf number normalization."""
+        """Validate the nested policy, including protobuf number normalization."""
         if isinstance(value, dict):
             return destination_policy_from_payload(value)
         return value
@@ -169,7 +208,7 @@ class AdmissionEnvelope(AdmissionModel):
                 raise ValueError("admission credential identity disagrees")  # noqa: TRY003
             if self.model_bindings.keys() != policy.models.keys():
                 raise ValueError("model bindings must cover the policy exactly")  # noqa: TRY003
-        elif self.model_bindings:
+        elif self.model_bindings or self.reroute_targets:
             raise ValueError("MCP admission cannot contain model bindings")  # noqa: TRY003
         aliases: set[str] = set()
         for model, binding in self.model_bindings.items():
@@ -179,7 +218,17 @@ class AdmissionEnvelope(AdmissionModel):
             aliases.add(alias)
             if not {"llm:invoke", f"model:{model}:invoke"} <= set(binding.required_permissions):
                 raise ValueError("model binding omits required invocation permissions")  # noqa: TRY003
+        self._validate_reroute_targets()
         return self
+
+    def _validate_reroute_targets(self) -> None:
+        """Require complete target declarations and explicit local invocation grants."""
+        for binding in self.model_bindings.values():
+            if not set(binding.allowed_reroutes) <= self.reroute_targets.keys():
+                raise ValueError("model reroute target is missing")  # noqa: TRY003
+        for model, target in self.reroute_targets.items():
+            if not {"llm:invoke", f"model:{model}:invoke"} <= set(target.required_permissions):
+                raise ValueError("reroute target omits required invocation permissions")  # noqa: TRY003
 
     def resolve_model(self, requested_model: str) -> RequestContext:
         """Make the sole model selection used by policy, authorization and final dispatch."""
@@ -208,6 +257,8 @@ class AdmissionEnvelope(AdmissionModel):
             destination_id=model,
             requested_model=requested_model,
             resolved_model=binding.upstream_model,
+            dispatch_binding_id=context.binding_id,
+            dispatch_destination_id=model,
             pii_policy=PiiPolicy(enabled=policy.models[model]),
             content_tracing_enabled=binding.content_tracing_enabled,
             billing_classification=(
@@ -215,11 +266,56 @@ class AdmissionEnvelope(AdmissionModel):
             ),
         )
 
+    def resolve_reroute(self, context: RequestContext, target_id: str | None) -> RequestContext:
+        """Authorize one pre-dispatch local transition; personal credentials never move."""
+        if (
+            context.provider_credential_source != "company"
+            or target_id is None
+            or target_id not in self.model_bindings[context.destination_id].allowed_reroutes
+            or target_id not in self.reroute_targets
+        ):
+            raise GatewayPolicyError("unsupported_reroute")
+        target = self.reroute_targets[target_id]
+        if not set(target.required_permissions) <= set(context.permissions):
+            raise GatewayPolicyError("permission_denied")
+        return context.model_copy(
+            update={
+                "resolved_model": target.upstream_model,
+                "dispatch_binding_id": target.binding_id,
+                "dispatch_destination_id": target_id,
+                "content_tracing_enabled": context.content_tracing_enabled
+                and target.content_tracing_enabled,
+                "billing_classification": "unknown",
+            }
+        )
+
+    def resolve_mcp(self) -> McpRequestContext:
+        """Require the current stateless MCP profile and exact destination permission."""
+        context, policy = self.request_context, self.destination_policy
+        if (
+            not isinstance(policy, McpDestinationPolicy)
+            or context.entry_mode != "api"
+            or context.protocol_profile != "mcp-streamable-http-v1"
+            or context.operation_id != "exchange"
+            or context.binding_id != f"mcp-{policy.destination_id}"
+            or context.provider_credential_source != "none"
+            or context.provider_id is not None
+        ):
+            raise GatewayPolicyError("unsupported_feature")
+        if not {"llm:invoke", f"mcp:{policy.destination_id}:invoke"} <= set(context.permissions):
+            raise GatewayPolicyError("permission_denied")
+        return McpRequestContext(
+            **context.model_dump(),
+            destination_id=policy.destination_id,
+            pii_policy=PiiPolicy(enabled=policy.pii_enabled),
+            content_tracing_enabled=policy.content_tracing_enabled,
+        )
+
 
 def metadata_from_request(
     request: ext_proc_pb2.ProcessingRequest,
-) -> DestinationPolicy | AdmissionEnvelope:
-    """Parse the new envelope independently from the unchanged legacy policy schemas."""
+) -> AdmissionEnvelope:
+    """Accept only the current gateway admission envelope."""
     try:
         payload = cast(
             dict[str, object],
@@ -228,9 +324,9 @@ def metadata_from_request(
                 preserving_proto_field_name=True,
             ),
         )
-        if payload.get("contract_version") == 5:
-            return AdmissionEnvelope.model_validate({**payload, "contract_version": 5})
-        return destination_policy_from_payload(payload)
+        return AdmissionEnvelope.model_validate(
+            {**payload, "contract_version": 5} if payload.get("contract_version") == 5 else payload
+        )
     except TrustedMetadataError:
         raise
     except (KeyError, TypeError, ValueError) as exc:
@@ -244,22 +340,4 @@ def admission_snapshot(request: ext_proc_pb2.ProcessingRequest) -> str:
         sort_keys=True,
         separators=(",", ":"),
         allow_nan=False,
-    )
-
-
-def is_admission_request(request: ext_proc_pb2.ProcessingRequest) -> bool:
-    """Suppress raw capture even for malformed or changed v5 metadata."""
-    if DESTINATION_POLICY_NAMESPACE not in request.metadata_context.filter_metadata:
-        return False
-    fields = request.metadata_context.filter_metadata[DESTINATION_POLICY_NAMESPACE].fields
-    return bool(
-        "request_context" in fields
-        or "model_bindings" in fields
-        or (
-            "contract_version" in fields
-            and (
-                fields["contract_version"].number_value == 5
-                or fields["contract_version"].string_value == "5"
-            )
-        )
     )

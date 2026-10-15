@@ -411,6 +411,14 @@ class StreamHandler:
             response.dynamic_metadata.update(
                 {"neurwerk.request_context": self.request_context.model_dump(mode="json")}
             )
+        elif (
+            self.admission is not None
+            and self.admission.request_context.destination_kind == "mcp"
+            and response.HasField("request_body")
+        ):
+            response.dynamic_metadata.update(
+                {"neurwerk.request_context": self.admission.resolve_mcp().model_dump(mode="json")}
+            )
         return response
 
     def _response_headers(  # noqa: C901
@@ -443,7 +451,11 @@ class StreamHandler:
             self.response_status = int(headers.get(":status", "200"))
         except ValueError as exc:
             raise ValueError("invalid response status") from exc
-        if self.admission is not None and 400 <= self.response_status <= 599:
+        if (
+            self.admission is not None
+            and self.response_api_kind != "mcp"
+            and 400 <= self.response_status <= 599
+        ):
             # Do not consume provider error bodies or echo challenges/cookies with credentials.
             return immediate_response(
                 self.response_status,
@@ -453,16 +465,20 @@ class StreamHandler:
             self.notice_messages.clear()
             self.response_notice_allowed = False
         media_type = self.response_content_type.partition(";")[0].strip().casefold()
-        if self.admission is not None and (
-            not 200 <= self.response_status < 300
-            or media_type not in {"application/json", "text/event-stream"}
-            or (
-                self.expected_response_format is not None
-                and media_type
-                != (
-                    "text/event-stream"
-                    if self.expected_response_format == "sse"
-                    else "application/json"
+        if (
+            self.admission is not None
+            and self.response_api_kind != "mcp"
+            and (
+                not 200 <= self.response_status < 300
+                or media_type not in {"application/json", "text/event-stream"}
+                or (
+                    self.expected_response_format is not None
+                    and media_type
+                    != (
+                        "text/event-stream"
+                        if self.expected_response_format == "sse"
+                        else "application/json"
+                    )
                 )
             )
         ):

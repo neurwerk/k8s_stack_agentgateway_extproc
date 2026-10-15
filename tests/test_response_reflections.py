@@ -122,7 +122,12 @@ async def inspect_request(client, admission, payload, *, stream):
     handler = StreamHandler(client)
     await handler.handle(
         header_request(
-            headers(**{":path": "/v1/responses", "x-session-id": "example-conversation"}),
+            headers(
+                **{
+                    ":path": "/bindings/openai-api/v1/responses",
+                    "x-session-id": "example-conversation",
+                }
+            ),
             policy=admission,
         )
     )

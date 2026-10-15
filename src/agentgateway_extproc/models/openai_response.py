@@ -29,6 +29,7 @@ class PromptTokens(ResponseModel):
     cache_write_tokens: Count | None = None
     image_tokens: Count | None = None
     text_tokens: Count | None = None
+    video_tokens: Count | None = None
 
 
 class CompletionTokens(ResponseModel):
@@ -39,6 +40,15 @@ class CompletionTokens(ResponseModel):
     reasoning_tokens: Count | None = None
     rejected_prediction_tokens: Count | None = None
     text_tokens: Count | None = None
+    image_tokens: Count | None = None
+
+
+class ChatCost(ResponseModel):
+    """Reported OpenRouter cost metadata, without inferring accounting completeness."""
+
+    upstream_inference_cost: float | None = Field(default=None, ge=0)
+    upstream_inference_prompt_cost: float = Field(ge=0)
+    upstream_inference_completions_cost: float = Field(ge=0)
 
 
 class ChatUsage(ResponseModel):
@@ -49,6 +59,9 @@ class ChatUsage(ResponseModel):
     total_tokens: Count
     prompt_tokens_details: PromptTokens | None = None
     completion_tokens_details: CompletionTokens | None = None
+    cost: float | None = Field(default=None, ge=0)
+    is_byok: bool | None = None
+    cost_details: ChatCost | None = None
 
 
 class Function(ResponseModel):
@@ -74,6 +87,7 @@ class ChatMessage(ResponseModel):
     refusal: str | None = None
     tool_calls: list[ToolCall] | None = Field(default=None, max_length=128)
     annotations: EmptyList | None = None
+    reasoning: None = None
 
 
 class ChatChoice(ResponseModel):
@@ -83,6 +97,7 @@ class ChatChoice(ResponseModel):
     message: ChatMessage
     finish_reason: FinishReason
     logprobs: None = None
+    native_finish_reason: Identifier | None = None
 
 
 class ChatEnvelope(ResponseModel):
@@ -94,6 +109,7 @@ class ChatEnvelope(ResponseModel):
     system_fingerprint: Identifier | None = None
     service_tier: ServiceTier | None = None
     usage: ChatUsage | None = None
+    provider: Identifier | None = None
 
 
 class ChatResponse(ChatEnvelope):
@@ -126,6 +142,7 @@ class ChatDelta(ResponseModel):
     content: str | None = None
     refusal: str | None = None
     tool_calls: list[ToolDelta] | None = Field(default=None, max_length=128)
+    reasoning: None = None
 
 
 class ChatChunkChoice(ResponseModel):
@@ -135,6 +152,7 @@ class ChatChunkChoice(ResponseModel):
     delta: ChatDelta
     finish_reason: FinishReason | None
     logprobs: None = None
+    native_finish_reason: Identifier | None = None
 
 
 class ChatChunk(ChatEnvelope):

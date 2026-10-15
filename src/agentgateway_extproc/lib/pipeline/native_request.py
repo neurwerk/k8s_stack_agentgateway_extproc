@@ -101,7 +101,7 @@ async def process_native_request(  # noqa: C901
         validate_reversal(request, reply)
         # Nonterminal replies also carry content classification in route_class.
         if reply.decision == "reroute":
-            raise GatewayPolicyError("unsupported_reroute")
+            handler.request_context = admission.resolve_reroute(context, reply.route_class)
         if reply.decision == "block" or reply.request is None:
             handler.record_dispatch("policy_block")
             return immediate_response(403, '{"error":"request blocked by policy"}')

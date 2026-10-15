@@ -32,6 +32,7 @@ def request_messages(admission, kind, *, stream):
         "openai-responses-v1" if kind == "responses" else "openai-chat-completions-v1"
     )
     path = "/v1/responses" if kind == "responses" else "/v1/chat/completions"
+    path = f"/bindings/{admission['request_context']['binding_id']}" + path
     return [
         header_request(headers(**{":path": path}), policy=admission),
         body_request(body(responses=kind == "responses", stream=stream), policy=admission),

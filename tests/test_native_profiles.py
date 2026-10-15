@@ -35,6 +35,7 @@ def native(request):
     admission = json.loads((FIXTURES / "admission-v5.json").read_text())
     context = admission["request_context"]
     context.update(
+        entry_mode="forward_proxy",
         protocol_profile="anthropic-messages-v1"
         if kind == "anthropic"
         else "google-generate-content-v1",

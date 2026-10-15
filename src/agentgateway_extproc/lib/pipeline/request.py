@@ -114,10 +114,11 @@ async def process_request(
     policy = handler.destination_policy
     if policy is None:
         raise ValueError("trusted destination policy is unavailable")  # noqa: TRY003
-    if handler.admission is not None and model_profile(handler.admission).request_kind in {
-        "anthropic",
-        "google",
-    }:
+    if (
+        policy.destination_kind == "model"
+        and handler.admission is not None
+        and model_profile(handler.admission).request_kind in {"anthropic", "google"}
+    ):
         from agentgateway_extproc.lib.pipeline.native_request import process_native_request
 
         return await process_native_request(handler, payload)
@@ -475,8 +476,11 @@ async def process_request(
             validate_reversal(request, reply)
         # Nonterminal replies also carry content classification in route_class.
         if handler.admission is not None and reply.decision == "reroute":
-            _clear_request(handler)
-            raise GatewayPolicyError("unsupported_reroute")
+            if handler.request_context is None:
+                raise GatewayPolicyError("unsupported_reroute")
+            handler.request_context = handler.admission.resolve_reroute(
+                handler.request_context, reply.route_class
+            )
     except (EngineUnavailableError, InvalidEngineReplyError):
         if images is None:
             raise

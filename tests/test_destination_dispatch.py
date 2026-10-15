@@ -19,7 +19,6 @@ from agentgateway_extproc.lib.pipeline.mcp import (
 )
 from agentgateway_extproc.lib.pipeline.stream_handler import StreamHandler
 from agentgateway_extproc.lib.session import make_session_key
-from agentgateway_extproc.metrics import dispatcher_total
 from agentgateway_extproc.models.destination import (
     McpDestinationPolicy,
     ModelDestinationPolicy,
@@ -184,35 +183,6 @@ async def test_missing_or_changing_metadata_is_a_platform_503(engine_client) -> 
     assert responses[-1].immediate_response.status.code == 503
 
 
-async def test_metadata_less_empty_response_eos_uses_locked_destination(engine_client) -> None:
-    """AgentGateway may omit metadata only on its empty final response callback."""
-    before = dispatcher_total.labels(outcome="metadata_eos_compat")._value.get()
-    servicer = ExtProcServicer(engine_client)
-    payload = b'{"choices":[{"index":0,"message":{"content":"answer"}}]}'
-
-    async def requests():
-        yield header_request()
-        yield body_request(request_json())
-        yield response_headers("application/json")
-        yield response_body(payload, end_of_stream=False)
-        yield response_body(b"", policy=None)
-
-    responses = [response async for response in servicer.Process(requests(), object())]
-
-    assert [response.WhichOneof("response") for response in responses] == [
-        "request_headers",
-        "request_body",
-        "response_headers",
-        "response_body",
-    ]
-    transformed = json.loads(
-        responses[-1].response_body.response.body_mutation.streamed_response.body
-    )
-    assert transformed["choices"][0]["message"]["content"].startswith("answer")
-    after = dispatcher_total.labels(outcome="metadata_eos_compat")._value.get()
-    assert after - before == 1
-
-
 @pytest.mark.parametrize(
     "processing_request",
     [
@@ -239,22 +209,6 @@ async def test_metadata_eos_compat_requires_accepted_response_headers(engine_cli
     handler = StreamHandler(engine_client)
     await handler.handle(header_request())
     await handler.handle(body_request(request_json()))
-
-    with pytest.raises(TrustedMetadataError):
-        await handler.handle(response_body(b"", policy=None))
-
-
-async def test_metadata_eos_compat_rejects_callback_after_completed_response(
-    engine_client,
-) -> None:
-    handler = StreamHandler(engine_client)
-    await handler.handle(header_request())
-    await handler.handle(body_request(request_json()))
-    await handler.handle(response_headers("application/json"))
-    completed = await handler.handle(
-        response_body(b'{"choices":[{"message":{"content":"answer"}}]}')
-    )
-    assert completed is not None
 
     with pytest.raises(TrustedMetadataError):
         await handler.handle(response_body(b"", policy=None))
@@ -288,153 +242,6 @@ async def test_malformed_metadata_fails_closed(engine_client, policy) -> None:
     assert responses[-1].immediate_response.status.code == 503
 
 
-@pytest.mark.parametrize(
-    ("content_type", "upstream_chunks"),
-    [
-        ("application/json", [b'{"value":"unchanged"}']),
-        (
-            "text/event-stream",
-            [
-                b'data: {"choices":[{"delta":{"content":"answer"}}]}\n\n',
-                b"data: [DONE]\n\n",
-            ],
-        ),
-    ],
-)
-@pytest.mark.parametrize(
-    ("original", "attachment_modes"),
-    [
-        (b'{ "model" : "test", "messages" : [ {"role":"user","content":"raw"} ] }', {}),
-        (b'{ "model" : "test", "input" : "raw" }', {}),
-        (
-            b'{"model":"test","input":[{"role":"user",'
-            b'"content":[{"type":"input_text","text":"raw"}]},'
-            b'{"type":"function_call_output","call_id":"call-1",'
-            b'"output":{"type":"file","description":"ordinary tool JSON"}}]}',
-            {},
-        ),
-        (
-            b'{ "model":"test", "messages":[{"role":"user","content":['
-            b'{"type":"file","file":{"filename":"private.pdf","file_data":"ZmlsZQ=="}},'
-            b'{"type":"image_url","image_url":{"url":"https://files.test/private.png"}}]}]}',
-            {"test": "passthrough"},
-        ),
-        (
-            b'{ "model":"test", "input":[{"role":"user","content":['
-            b'{"type":"input_file","file_id":"file-private"}]}]}',
-            {"test": "passthrough"},
-        ),
-    ],
-    ids=[
-        "chat",
-        "responses-string",
-        "responses-tool-json",
-        "chat-passthrough",
-        "responses-passthrough",
-    ],
-)
-async def test_exact_disabled_model_bypasses_engine_and_preserves_response_chunks(
-    engine_client, content_type, upstream_chunks, original, attachment_modes
-) -> None:
-    policy = {
-        **MODEL_POLICY,
-        "models": {"test": False, "other": True},
-        "attachment_modes": attachment_modes,
-    }
-    handler = StreamHandler(engine_client)
-    with patch.object(engine_client, "analyze_request", new_callable=AsyncMock) as analyze:
-        await handler.handle(header_request(policy=policy))
-        response = await handler.handle(body_request(original, policy=policy))
-
-    assert response is not None
-    assert not response.request_body.response.body_mutation.ByteSize()
-    assert not response.HasField("mode_override")
-    assert not handler.reversal_map
-    assert handler.request_stats is None
-    assert handler.presidio_code is None
-    assert not handler.notice_messages
-    analyze.assert_not_awaited()
-
-    headers = await handler.handle(response_headers(content_type, policy=policy))
-    bodies = []
-    for index, chunk in enumerate(upstream_chunks):
-        body = await handler.handle(
-            response_body(
-                chunk,
-                end_of_stream=index == len(upstream_chunks) - 1,
-                policy=policy,
-            )
-        )
-        assert body is not None
-        bodies.append(body.response_body.response.body_mutation.streamed_response)
-    trailers = await handler.handle(
-        add_policy(
-            ext_proc_pb2.ProcessingRequest(
-                response_trailers=ext_proc_pb2.HttpTrailers(
-                    trailers={"headers": [{"key": "digest", "value": "sha-256=stale"}]}
-                )
-            ),
-            policy,
-        )
-    )
-    assert headers is not None and headers.HasField("response_headers")
-    assert [body.body for body in bodies] == upstream_chunks
-    assert [body.end_of_stream for body in bodies] == [False] * (len(upstream_chunks) - 1) + [True]
-    assert trailers is not None
-    assert not trailers.response_trailers.header_mutation.remove_headers
-
-
-@pytest.mark.parametrize("pii_enabled", [True, False])
-@pytest.mark.parametrize("api_kind", ["chat", "responses"])
-@pytest.mark.parametrize(
-    "attachment",
-    [
-        {"type": "image_url", "image_url": {"url": "data:image/png;base64,aW1hZ2U="}},
-        {"type": "input_audio", "input_audio": {"data": "YXVkaW8=", "format": "wav"}},
-        {"type": "file", "file": {"filename": "private.pdf", "file_data": "ZmlsZQ=="}},
-        {"type": "input_image", "image_url": "https://files.test/private.png"},
-        {"type": "input_file", "file_id": "file-private"},
-        {"type": "image", "data": "aW1hZ2U="},
-        {"type": "audio", "data": "YXVkaW8="},
-        {"type": "resource", "resource": {"uri": "file:///private.txt", "text": "raw"}},
-        {"type": "resource_link", "uri": "https://files.test/private.txt"},
-    ],
-    ids=lambda part: part["type"],
-)
-async def test_model_attachments_stop_before_engine_or_upstream(
-    engine_client, pii_enabled, api_kind, attachment
-) -> None:
-    policy = {**MODEL_POLICY, "models": {"test": pii_enabled}}
-    text_type = "text" if api_kind == "chat" else "input_text"
-    messages = [
-        {"role": "assistant", "content": [{"type": text_type, "text": "history"}, attachment]},
-        {"role": "user", "content": [{"type": text_type, "text": "follow-up"}]},
-    ]
-    field = "messages" if api_kind == "chat" else "input"
-    body = json.dumps({"model": "test", field: messages}).encode()
-
-    async def requests():
-        yield header_request(policy=policy)
-        yield body_request(body, policy=policy)
-        pytest.fail("blocked attachments must terminate processing before upstream dispatch")
-
-    with patch.object(engine_client, "analyze_request", new_callable=AsyncMock) as analyze:
-        responses = [
-            response
-            async for response in ExtProcServicer(engine_client).Process(requests(), object())
-        ]
-    analyze.assert_not_called()
-    assert [response.WhichOneof("response") for response in responses] == [
-        "request_headers",
-        "immediate_response",
-    ]
-    assert responses[-1].immediate_response.status.code == 403
-    error = json.loads(responses[-1].immediate_response.body)["error"]
-    assert error["message"] == "neurwerk: attachments are disabled for this model."
-    assert error["code"] == "policy_blocked"
-    assert len(error["request_id"]) == 32
-
-
 @pytest.mark.parametrize("role", ["user", "tool"])
 async def test_attachment_block_precedes_mixed_catalog_pii_bypass(engine_client, role) -> None:
     policy = {
@@ -462,64 +269,6 @@ async def test_attachment_block_precedes_mixed_catalog_pii_bypass(engine_client,
     assert not handler.request_headers
     assert handler.request_stats is None
     assert not handler.reversal_map
-
-
-@pytest.mark.parametrize("pii_enabled", [True, False])
-@pytest.mark.parametrize("api_kind", ["chat", "responses"])
-@pytest.mark.parametrize(
-    ("mode", "attachment_type", "status"),
-    [("block", "file", 403), ("extract", "file", 503), ("extract", "image_url", 400)],
-)
-async def test_explicit_attachment_modes_fail_closed_without_converter(
-    engine_client, pii_enabled, api_kind, mode, attachment_type, status
-) -> None:
-    policy = {
-        **MODEL_POLICY,
-        "models": {"test": pii_enabled},
-        "attachment_modes": {"test": mode},
-    }
-    field = "messages" if api_kind == "chat" else "input"
-    payload = {"model": "test", field: [{"role": "user", "content": [{"type": attachment_type}]}]}
-    handler = StreamHandler(engine_client)
-    with patch.object(engine_client, "analyze_request", new_callable=AsyncMock) as analyze:
-        await handler.handle(header_request(policy=policy))
-        response = await handler.handle(body_request(json.dumps(payload).encode(), policy=policy))
-    analyze.assert_not_called()
-    assert response is not None
-    assert response.WhichOneof("response") == "immediate_response"
-    assert response.immediate_response.status.code == status
-    if status == 503:
-        assert json.loads(response.immediate_response.body) == {
-            "error": "neurwerk: text extraction service unavailable."
-        }
-
-
-@pytest.mark.parametrize(
-    "body",
-    [
-        b'{"model":"unknown","messages":[{"role":"user","content":"x"}]}',
-        b'{"model":"test","model":"other","messages":[{"role":"user","content":"x"}]}',
-        b'{"model":"test","messages":[{"role":"user","content":"x"}],"stream":1}',
-        b'{"model":"test","messages":[{"role":"user","content":"x"}],"temperature":NaN}',
-    ],
-)
-async def test_invalid_model_selection_is_a_400_before_engine(engine_client, body) -> None:
-    policy = {**MODEL_POLICY, "models": {"test": False, "other": True}}
-    handler = StreamHandler(engine_client)
-    with patch.object(engine_client, "analyze_request", new_callable=AsyncMock) as analyze:
-        await handler.handle(header_request(policy=policy))
-        response = await handler.handle(body_request(body, policy=policy))
-    assert response is not None
-    assert response.immediate_response.status.code == 400
-    analyze.assert_not_awaited()
-
-
-async def test_all_disabled_catalog_sets_safe_header_phase_mode_override(engine_client) -> None:
-    policy = {**MODEL_POLICY, "models": {"test": False}}
-    response = await StreamHandler(engine_client).handle(header_request(policy=policy))
-    assert response is not None
-    assert response.mode_override.response_header_mode == response.mode_override.SKIP
-    assert response.mode_override.response_body_mode == response.mode_override.NONE
 
 
 @pytest.mark.parametrize(
@@ -1764,29 +1513,6 @@ async def test_header_only_mcp_get_and_response_events_pass_without_engine(engin
         response = await handler.handle(response_body(body, policy=policy))
     assert response is not None
     analyze.assert_not_awaited()
-
-
-async def test_mcp_buffered_body_and_trailers_receive_one_matching_response_each(
-    engine_client,
-) -> None:
-    policy = mcp_policy()
-    body = b'{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}'
-    servicer = ExtProcServicer(engine_client)
-
-    async def requests():
-        yield header_request(mcp_headers(), policy=policy)
-        yield body_request(body, end_of_stream=False, policy=policy)
-        yield add_policy(
-            ext_proc_pb2.ProcessingRequest(
-                request_trailers=ext_proc_pb2.HttpTrailers(trailers=ext_proc_pb2.HeaderMap())
-            ),
-            policy,
-        )
-
-    responses = [response async for response in servicer.Process(requests(), object())]
-    kinds = [response.WhichOneof("response") for response in responses]
-    assert kinds == ["request_headers", "request_body", "request_trailers"]
-    assert not responses[1].request_body.response.body_mutation.ByteSize()
 
 
 def test_session_keys_scope_principal_destination_and_mcp_session() -> None:

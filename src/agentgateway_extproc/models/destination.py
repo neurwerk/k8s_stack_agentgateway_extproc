@@ -251,6 +251,7 @@ class McpDestinationPolicy(DestinationModel):
         pattern=r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*$",
     )
     pii_enabled: bool
+    content_tracing_enabled: bool = False
     contextforge: bool = False
 
     @field_validator("principal_id")

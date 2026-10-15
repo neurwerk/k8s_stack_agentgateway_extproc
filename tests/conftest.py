@@ -107,9 +107,26 @@ def header_request(
     policy: dict[str, object] | None = MODEL_POLICY,
 ) -> ext_proc_pb2.ProcessingRequest:
     """Build an Envoy request headers message."""
+    supplied = dict(headers or {})
+    if policy is not None:
+        context = policy.get("request_context", policy)
+        if isinstance(context, dict) and context.get("destination_kind") == "model":
+            binding = context.get("binding_id", "test-binding")
+            operation = (
+                "responses"
+                if context.get("protocol_profile") == "openai-responses-v1"
+                else "chat/completions"
+            )
+            supplied = {
+                ":method": "POST",
+                ":path": f"/bindings/{binding}/v1/{operation}",
+                "content-type": "application/json",
+            } | supplied
+            if policy.get("contract_version") != 5 and supplied[":path"].startswith("/v1/"):
+                supplied[":path"] = "/bindings/test-binding" + supplied[":path"]
     values = [
         shared_envoy_pb2.HeaderValue(key=key, raw_value=value.encode())
-        for key, value in (headers or {}).items()
+        for key, value in supplied.items()
     ]
     return add_policy(
         ext_proc_pb2.ProcessingRequest(
@@ -185,9 +202,67 @@ def add_policy(
     request: ext_proc_pb2.ProcessingRequest,
     policy: dict[str, object] | None = MODEL_POLICY,
 ) -> ext_proc_pb2.ProcessingRequest:
-    """Attach one trusted destination policy to a processing phase."""
+    """Attach the current admission envelope around the selected policy fixture."""
     if policy is not None:
-        request.metadata_context.filter_metadata[DESTINATION_POLICY_NAMESPACE].update(policy)
+        envelope = policy
+        if policy.get("contract_version") != 5 and policy.get("destination_kind") in {
+            "model",
+            "mcp",
+        }:
+            mcp = policy["destination_kind"] == "mcp"
+            models = policy.get("models", {})
+            models = models if isinstance(models, dict) else {}
+            permissions = ["llm:invoke"]
+            if mcp:
+                permissions.append(f"mcp:{policy.get('destination_id')}:invoke")
+            else:
+                permissions.extend(f"model:{name}:invoke" for name in models)
+                permissions.extend(["provider:test:company-use", "model:local:invoke"])
+            context = {
+                "request_id": "0123456789abcdef0123456789abcdef",
+                "principal_id": policy.get("principal_id"),
+                "credential_context_version": policy.get("credential_context_version"),
+                "credential_id": policy.get("credential_id"),
+                "credential_kind": policy.get("credential_kind"),
+                "entry_mode": "api",
+                "destination_kind": policy["destination_kind"],
+                "provider_id": None if mcp else "test",
+                "binding_id": f"mcp-{policy.get('destination_id')}" if mcp else "test-binding",
+                "protocol_profile": "mcp-streamable-http-v1"
+                if mcp
+                else "openai-chat-completions-v1",
+                "operation_id": "exchange" if mcp else "create",
+                "provider_credential_source": "none" if mcp else "company",
+                "policy_revision": "test-policy",
+                "permissions": list(dict.fromkeys(permissions)),
+            }
+            envelope = {
+                "contract_version": 5,
+                "request_context": context,
+                "destination_policy": policy,
+                "model_bindings": {}
+                if mcp
+                else {
+                    name: {
+                        "upstream_model": name,
+                        "required_permissions": ["llm:invoke", f"model:{name}:invoke"],
+                        "content_tracing_enabled": True,
+                        "allowed_reroutes": ["local"],
+                    }
+                    for name in models
+                },
+                "reroute_targets": {}
+                if mcp
+                else {
+                    "local": {
+                        "binding_id": "local-binding",
+                        "upstream_model": "local",
+                        "required_permissions": ["llm:invoke", "model:local:invoke"],
+                        "content_tracing_enabled": True,
+                    }
+                },
+            }
+        request.metadata_context.filter_metadata[DESTINATION_POLICY_NAMESPACE].update(envelope)
     return request
 
 
@@ -200,7 +275,7 @@ def mcp_headers(
     """Build strict Streamable HTTP request headers for MCP tests."""
     headers = {
         ":method": method,
-        ":path": f"/mcp/{destination_id}",
+        ":path": f"/bindings/mcp-{destination_id}/mcp",
         "mcp-protocol-version": "2025-11-25",
     }
     if method == "POST":

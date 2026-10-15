@@ -369,7 +369,7 @@ def _take_opaque_chat_reasoning(
 
 def _validate_profile_response(handler: StreamHandler, payload: Any) -> None:
     """Validate every v5 envelope field before legacy restoration can detach any content."""
-    if handler.admission is None:
+    if handler.admission is None or handler.response_api_kind == "mcp":
         return
     validate_json_response(handler.response_api_kind, payload)
 
@@ -560,7 +560,10 @@ class SseResponseProcessor:
         self._responses_terminal_type: str | None = None
         self._plain_sse = False
         self._profile = (
-            OpenAIStreamValidator(handler.response_api_kind)
+            OpenAIStreamValidator(
+                handler.response_api_kind,
+                openrouter=handler.admission.request_context.provider_id == "openrouter",
+            )
             if handler.admission is not None
             else None
         )
