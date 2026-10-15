@@ -38,6 +38,12 @@ website adapters and unqualified transports are rejected.
 - PII and content tracing are independent. Restoration is request-scoped; usage
   completeness remains unknown until the gateway has sufficient provider evidence.
 
+Rejections log their request ID, binding, model, HTTP status and fixed reason.
+Plain JSON provider HTTP 400 bodies are inspected up to 8 KiB for recognized
+model/parameter errors; raw bodies and headers never enter logs or client errors.
+Other provider errors are rejected at headers. Search OpenSearch by the request ID
+returned in the client error; stream failures carry the same ID in processor logs.
+
 ## Development
 
 ```sh

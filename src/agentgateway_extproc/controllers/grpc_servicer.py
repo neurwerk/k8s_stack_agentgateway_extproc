@@ -149,7 +149,7 @@ class ExtProcServicer(ext_proc_pb2_grpc.ExternalProcessorServicer):
                 except Exception as exc:
                     _record_dispatch_failure(handler, exc)
                     _log_committed_limit(handler, phase, exc)
-                    output = await _failure_for_phase(context, phase, kind, exc)
+                    output = await _failure_for_phase(context, phase, kind, exc, handler)
                     await self._annotate_rejection(
                         handler, output, original_body, observed_bytes, body_complete, exc
                     )
@@ -166,7 +166,7 @@ class ExtProcServicer(ext_proc_pb2_grpc.ExternalProcessorServicer):
             except Exception as exc:
                 _record_dispatch_failure(handler, exc)
                 _log_committed_limit(handler, phase, exc)
-                output = await _failure_for_phase(context, phase, "response_eof", exc)
+                output = await _failure_for_phase(context, phase, "response_eof", exc, handler)
                 await self._annotate_rejection(handler, output, b"", 0, False, exc)
                 yield output
         finally:
@@ -209,6 +209,28 @@ class ExtProcServicer(ext_proc_pb2_grpc.ExternalProcessorServicer):
             annotate_rejection(response, handler.correlation_id, limit=limit)
         status = response.immediate_response.status.code
         if handler.admission is not None:
+            error_body = json.loads(response.immediate_response.body).get("error", {})
+            code = (
+                error_body.get("code", "request_rejected")
+                if isinstance(error_body, dict)
+                else "request_rejected"
+            )
+            admission = handler.admission.request_context
+            _logger.warning(
+                "gateway rejection request_id=%s binding_id=%s provider_id=%s profile=%s "
+                "model=%s phase=%s http.status=%d reason=%s param=%s",
+                handler.correlation_id,
+                admission.binding_id,
+                admission.provider_id or "none",
+                admission.protocol_profile,
+                handler.request_context.resolved_model if handler.request_context else "unresolved",
+                "provider_response" if handler.response_started else "request_admission",
+                status,
+                code,
+                error_body.get("param", "none")
+                if code in {"provider_unsupported_parameter", "provider_stream_required"}
+                else "none",
+            )
             return
         if (
             status in {400, 413, 403, 503}
@@ -319,13 +341,17 @@ async def _handle_message(
         final_body = handler.finish_response()
         if final_body is not None:
             outputs.extend(_ordered_response(handler, final_body))
+            if final_body.HasField("immediate_response"):
+                return tuple(outputs)
     response = await handler.handle(request)
     if response is not None:
         outputs.extend(_ordered_response(handler, response))
     return tuple(outputs)
 
 
-def _failure_response(phase: str, exc: Exception) -> ext_proc_pb2.ProcessingResponse:
+def _failure_response(
+    phase: str, exc: Exception, handler: StreamHandler
+) -> ext_proc_pb2.ProcessingResponse:
     """Record only bounded response failure context and fail the stream closed."""
     if isinstance(exc, GatewayPolicyError):
         return immediate_response(
@@ -342,7 +368,7 @@ def _failure_response(phase: str, exc: Exception) -> ext_proc_pb2.ProcessingResp
             'Connect your ContextForge account."}}',
         )
     if isinstance(exc, McpUnsupportedFeatureError):
-        _record_failure(phase, exc)
+        _record_failure(phase, exc, handler)
         return immediate_response(400, exc.body)
     if isinstance(exc, McpHttpError):
         response = immediate_response(exc.status_code, '{"error":"MCP HTTP request failed"}')
@@ -351,7 +377,7 @@ def _failure_response(phase: str, exc: Exception) -> ext_proc_pb2.ProcessingResp
                 header={"key": key, "value": value}, append_action=2
             )
         return response
-    _record_failure(phase, exc)
+    _record_failure(phase, exc, handler)
     if isinstance(exc, EnginePolicyError):
         body = json.dumps(
             {
@@ -375,28 +401,33 @@ async def _failure_for_phase(
     state: StreamPhase,
     phase: str,
     exc: Exception,
+    handler: StreamHandler,
 ) -> ext_proc_pb2.ProcessingResponse:
     """Return a precommit local reply or abort a response already committed downstream."""
     if state.response_headers_committed:
-        await _abort_stream(context, phase, exc)
-    return _failure_response(phase, exc)
+        await _abort_stream(context, phase, exc, handler)
+    return _failure_response(phase, exc, handler)
 
 
-async def _abort_stream(context: object, phase: str, exc: Exception) -> NoReturn:
+async def _abort_stream(
+    context: object, phase: str, exc: Exception, handler: StreamHandler
+) -> NoReturn:
     """Abort a response whose headers have already been committed downstream."""
-    _record_failure(phase, exc)
+    _record_failure(phase, exc, handler)
     grpc_context = cast(AbortContext, context)
     await grpc_context.abort(grpc.StatusCode.INTERNAL, "response processing failed closed")
 
 
-def _record_failure(phase: str, exc: Exception) -> None:
+def _record_failure(phase: str, exc: Exception, handler: StreamHandler) -> None:
     """Record bounded failure metadata without response payloads or exception text."""
     reason = _failure_reason(exc)
     errors_total.labels(type="processing").inc()
     if phase in {"response_headers", "response_body", "response_trailers", "response_eof"}:
         response_failures_total.labels(phase=phase, reason=reason).inc()
     _logger.warning(
-        "ext_proc processing failed closed phase=%s reason=%s error=%s",
+        "ext_proc processing failed closed request_id=%s binding_id=%s phase=%s reason=%s error=%s",
+        handler.correlation_id,
+        handler.admission.request_context.binding_id if handler.admission else "unresolved",
         phase,
         reason,
         type(exc).__name__,
