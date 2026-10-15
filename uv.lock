@@ -4,7 +4,7 @@ requires-python = "==3.12.*"
 
 [[package]]
 name = "agentgateway-extproc"
-version = "0.19.1"
+version = "0.19.2"
 source = { editable = "." }
 dependencies = [
     { name = "fastapi" },
@@ -290,7 +290,7 @@ wheels = [
 
 [[package]]
 name = "neurwerk-request-segments"
-version = "0.1.0"
+version = "0.1.1"
 source = { editable = "packages/request_segments" }
 dependencies = [
     { name = "pydantic" },
