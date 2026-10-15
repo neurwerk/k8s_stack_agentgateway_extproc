@@ -17,6 +17,8 @@
     "destination_id": "example-chat",
     "requested_model": "example-chat",
     "resolved_model": "provider-chat",
+    "dispatch_binding_id": "openai-api",
+    "dispatch_destination_id": "example-chat",
     "pii_policy": {"enabled": true},
     "content_tracing_enabled": false,
     "billing_classification": "unknown",

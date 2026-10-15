@@ -50,7 +50,7 @@ def admission():
 def headers(**changes):
     return {
         ":method": "POST",
-        ":path": "/v1/chat/completions",
+        ":path": "/bindings/openai-api/v1/chat/completions",
         "content-type": "application/json",
         "authorization": f"Bearer {SECRET}",
     } | changes
@@ -100,7 +100,12 @@ async def test_one_resolution_drives_permissions_policy_and_final_provider_model
     async with httpx.AsyncClient(transport=httpx.MockTransport(analyze)) as http:
         client = EngineClient(EngineSettings(base_url="https://engine.example.test"), http)
         handler = StreamHandler(client)
-        original = headers(**{":path": "/v1/responses" if responses else "/v1/chat/completions"})
+        original = headers(
+            **{
+                ":path": "/bindings/openai-api/v1/"
+                + ("responses" if responses else "chat/completions")
+            }
+        )
         header_reply = await handler.handle(header_request(original, policy=admission))
         assert header_reply is not None
         assert (
@@ -441,7 +446,7 @@ async def test_unqualified_features_stop_before_analysis(admission, engine_clien
         payload = json.dumps(data).encode()
     elif change in {"background", "history"}:
         admission["request_context"]["protocol_profile"] = "openai-responses-v1"
-        request_headers[":path"] = "/v1/responses"
+        request_headers[":path"] = "/bindings/openai-api/v1/responses"
         data = json.loads(body(responses=True))
         data["background" if change == "background" else "previous_response_id"] = (
             True if change == "background" else "provider-history"
@@ -474,7 +479,7 @@ async def test_unqualified_features_stop_before_analysis(admission, engine_clien
     analyze.assert_not_awaited()
 
 
-async def test_v5_reroute_rejected_while_legacy_keeps_existing_routing(
+async def test_reroute_requires_company_source_and_explicit_local_permission(
     engine_client, engine_reply, admission
 ):
     engine_reply.update(
@@ -502,12 +507,37 @@ async def test_v5_reroute_rejected_while_legacy_keeps_existing_routing(
     )
     assert replies[-1].immediate_response.status.code == 403
     assert "unsupported_reroute" in replies[-1].immediate_response.body
-    legacy = await exchange(engine_client, [header_request(), body_request(request_json())])
-    assert legacy[-1].HasField("request_body")
-    assert any(
-        item.header.key == "x-route-class" and item.header.value == "local"
-        for item in legacy[-1].request_body.response.header_mutation.set_headers
-    )
+    admission["model_bindings"]["example-chat"]["allowed_reroutes"] = ["local"]
+    admission["reroute_targets"] = {
+        "local": {
+            "binding_id": "local-binding",
+            "upstream_model": "local-provider-model",
+            "required_permissions": ["llm:invoke", "model:local:invoke"],
+            "content_tracing_enabled": True,
+        }
+    }
+    admission["request_context"]["provider_credential_source"] = "company"
+    admission["request_context"]["permissions"].append("provider:openai:company-use")
+    for allowed in (False, True):
+        if allowed:
+            admission["request_context"]["permissions"].append("model:local:invoke")
+        replies = await exchange(
+            engine_client,
+            [header_request(headers(), policy=admission), body_request(body(), policy=admission)],
+        )
+        if not allowed:
+            assert replies[-1].immediate_response.status.code == 403
+            assert "permission_denied" in replies[-1].immediate_response.body
+        else:
+            assert replies[-1].HasField("request_body")
+            context = MessageToDict(replies[-1].dynamic_metadata)["neurwerk.request_context"]
+            assert context["dispatch_binding_id"] == "local-binding"
+            assert context["dispatch_destination_id"] == "local"
+            assert context["resolved_model"] == "local-provider-model"
+            assert context["destination_id"] == "example-chat"
+            assert context["provider_credential_source"] == "company"
+            assert context["content_tracing_enabled"] is False
+            assert context["billing_classification"] == "unknown"
 
 
 def test_legacy_schema_does_not_accept_v5_fields(admission):
@@ -751,6 +781,7 @@ async def test_v5_notice_identity_uses_neurwerk_key_and_existing_cache(
     "mode,prefix,accepted",
     [
         ("api", "/bindings/openai-api", True),
+        ("api", "", False),
         ("api", "/bindings/another-binding", False),
         ("forward_proxy", "/bindings/openai-api", False),
         ("forward_proxy", "", True),

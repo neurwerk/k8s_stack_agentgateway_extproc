@@ -92,7 +92,7 @@ def validate_mcp_headers(headers: dict[str, str], policy: McpDestinationPolicy) 
     method = headers.get(":method", "").upper()
     if method not in {"POST", "GET", "DELETE"}:
         raise McpProtocolError("unsupported MCP HTTP method")
-    if headers.get(":path") != f"/mcp/{policy.destination_id}":
+    if headers.get(":path") != f"/bindings/mcp-{policy.destination_id}/mcp":
         raise McpProtocolError("MCP route does not match trusted destination")
     version = headers.get("mcp-protocol-version")
     if version is not None and version not in MCP_SUPPORTED_VERSIONS:
