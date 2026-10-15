@@ -8,6 +8,7 @@ import json
 from typing import TYPE_CHECKING, Any
 
 from neurwerk_request_segments import extract_request, parse_request
+from neurwerk_request_segments.reasoning import CHAT_REASONING_FIELDS
 
 from agentgateway_extproc.gen import ext_proc_pb2
 from agentgateway_extproc.lib.json_limits import strict_json_loads
@@ -23,6 +24,7 @@ from agentgateway_extproc.lib.pipeline.openai_response import (
     OpenAIStreamValidator,
     validate_json_response,
 )
+from agentgateway_extproc.lib.pipeline.reasoning import response_receipts
 from agentgateway_extproc.lib.pipeline.sse import SseDecoder, SseEvent
 from agentgateway_extproc.metrics import invalid_placeholder_total
 from agentgateway_extproc.models.exceptions import InvalidReversalError
@@ -128,7 +130,11 @@ def _reverse_json_values(
         reflections = _reverse_response_reflections(handler, value, path) if protocol_fields else {}
         transformed: dict[str, Any] = {}
         for key, item in value.items():
-            if key in reflections:
+            if protocol_fields and _reasoning_field(handler.response_api_kind, value, key, path):
+                # Model output stays byte-identical at the string-value level, including
+                # late signatures. Readable client replay is inspected on the next request.
+                transformed[key] = item
+            elif key in reflections:
                 transformed[key] = reflections[key]
             elif (
                 protocol_fields
@@ -160,6 +166,34 @@ def _reverse_json_values(
                 )
         return transformed
     return value
+
+
+def _reasoning_field(
+    kind: str, value: dict[str, Any], key: str, path: tuple[str | int, ...]
+) -> bool:
+    if kind == "chat":
+        return (
+            len(path) == 3
+            and path[0] == "choices"
+            and isinstance(path[1], int)
+            and path[2] in {"message", "delta"}
+            and key in CHAT_REASONING_FIELDS
+        )
+    if kind != "responses":
+        return False
+    if value.get("type") == "reasoning":
+        return key in {"summary", "content", "encrypted_content"} and (
+            path == ("item",)
+            or (len(path) == 2 and path[0] == "output")
+            or (len(path) == 3 and path[:2] == ("response", "output"))
+        )
+    return (
+        not path
+        and str(value.get("type", "")).startswith(
+            ("response.reasoning_summary_", "response.reasoning_text.")
+        )
+        and key in {"part", "delta", "text"}
+    )
 
 
 def _reverse_response_reflections(
@@ -288,6 +322,8 @@ def process_json_response(handler: StreamHandler, text: str) -> str:
     if notice and transformed_target is not None:
         container, field = transformed_target
         container[field] += notice
+    if handler.admission is not None and handler.response_api_kind in {"chat", "responses"}:
+        handler.reasoning_digests.update(response_receipts(handler.response_api_kind, payload))
     return _json_dumps(payload)
 
 
@@ -501,6 +537,7 @@ class SseResponseProcessor:
         if final:
             if self._profile is not None:
                 self._profile.finish()
+                self._handler.reasoning_digests.update(self._profile.reasoning_digests)
             detached: list[tuple[str, str]] = []
             for key, rewriter in self._rewriters.items():
                 guarded = ""

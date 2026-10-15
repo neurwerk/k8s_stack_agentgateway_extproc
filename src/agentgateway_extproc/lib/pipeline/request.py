@@ -27,6 +27,7 @@ from agentgateway_extproc.lib.pipeline.mcp import (
     parse_mcp_message,
 )
 from agentgateway_extproc.lib.pipeline.profiles import model_profile
+from agentgateway_extproc.lib.pipeline.reasoning import verify_reasoning
 from agentgateway_extproc.lib.pipeline.reply_validation import (
     validate_request_mutation,
     validate_reversal,
@@ -370,6 +371,7 @@ async def process_request(
         if unchecked_without_documents or (
             not handler.text_pii_enabled and not (images and images.protect_faces)
         ):
+            await verify_reasoning(handler, request)
             if (
                 images is not None
                 and policy.contract_version in {3, 4, "4.1"}
@@ -458,6 +460,10 @@ async def process_request(
             handler.request_context = handler.admission.resolve_reroute(
                 handler.request_context, reply.route_class
             )
+        if reply.decision != "block" and isinstance(
+            request, EngineChatRequest | EngineResponsesRequest
+        ):
+            await verify_reasoning(handler, request, policy_version=reply.analysis.policy_version)
     except (EngineUnavailableError, InvalidEngineReplyError):
         if images is None:
             raise

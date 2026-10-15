@@ -60,5 +60,4 @@ closed schema and cannot use the OpenAI compatibility extension mechanism.
 
 Canonical source: `neurwerk/k8s_stack_agentgateway_extproc/packages/request_segments`.
 Build with `uv build`; extProc uses a local path dependency. Engine and Studio vendor
-the exact source for independent builds. Refresh both snapshots after changes and
-record version, source and SHA-256 in their `ORIGIN.md`; exclude caches/build output.
+the exact source for independent builds. Refresh both copies after changes; exclude caches and build output.

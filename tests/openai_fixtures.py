@@ -3,11 +3,50 @@
 import json
 from copy import deepcopy
 from pathlib import Path
+from typing import Any
 
 from .conftest import REVERSIBLE_TOKEN
 
 
-def response_payload(kind, text=REVERSIBLE_TOKEN, *, tools=False):
+def reasoning_value(kind):
+    if kind == "chat":
+        return {
+            "reasoning": "Model thought " + REVERSIBLE_TOKEN,
+            "reasoning_content": "Alias thought",
+            "reasoning_signature": "top-signature",
+            "reasoning_details": [
+                {
+                    "type": "reasoning.text",
+                    "text": "Signed " + REVERSIBLE_TOKEN,
+                    "signature": "detail-signature",
+                    "id": "reasoning-1",
+                    "format": "anthropic-claude-v1",
+                    "index": 0,
+                },
+                {"type": "reasoning.summary", "summary": "Readable summary", "index": 1},
+                {"type": "reasoning.encrypted", "data": "opaque-detail", "index": 2},
+            ],
+            "thinking_blocks": [
+                {
+                    "type": "thinking",
+                    "thinking": "Signed thought",
+                    "signature": "block-signature",
+                    "index": 0,
+                },
+                {"type": "redacted_thinking", "data": "opaque-block", "index": 1},
+            ],
+        }
+    return {
+        "id": "rs-example",
+        "type": "reasoning",
+        "status": "completed",
+        "summary": [{"type": "summary_text", "text": "Summary " + REVERSIBLE_TOKEN}],
+        "content": [{"type": "reasoning_text", "text": "Reasoned carefully"}],
+        "encrypted_content": "opaque-responses-state",
+    }
+
+
+def response_payload(kind, text=REVERSIBLE_TOKEN, *, tools=False, reasoning=False):
     payload = json.loads(
         (Path(__file__).parent / f"fixtures/openai-{kind}-response.json").read_text()
     )
@@ -37,10 +76,15 @@ def response_payload(kind, text=REVERSIBLE_TOKEN, *, tools=False):
                     "status": "completed",
                 }
             )
+    if reasoning:
+        if kind == "chat":
+            payload["choices"][0]["message"].update(reasoning_value(kind))
+        else:
+            payload["output"].insert(0, reasoning_value(kind))
     return payload
 
 
-def stream_events(kind, text=REVERSIBLE_TOKEN, *, tools=False):
+def stream_events(kind, text=REVERSIBLE_TOKEN, *, tools=False, reasoning=False):  # noqa: C901
     payload = response_payload(kind, text, tools=tools)
     if kind == "chat":
         envelope = {key: value for key, value in payload.items() if key not in {"choices", "usage"}}
@@ -51,6 +95,24 @@ def stream_events(kind, text=REVERSIBLE_TOKEN, *, tools=False):
             return {**envelope, "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
 
         events = [chunk({"role": "assistant", "content": ""})]
+        if reasoning:
+            for name, value in reasoning_value(kind).items():
+                if isinstance(value, str):
+                    events.extend(chunk({name: fragment}) for fragment in (value[:4], value[4:]))
+                else:
+                    for block in value:
+                        # Signatures deliberately arrive after the corresponding text.
+                        for field in ("text", "summary", "thinking", "data", "signature"):
+                            if field in block:
+                                identity = {
+                                    key: block[key]
+                                    for key in ("type", "index", "id", "format")
+                                    if key in block
+                                }
+                                events.extend(
+                                    chunk({name: [{**identity, field: fragment}]})
+                                    for fragment in (block[field][:4], block[field][4:])
+                                )
         events += [chunk({"content": part}) for part in [text[:12], text[12:]]]
         if tools:
             tool = payload["choices"][0]["message"]["tool_calls"][0]
@@ -79,7 +141,7 @@ def stream_events(kind, text=REVERSIBLE_TOKEN, *, tools=False):
     message = payload["output"][0]
     part = message["content"][0]
     coordinates = {"item_id": message["id"], "output_index": 0, "content_index": 0}
-    events = [
+    events: list[dict[str, Any]] = [
         {
             "type": "response.created",
             "response": {**payload, "status": "in_progress", "output": [], "usage": None},
@@ -120,6 +182,52 @@ def stream_events(kind, text=REVERSIBLE_TOKEN, *, tools=False):
             {"type": "response.output_item.done", "output_index": 1, "item": tool},
         ]
     events.append({"type": "response.completed", "response": payload})
+    if reasoning:
+        item = reasoning_value(kind)
+        for event in events:
+            if isinstance(index := event.get("output_index"), int):
+                event["output_index"] = index + 1
+        payload["output"].insert(0, item)
+        coordinates = {"item_id": item["id"], "output_index": 0, "summary_index": 0}
+        summary = item["summary"][0]
+        reasoning_events = [
+            {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type": "reasoning", "id": item["id"], "summary": []},
+            },
+            {
+                "type": "response.reasoning_summary_part.added",
+                **coordinates,
+                "part": {**summary, "text": ""},
+            },
+            *[
+                {"type": "response.reasoning_summary_text.delta", **coordinates, "delta": fragment}
+                for fragment in (summary["text"][:15], summary["text"][15:])
+            ],
+            {
+                "type": "response.reasoning_summary_text.done",
+                **coordinates,
+                "text": summary["text"],
+            },
+            {"type": "response.reasoning_summary_part.done", **coordinates, "part": summary},
+            {
+                "type": "response.reasoning_text.delta",
+                "item_id": item["id"],
+                "output_index": 0,
+                "content_index": 0,
+                "delta": item["content"][0]["text"],
+            },
+            {
+                "type": "response.reasoning_text.done",
+                "item_id": item["id"],
+                "output_index": 0,
+                "content_index": 0,
+                "text": item["content"][0]["text"],
+            },
+            {"type": "response.output_item.done", "output_index": 0, "item": item},
+        ]
+        events[1:1] = reasoning_events
     return [
         deepcopy(event)
         | {"sequence_number": index}

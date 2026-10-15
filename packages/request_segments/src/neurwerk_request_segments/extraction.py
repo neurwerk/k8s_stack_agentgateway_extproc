@@ -20,6 +20,7 @@ from .compatibility import (
 )
 from .models import EngineChatRequest, EngineMcpRequest, EngineResponsesRequest, SupportedRequest
 from .native import AnthropicRequest, GoogleRequest
+from .reasoning import chat_reasoning_text
 
 type Path = tuple[str | int, ...]
 
@@ -182,6 +183,8 @@ def extract_request(request: SupportedRequest, *, max_depth: int = 32) -> Extrac
             path: Path = ("messages", index)
             content(message.get("content"), (*path, "content"))
             text(message.get("refusal"), (*path, "refusal"))
+            for child, value in chat_reasoning_text(message):
+                text(value, (*path, *child))
             for call_index, call in enumerate(message.get("tool_calls") or []):
                 root = (*path, "tool_calls", call_index, "function", "arguments")
                 if "arguments" in call["function"]:
@@ -221,6 +224,10 @@ def extract_request(request: SupportedRequest, *, max_depth: int = 32) -> Extrac
                     leaves.extend(
                         _json_leaves(item["output"], (*path, "output"), max_depth=max_depth)
                     )
+                elif item["type"] == "reasoning":
+                    for field in ("summary", "content"):
+                        for part_index, part in enumerate(item.get(field) or []):
+                            text(part["text"], (*path, field, part_index, "text"))
         for index, tool in enumerate(data.get("tools") or []):
             leaves.extend(_definition(tool, ("tools", index), max_depth))
         config = data.get("text")

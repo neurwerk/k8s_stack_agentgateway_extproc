@@ -3,6 +3,7 @@
 from typing import Annotated, Literal
 
 from neurwerk_request_segments.models import EngineResponseTextConfig, EngineResponseToolDefinition
+from neurwerk_request_segments.reasoning import ChatReasoning, ResponseReasoning, SummaryText
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 type Identifier = Annotated[str, Field(min_length=1, max_length=256)]
@@ -52,15 +53,14 @@ class ToolCall(ResponseModel):
     function: Function
 
 
-class ChatMessage(ResponseModel):
-    """An assistant's text, refusal or client tool calls; opaque reasoning is excluded."""
+class ChatMessage(ResponseModel, ChatReasoning):
+    """An assistant's answer, reasoning and client tool calls."""
 
     role: Literal["assistant"]
     content: str | None = None
     refusal: str | None = None
     tool_calls: list[ToolCall] | None = Field(default=None, max_length=128)
     annotations: EmptyList | None = None
-    reasoning: None = None
 
 
 class ChatChoice(ResponseModel):
@@ -108,14 +108,13 @@ class ToolDelta(ResponseModel):
     function: FunctionDelta | None = None
 
 
-class ChatDelta(ResponseModel):
+class ChatDelta(ResponseModel, ChatReasoning):
     """Qualified Chat stream fields only."""
 
     role: Literal["assistant"] | None = None
     content: str | None = None
     refusal: str | None = None
     tool_calls: list[ToolDelta] | None = Field(default=None, max_length=128)
-    reasoning: None = None
 
 
 class ChatChunkChoice(ResponseModel):
@@ -176,7 +175,15 @@ class OutputFunction(ResponseModel):
     status: ItemStatus | None = None
 
 
-type OutputItem = Annotated[OutputMessage | OutputFunction, Field(discriminator="type")]
+class OutputReasoning(ResponseReasoning):
+    """A response-side reasoning item has an identity for stream integrity."""
+
+    id: Identifier
+
+
+type OutputItem = Annotated[
+    OutputMessage | OutputFunction | OutputReasoning, Field(discriminator="type")
+]
 
 
 class IncompleteDetails(ResponseModel):
@@ -321,6 +328,49 @@ class ArgumentsDoneEvent(ItemCoordinate):
     arguments: str
 
 
+class SummaryCoordinate(ItemCoordinate):
+    """Coordinate a reasoning summary with its open output item."""
+
+    summary_index: Annotated[int, Field(ge=0, le=63)]
+
+
+class SummaryPartEvent(SummaryCoordinate):
+    """Open or close one reasoning summary part."""
+
+    type: Literal["response.reasoning_summary_part.added", "response.reasoning_summary_part.done"]
+    part: SummaryText
+
+
+class SummaryDeltaEvent(SummaryCoordinate):
+    """Stream readable reasoning, separate from final-answer text."""
+
+    type: Literal["response.reasoning_summary_text.delta"]
+    delta: str
+    obfuscation: str | None = Field(default=None, max_length=1024)
+
+
+class SummaryDoneEvent(SummaryCoordinate):
+    """Close a reasoning summary with its full snapshot."""
+
+    type: Literal["response.reasoning_summary_text.done"]
+    text: str
+
+
+class ReasoningDeltaEvent(PartCoordinate):
+    """Stream Responses reasoning content."""
+
+    type: Literal["response.reasoning_text.delta"]
+    delta: str
+    obfuscation: str | None = Field(default=None, max_length=1024)
+
+
+class ReasoningDoneEvent(PartCoordinate):
+    """Close Responses reasoning content."""
+
+    type: Literal["response.reasoning_text.done"]
+    text: str
+
+
 RESPONSES_EVENT = TypeAdapter(
     Annotated[
         LifecycleEvent
@@ -330,7 +380,12 @@ RESPONSES_EVENT = TypeAdapter(
         | TextDoneEvent
         | RefusalDoneEvent
         | ArgumentsDeltaEvent
-        | ArgumentsDoneEvent,
+        | ArgumentsDoneEvent
+        | SummaryPartEvent
+        | SummaryDeltaEvent
+        | SummaryDoneEvent
+        | ReasoningDeltaEvent
+        | ReasoningDoneEvent,
         Field(discriminator="type"),
     ]
 )

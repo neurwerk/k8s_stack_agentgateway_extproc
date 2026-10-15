@@ -176,6 +176,7 @@ type GatewayErrorCode = Literal[
     "provider_credential_required",
     "invalid_provider_credential",
     "unsupported_reroute",
+    "unverified_reasoning",
 ]
 
 _GATEWAY_ERRORS: dict[GatewayErrorCode, tuple[int, str]] = {
@@ -186,6 +187,10 @@ _GATEWAY_ERRORS: dict[GatewayErrorCode, tuple[int, str]] = {
     "provider_credential_required": (401, "A provider credential is required."),
     "invalid_provider_credential": (400, "The provider credential does not match this profile."),
     "unsupported_reroute": (403, "Rerouting is not supported on this binding."),
+    "unverified_reasoning": (
+        400,
+        "Reasoning continuation is unverified or expired. Start a new conversation.",
+    ),
 }
 
 

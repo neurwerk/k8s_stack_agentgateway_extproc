@@ -31,6 +31,7 @@ from agentgateway_extproc.lib.pipeline.provider_errors import (
     MAX_PROVIDER_ERROR_BYTES,
     provider_error_response,
 )
+from agentgateway_extproc.lib.pipeline.reasoning import reasoning_scope
 from agentgateway_extproc.lib.pipeline.request import immediate_response, process_request
 from agentgateway_extproc.lib.pipeline.response import process_response_chunk
 from agentgateway_extproc.metrics import dispatcher_total, response_transport_total
@@ -156,6 +157,7 @@ class StreamHandler:
         self.request_nonce: bytes | None = None
         self.response_processing_enabled = True
         self.text_pii_enabled = True
+        self.reasoning_digests: set[str] = set()
         self._dispatch_outcomes: set[str] = set()
 
     def clear_sensitive_state(self) -> None:
@@ -189,6 +191,7 @@ class StreamHandler:
         self.mcp_headers = None
         self.mcp_context = None
         self.request_nonce = None
+        self.reasoning_digests.clear()
         self.response_headers_accepted = False
         self.mcp_empty_eos_pending = False
 
@@ -211,7 +214,9 @@ class StreamHandler:
         if kind == "response_headers":
             return self._response_headers(request)
         if kind == "response_body":
-            return self._response_body(request)
+            response = self._response_body(request)
+            await self._record_reasoning()
+            return response
         if kind == "request_trailers":
             if not self.request_processed:
                 self.request_processed = True
@@ -612,11 +617,26 @@ class StreamHandler:
             request.response_body.body, request.response_body.end_of_stream
         )
 
-    def finish_response(self) -> ext_proc_pb2.ProcessingResponse | None:
+    async def finish_response(self) -> ext_proc_pb2.ProcessingResponse | None:
         """Flush a full-duplex body before acknowledging response trailers."""
         if not self.response_started or self.response_processed:
             return None
-        return self._process_response_bytes(b"", True)
+        response = self._process_response_bytes(b"", True)
+        await self._record_reasoning()
+        return response
+
+    async def _record_reasoning(self) -> None:
+        if self.response_processed and self.reasoning_digests and self.request_context is not None:
+            await self.client.reasoning_receipts(
+                reasoning_scope(self.request_context),
+                sorted(self.reasoning_digests),
+                record=True,
+                correlation_id=self.correlation_id,
+                policy_version=self.request_stats.analysis.policy_version
+                if self.request_stats
+                else None,
+            )
+            self.reasoning_digests.clear()
 
     def _process_response_bytes(
         self, chunk: bytes, end: bool

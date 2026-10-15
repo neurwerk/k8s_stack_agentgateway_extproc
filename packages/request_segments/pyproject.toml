@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "neurwerk-request-segments"
-version = "0.1.1"
+version = "0.1.2"
 description = "Shared supported-request extraction and lossless text reconstruction"
 readme = "README.md"
 license = "MIT"
