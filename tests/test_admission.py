@@ -14,7 +14,6 @@ from pydantic import ValidationError
 from agentgateway_extproc.config.settings import (
     EngineSettings,
     NoticePreferencesSettings,
-    RejectionCaptureSettings,
     Settings,
 )
 from agentgateway_extproc.controllers.grpc_servicer import ExtProcServicer
@@ -67,16 +66,13 @@ def body(model="example-chat", *, responses=False, stream=False):
     ).encode()
 
 
-async def exchange(client, messages, *, settings=None, exporter=None):
+async def exchange(client, messages, *, settings=None):
     async def requests():
         for message in messages:
             yield message
 
     return [
-        reply
-        async for reply in ExtProcServicer(client, settings, rejection_langfuse=exporter).Process(
-            requests(), object()
-        )
+        reply async for reply in ExtProcServicer(client, settings).Process(requests(), object())
     ]
 
 
@@ -384,16 +380,9 @@ async def test_provider_rejection_keeps_status_without_consuming_or_echoing_cred
 @pytest.mark.parametrize(
     "reason", ["limit", "invalid_json", "permission", "changed_metadata", "overload"]
 )
-async def test_v5_never_enters_raw_rejection_sinks(
-    admission, engine_client, tmp_path, caplog, reason
-):
-    directory = tmp_path / "captures"
-    settings = Settings(
-        max_request_bytes=1024,
-        rejection_capture=RejectionCaptureSettings(enabled=True, directory=directory),
-    )
-    exporter = Mock()
-    servicer = ExtProcServicer(engine_client, settings, rejection_langfuse=exporter)
+async def test_v5_rejections_do_not_disclose_content(admission, engine_client, caplog, reason):
+    settings = Settings(max_request_bytes=1024)
+    servicer = ExtProcServicer(engine_client, settings)
     payload = body()
     body_policy = deepcopy(admission)
     if reason == "limit":
@@ -414,8 +403,6 @@ async def test_v5_never_enters_raw_rejection_sinks(
 
     replies = [reply async for reply in servicer.Process(requests(), object())]
     assert replies[-1].HasField("immediate_response")
-    exporter.submit.assert_not_called()
-    assert not directory.exists()
     assert SECRET not in str(replies) + caplog.text
 
 

@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 import re
-from typing import Annotated, Literal, cast
+from typing import Annotated, Literal
 
-from google.protobuf.json_format import MessageToDict
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator, model_validator
 
-from agentgateway_extproc.gen import ext_proc_pb2
 from agentgateway_extproc.models.exceptions import (
     ContextForgeAccountRequiredError,
     TrustedMetadataError,
@@ -265,23 +263,6 @@ type DestinationPolicy = ModelDestinationPolicy | McpDestinationPolicy
 DESTINATION_POLICY_ADAPTER: TypeAdapter[DestinationPolicy] = TypeAdapter(
     Annotated[DestinationPolicy, Field(discriminator="destination_kind")]
 )
-
-
-def destination_policy_from_request(
-    request: ext_proc_pb2.ProcessingRequest,
-) -> DestinationPolicy:
-    """Read one strict policy from the trusted protobuf metadata namespace."""
-    try:
-        metadata = request.metadata_context.filter_metadata[DESTINATION_POLICY_NAMESPACE]
-        payload = cast(
-            dict[str, object],
-            MessageToDict(metadata, preserving_proto_field_name=True),
-        )
-        return destination_policy_from_payload(payload)
-    except TrustedMetadataError:
-        raise
-    except (KeyError, TypeError, ValueError) as exc:
-        raise TrustedMetadataError from exc
 
 
 def destination_policy_from_payload(payload: dict[str, object]) -> DestinationPolicy:

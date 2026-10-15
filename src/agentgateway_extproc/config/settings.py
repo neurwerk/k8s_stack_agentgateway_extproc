@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
 
@@ -134,57 +133,6 @@ class NoticePreferencesSettings(BaseModel):
         return self
 
 
-class RejectionCaptureSettings(BaseModel):
-    """Bound optional original-body captures in a private diagnostic directory."""
-
-    enabled: bool = False
-    directory: Path = Path("/var/run/extproc-diagnostics/captures")
-    max_file_bytes: int = Field(default=6 * MEBIBYTE, ge=1024, le=65 * MEBIBYTE)
-    max_total_bytes: int = Field(default=30 * MEBIBYTE, ge=1024, le=256 * MEBIBYTE)
-    max_files: int = Field(default=20, ge=1, le=100)
-    retention_seconds: int = Field(default=3600, ge=60, le=86400)
-
-    @model_validator(mode="after")
-    def validate_storage(self) -> RejectionCaptureSettings:
-        """Reject inconsistent capture budgets and relative diagnostic paths."""
-        if self.max_total_bytes < self.max_file_bytes or not self.directory.is_absolute():
-            raise ValueError("capture requires an absolute directory and total >= file limit")  # noqa: TRY003
-        return self
-
-
-class RejectionLangfuseSettings(BaseModel):
-    """Bound optional rejected-request exports to a dedicated debug project."""
-
-    enabled: bool = False
-    endpoint: str = ""
-    public_key: SecretStr = SecretStr("")
-    secret_key: SecretStr = SecretStr("")
-    allow_http: bool = False
-    max_capture_bytes: int = Field(default=65536, ge=1024, le=1048576)
-    queue_capacity: int = Field(default=32, ge=1, le=128)
-    timeout_seconds: float = Field(default=2, gt=0, le=10)
-
-    @model_validator(mode="after")
-    def validate_export(self) -> RejectionLangfuseSettings:
-        """Validate a supplied destination; absent credentials disable only export."""
-        url = urlsplit(self.endpoint)
-        if (
-            self.enabled
-            and self.endpoint
-            and (
-                url.scheme not in ({"https", "http"} if self.allow_http else {"https"})
-                or not url.hostname
-                or url.username is not None
-                or url.password is not None
-                or url.query
-                or url.fragment
-                or url.path != "/api/public/otel/v1/traces"
-            )
-        ):
-            raise ValueError("rejection export requires a valid OTLP endpoint")  # noqa: TRY003
-        return self
-
-
 class Settings(BaseSettings):
     """Load adapter configuration from ``EXTPROC_`` environment variables."""
 
@@ -195,8 +143,6 @@ class Settings(BaseSettings):
     docling: DoclingSettings = Field(default_factory=DoclingSettings)
     image_inspection: ImageInspectionSettings = Field(default_factory=ImageInspectionSettings)
     notice_preferences: NoticePreferencesSettings = Field(default_factory=NoticePreferencesSettings)
-    rejection_capture: RejectionCaptureSettings = Field(default_factory=RejectionCaptureSettings)
-    rejection_langfuse: RejectionLangfuseSettings = Field(default_factory=RejectionLangfuseSettings)
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "WARNING"
     max_request_bytes: int = Field(default=MAX_REQUEST_BYTES, ge=1_024, le=MAX_UPLOAD_REQUEST_BYTES)
     max_response_bytes: int = Field(default=MAX_RESPONSE_BYTES, ge=1_024, le=MAX_RESPONSE_BYTES)

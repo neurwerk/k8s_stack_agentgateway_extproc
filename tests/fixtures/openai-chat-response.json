@@ -11,7 +11,7 @@
       "logprobs": null
     }
   ],
-  "usage": {"prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30},
+  "usage": {"prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30, "new_counter": 0},
   "system_fingerprint": "fp-example",
   "service_tier": "default"
 }

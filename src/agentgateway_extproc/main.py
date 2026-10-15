@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import signal
-from contextlib import suppress
 from typing import cast
 
 import grpc
@@ -20,8 +19,6 @@ from agentgateway_extproc.lib.docling import DoclingClient
 from agentgateway_extproc.lib.engine.client import EngineClient
 from agentgateway_extproc.lib.image_inspection import ImageInspectionClient
 from agentgateway_extproc.lib.notice.preferences import NoticePreferencesClient
-from agentgateway_extproc.lib.rejection_capture import RejectionCapture, RejectionCaptureConfig
-from agentgateway_extproc.lib.rejection_langfuse import RejectionLangfuse
 
 
 def main() -> None:
@@ -43,13 +40,9 @@ async def _run(settings: Settings) -> None:
     image_inspection = ImageInspectionClient(settings.image_inspection)
     docling = DoclingClient(settings.docling, image_inspection=image_inspection)
     preferences = NoticePreferencesClient(settings.notice_preferences)
-    capture = RejectionCapture(RejectionCaptureConfig(**settings.rejection_capture.model_dump()))
-    rejection_langfuse = RejectionLangfuse(settings.rejection_langfuse)
-    server = create_grpc_server(settings, client, docling, preferences, rejection_langfuse)
+    server = create_grpc_server(settings, client, docling, preferences)
     server.add_insecure_port("[::]:9000")
     await server.start()
-    rejection_langfuse.start()
-    capture_cleanup = asyncio.create_task(capture.run_cleanup())
     http_server = uvicorn.Server(
         uvicorn.Config(
             create_http_app(client),
@@ -69,12 +62,8 @@ async def _run(settings: Settings) -> None:
     try:
         await http_server.serve()
     finally:
-        capture_cleanup.cancel()
-        with suppress(asyncio.CancelledError):
-            await capture_cleanup
         try:
             await server.stop(grace=settings.shutdown_grace_seconds)
-            await rejection_langfuse.close()
             await docling.close()
             await image_inspection.close()
             await client.close()
@@ -89,7 +78,6 @@ def create_grpc_server(
     client: EngineClient,
     docling: DoclingClient | None = None,
     preferences: NoticePreferencesClient | None = None,
-    rejection_langfuse: RejectionLangfuse | None = None,
 ) -> grpc.aio.Server:
     """Create the extProc server with an explicit finite receive-message limit."""
     server = cast(
@@ -102,7 +90,7 @@ def create_grpc_server(
         ),
     )
     ext_proc_pb2_grpc.add_ExternalProcessorServicer_to_server(
-        ExtProcServicer(client, settings, docling, preferences, rejection_langfuse), server
+        ExtProcServicer(client, settings, docling, preferences), server
     )
     return server
 

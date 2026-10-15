@@ -26,7 +26,7 @@ from agentgateway_extproc.lib.image_inspection import (
     ImageInspectionClient,
     ImageInspectionTimeoutError,
 )
-from agentgateway_extproc.lib.pipeline.mcp import strict_json_loads
+from agentgateway_extproc.lib.json_limits import strict_json_loads
 from agentgateway_extproc.models.engine import EngineAttachmentPart
 
 _STATUSES = {"pending", "started", "success", "partial_success", "failure", "skipped"}
