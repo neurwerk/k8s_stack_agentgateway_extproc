@@ -593,7 +593,7 @@ async def test_engine_response_rejects_ten_mibibytes_plus_one_before_parsing(
     client = _client_streaming(200, content) if chunked else _client_returning(200, content)
 
     with (
-        patch("agentgateway_extproc.lib.engine.client.json.loads") as loads,
+        patch("agentgateway_extproc.lib.engine.client.strict_json_loads") as loads,
         pytest.raises(InvalidEngineReplyError),
     ):
         await client.analyze_request(

@@ -215,7 +215,7 @@ async def test_reviewed_controls_are_scoped_typed_and_preserved_through_rebuild(
         ],
     }
     original = parse_request(document, controls=controls)
-    converted, _ = _converted_request(document, ["Jane"], {}, controls=original._controls)
+    converted, _ = _converted_request(document, ["Jane"], controls=original._controls)
     inspected = extract_request(converted)
     reconstructed = inspected.rebuild(inspected.segments)
     reply = EngineReply.model_validate({**engine_reply, "request": reconstructed})

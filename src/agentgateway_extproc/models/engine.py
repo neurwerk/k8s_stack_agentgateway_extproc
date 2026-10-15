@@ -202,15 +202,6 @@ class VisualFindings(EngineModel):
     faces: FaceFindings
 
 
-class EngineDocumentRequest(EngineModel):
-    """Add trusted controls to a converted text-only Chat or Responses request."""
-
-    api_version: Literal["v1"]
-    request: EngineChatRequest | EngineResponsesRequest
-    text_pii_enabled: Annotated[bool, Field(strict=True)]
-    visual_findings: VisualFindings
-
-
 type PIIAction = Literal[
     "pass",
     "block",

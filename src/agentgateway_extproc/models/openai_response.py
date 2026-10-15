@@ -1,4 +1,4 @@
-"""Closed v5 OpenAI text/function response shapes, independent of legacy parsing."""
+"""Inspection-owned content shapes with bounded, extensible provider metadata."""
 
 from typing import Annotated, Literal
 
@@ -11,8 +11,13 @@ type OutputIndex = Annotated[int, Field(ge=0, le=255)]
 type ChoiceIndex = Annotated[int, Field(ge=0, le=15)]
 type FinishReason = Literal["stop", "length", "tool_calls", "content_filter"]
 type ItemStatus = Literal["in_progress", "completed", "incomplete"]
-type ServiceTier = Literal["auto", "default", "flex", "scale", "priority", "fast"]
 type EmptyList = Annotated[list[None], Field(max_length=0)]
+type MetadataToken = Annotated[str, Field(pattern=r"^[a-z][a-z0-9_-]*$", max_length=64)]
+type ControlMetadata = Annotated[dict[MetadataToken, MetadataToken | None], Field(max_length=64)]
+type UsageMetadata = Annotated[
+    dict[MetadataToken, Annotated[int | float, Field(ge=0)] | bool | UsageMetadata | None],
+    Field(max_length=128),
+]
 
 
 class ResponseModel(BaseModel):
@@ -21,47 +26,15 @@ class ResponseModel(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, allow_inf_nan=False)
 
 
-class PromptTokens(ResponseModel):
-    """Known prompt-token breakdown."""
+class MetadataEnvelope(ResponseModel):
+    """Allow new numeric/null/boolean facts only outside content carriers.
 
-    audio_tokens: Count | None = None
-    cached_tokens: Count | None = None
-    cache_write_tokens: Count | None = None
-    image_tokens: Count | None = None
-    text_tokens: Count | None = None
-    video_tokens: Count | None = None
+    Strings and containers require an explicitly classified field. Original JSON
+    is forwarded, not this validation view; native AgentGateway owns accounting.
+    """
 
-
-class CompletionTokens(ResponseModel):
-    """Known completion-token breakdown, containing counts rather than reasoning content."""
-
-    accepted_prediction_tokens: Count | None = None
-    audio_tokens: Count | None = None
-    reasoning_tokens: Count | None = None
-    rejected_prediction_tokens: Count | None = None
-    text_tokens: Count | None = None
-    image_tokens: Count | None = None
-
-
-class ChatCost(ResponseModel):
-    """Reported OpenRouter cost metadata, without inferring accounting completeness."""
-
-    upstream_inference_cost: float | None = Field(default=None, ge=0)
-    upstream_inference_prompt_cost: float = Field(ge=0)
-    upstream_inference_completions_cost: float = Field(ge=0)
-
-
-class ChatUsage(ResponseModel):
-    """Preserve provider usage facts without inferring completeness."""
-
-    prompt_tokens: Count
-    completion_tokens: Count
-    total_tokens: Count
-    prompt_tokens_details: PromptTokens | None = None
-    completion_tokens_details: CompletionTokens | None = None
-    cost: float | None = Field(default=None, ge=0)
-    is_byok: bool | None = None
-    cost_details: ChatCost | None = None
+    model_config = ConfigDict(extra="allow")
+    __pydantic_extra__: dict[str, int | float | bool | None] = Field(init=False)
 
 
 class Function(ResponseModel):
@@ -100,15 +73,15 @@ class ChatChoice(ResponseModel):
     native_finish_reason: Identifier | None = None
 
 
-class ChatEnvelope(ResponseModel):
+class ChatEnvelope(MetadataEnvelope):
     """Stable Chat envelope fields, shared by JSON responses and streaming chunks."""
 
     id: Identifier
     created: Count
     model: Identifier
     system_fingerprint: Identifier | None = None
-    service_tier: ServiceTier | None = None
-    usage: ChatUsage | None = None
+    service_tier: MetadataToken | None = None
+    usage: UsageMetadata | None = None
     provider: Identifier | None = None
 
 
@@ -206,40 +179,10 @@ class OutputFunction(ResponseModel):
 type OutputItem = Annotated[OutputMessage | OutputFunction, Field(discriminator="type")]
 
 
-class InputTokens(ResponseModel):
-    """Responses cached input count."""
-
-    cached_tokens: Count
-
-
-class OutputTokens(ResponseModel):
-    """Responses reasoning count, never opaque reasoning content."""
-
-    reasoning_tokens: Count
-
-
-class ResponsesUsage(ResponseModel):
-    """Native Responses usage fields."""
-
-    input_tokens: Count
-    output_tokens: Count
-    total_tokens: Count
-    input_tokens_details: InputTokens | None = None
-    output_tokens_details: OutputTokens | None = None
-
-
 class IncompleteDetails(ResponseModel):
     """Qualified protocol completion reasons for an incomplete generation."""
 
     reason: Literal["max_output_tokens", "content_filter"]
-
-
-class ReasoningControls(ResponseModel):
-    """Non-content controls are distinct from unsupported opaque output items."""
-
-    effort: Literal["none", "minimal", "low", "medium", "high", "xhigh"] | None = None
-    summary: Literal["auto", "concise", "detailed"] | None = None
-    generate_summary: Literal["auto", "concise", "detailed"] | None = None
 
 
 class FunctionChoice(ResponseModel):
@@ -257,41 +200,36 @@ class AllowedTools(ResponseModel):
     tools: list[FunctionChoice] = Field(min_length=1, max_length=128)
 
 
-class ResponsesResponse(ResponseModel):
-    """Closed Responses envelope with qualified output and reflected request controls."""
+class ResponsesResponse(MetadataEnvelope):
+    """Validate output and reflected content without mirroring provider accounting."""
 
     id: Identifier
     object: Literal["response"]
     created_at: Count
     completed_at: Count | None = None
-    access_programs: None = None
+    access_programs: ControlMetadata | None = None
     model: Identifier
     status: ItemStatus
     output: list[OutputItem] = Field(max_length=256)
     error: None = None
     incomplete_details: IncompleteDetails | None = None
-    usage: ResponsesUsage | None = None
+    usage: UsageMetadata | None = None
+    tool_usage: UsageMetadata | None = None
     background: Literal[False] | None = None
     instructions: str | None = None
-    max_output_tokens: Annotated[int, Field(ge=1)] | None = None
-    max_tool_calls: Annotated[int, Field(ge=1)] | None = None
-    parallel_tool_calls: bool | None = None
     previous_response_id: None = None
-    reasoning: ReasoningControls | None = None
-    reasoning_effort: Literal["none", "minimal", "low", "medium", "high", "xhigh"] | None = None
-    service_tier: ServiceTier | None = None
-    store: bool | None = None
-    temperature: Annotated[float, Field(ge=0, le=2)] | None = None
+    reasoning: ControlMetadata | None = None
+    reasoning_effort: MetadataToken | None = None
+    service_tier: MetadataToken | None = None
     text: EngineResponseTextConfig | None = None
     tool_choice: Literal["auto", "none", "required"] | FunctionChoice | AllowedTools | None = None
     tools: list[EngineResponseToolDefinition] | None = Field(default=None, max_length=128)
     top_logprobs: Literal[0] | None = None
-    top_p: Annotated[float, Field(ge=0, le=1)] | None = None
-    truncation: Literal["disabled", "auto"] | None = None
+    truncation: MetadataToken | None = None
     user: str | None = Field(default=None, max_length=256)
     safety_identifier: str | None = Field(default=None, max_length=256)
     prompt_cache_key: str | None = Field(default=None, max_length=256)
-    prompt_cache_retention: Literal["in_memory", "24h"] | None = None
+    prompt_cache_retention: Identifier | None = None
     metadata: (
         Annotated[
             dict[Annotated[str, Field(max_length=64)], Annotated[str, Field(max_length=512)]],

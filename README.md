@@ -17,9 +17,15 @@ operation. Proxy paths retain their exact provider path. MCP uses
 
 Supported model profiles are OpenAI Chat/Responses, Anthropic Messages and Google
 generateContent. Requests use JSON and complete buffered bodies. Responses use
-closed JSON/SSE schemas with explicit completion; EOF alone is not completion.
+JSON/SSE content validation with explicit completion; EOF alone is not completion.
 See [`profiles.py`](src/agentgateway_extproc/lib/pipeline/profiles.py) for paths and
 [`openai_response.py`](src/agentgateway_extproc/models/openai_response.py) for OpenAI shapes.
+
+OpenAI envelopes preserve new numeric, boolean and null metadata. Reviewed usage
+namespaces accept bounded numeric breakdowns; reasoning settings and access programs
+accept bounded control labels. Content carriers, reflected instructions/tools and
+stream lifecycles stay strict. New text, objects or event types need classification;
+AgentGateway owns provider compatibility and accounting.
 
 Opaque reasoning continuation, stored prior Responses, background execution,
 website adapters and unqualified transports are rejected.
@@ -34,7 +40,7 @@ website adapters and unqualified transports are rejected.
 - A company request may reroute before dispatch only to an explicitly approved
   local target whose invocation grant is also present. Personal credentials cannot.
 - `neurwerk.request_context` records the selected model and actual dispatch target.
-  Credentials, cookies and restoration maps are excluded. Raw request capture is disabled.
+  Credentials, cookies and restoration maps are excluded. Raw request capture is removed.
 - PII and content tracing are independent. Restoration is request-scoped; usage
   completeness remains unknown until the gateway has sufficient provider evidence.
 
@@ -43,6 +49,7 @@ Plain JSON provider HTTP 400 bodies are inspected up to 8 KiB for recognized
 model/parameter errors; raw bodies and headers never enter logs or client errors.
 Other provider errors are rejected at headers. Search OpenSearch by the request ID
 returned in the client error; stream failures carry the same ID in processor logs.
+The standalone `lib.rejection_retention` command remains for historical debug-data cleanup.
 
 ## Development
 

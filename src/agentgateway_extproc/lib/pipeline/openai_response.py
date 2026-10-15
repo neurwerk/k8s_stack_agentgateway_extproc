@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from hashlib import sha256
 from typing import TYPE_CHECKING
 
-from agentgateway_extproc.lib.pipeline.mcp import strict_json_loads
+from agentgateway_extproc.lib.json_limits import strict_json_loads
 from agentgateway_extproc.lib.pipeline.sse import SseEvent
 from agentgateway_extproc.models.exceptions import InvalidReversalError
 from agentgateway_extproc.models.openai_response import (

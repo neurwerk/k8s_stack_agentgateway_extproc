@@ -5,12 +5,12 @@
 from __future__ import annotations
 
 import json
-import math
 from typing import TYPE_CHECKING, Any
 
 from neurwerk_request_segments import extract_request, parse_request
 
 from agentgateway_extproc.gen import ext_proc_pb2
+from agentgateway_extproc.lib.json_limits import strict_json_loads
 from agentgateway_extproc.lib.masking.reversal import PlaceholderStreamRewriter
 from agentgateway_extproc.lib.notice.inject import render_notice
 from agentgateway_extproc.lib.notice.report import face_status_visible, render_report, row_visible
@@ -44,54 +44,6 @@ _RESPONSES_TERMINALS = {
     "response.incomplete",
     "error",
 }
-_OPAQUE_RESPONSE_REASONING_FIELDS = (
-    "reasoning_content",
-    "reasoning",
-    "reasoning_details",
-    "thinking_blocks",
-    "reasoning_signature",
-)
-type OpaqueResponseReasoning = list[tuple[int, dict[str, Any]]]
-
-
-def split_safe_prefix(text: str) -> tuple[str, str]:
-    """Retain a possible reserved placeholder suffix for compatibility callers."""
-    last_open = text.rfind("<")
-    if last_open < 0 or ">" in text[last_open:]:
-        return text, ""
-    suffix = text[last_open:]
-    prefixes = ("<REV_", "<ENCRYPTED_")
-    if any(prefix.startswith(suffix) or suffix.startswith(prefix) for prefix in prefixes):
-        return text[:last_open], suffix
-    return text, ""
-
-
-def strict_json_loads(value: str) -> Any:
-    """Decode one strict JSON value without duplicate names or non-finite numbers."""
-
-    def reject_duplicate_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-        result: dict[str, Any] = {}
-        for key, item in pairs:
-            if key in result:
-                raise ValueError("JSON object contains duplicate keys")
-            result[key] = item
-        return result
-
-    def reject_constant(value: str) -> None:
-        raise ValueError(f"JSON contains unsupported constant: {value}")
-
-    def finite_float(value: str) -> float:
-        parsed = float(value)
-        if not math.isfinite(parsed):
-            raise ValueError("JSON contains a non-finite number")
-        return parsed
-
-    return json.loads(
-        value,
-        object_pairs_hook=reject_duplicate_pairs,
-        parse_constant=reject_constant,
-        parse_float=finite_float,
-    )
 
 
 def _json_dumps(value: Any) -> str:
@@ -316,7 +268,6 @@ def process_json_response(handler: StreamHandler, text: str) -> str:
     """Transform one complete JSON document and insert one valid notice carrier."""
     payload = strict_json_loads(text)
     _validate_profile_response(handler, payload)
-    opaque_reasoning = _take_opaque_chat_reasoning(handler, payload, "message")
     if handler.response_api_kind == "chat":
         _reverse_structured_chat_content(handler, payload)
     target = _json_notice_target(handler, payload)
@@ -337,57 +288,14 @@ def process_json_response(handler: StreamHandler, text: str) -> str:
     if notice and transformed_target is not None:
         container, field = transformed_target
         container[field] += notice
-    _restore_opaque_chat_reasoning(payload, "message", opaque_reasoning)
     return _json_dumps(payload)
 
 
-def _take_opaque_chat_reasoning(
-    handler: StreamHandler, payload: Any, carrier: str
-) -> OpaqueResponseReasoning:
-    """Detach exact Chat reasoning fields from all response processing."""
-    if handler.response_api_kind != "chat" or not isinstance(payload, dict):
-        return []
-    choices = payload.get("choices")
-    if not isinstance(choices, list):
-        return []
-    detached: OpaqueResponseReasoning = []
-    for index, choice in enumerate(choices):
-        if not isinstance(choice, dict):
-            continue
-        container = choice.get(carrier)
-        if not isinstance(container, dict):
-            continue
-        values = {
-            field: container.pop(field)
-            for field in _OPAQUE_RESPONSE_REASONING_FIELDS
-            if field in container
-        }
-        if values:
-            detached.append((index, values))
-    return detached
-
-
 def _validate_profile_response(handler: StreamHandler, payload: Any) -> None:
-    """Validate every v5 envelope field before legacy restoration can detach any content."""
+    """Validate content carriers and completion before restoration."""
     if handler.admission is None or handler.response_api_kind == "mcp":
         return
     validate_json_response(handler.response_api_kind, payload)
-
-
-def _restore_opaque_chat_reasoning(
-    payload: Any, carrier: str, reasoning: OpaqueResponseReasoning
-) -> None:
-    """Restore detached reasoning values without inspecting or transforming them."""
-    choices = payload.get("choices") if isinstance(payload, dict) else None
-    if not isinstance(choices, list):
-        return
-    for index, values in reasoning:
-        if index >= len(choices) or not isinstance(choices[index], dict):
-            continue
-        container = choices[index].get(carrier)
-        if not isinstance(container, dict):
-            continue
-        container.update(values)
 
 
 def _reverse_human_json_text(handler: StreamHandler, payload: Any) -> None:
@@ -558,7 +466,6 @@ class SseResponseProcessor:
         self._responses_count_source: str | None = None
         self._responses_tail_held = False
         self._responses_terminal_type: str | None = None
-        self._plain_sse = False
         self._profile = (
             OpenAIStreamValidator(
                 handler.response_api_kind,
@@ -634,19 +541,11 @@ class SseResponseProcessor:
         try:
             payload = strict_json_loads(event.data)
         except (ValueError, json.JSONDecodeError):
-            if self._handler.admission is not None:
-                raise InvalidReversalError("profile SSE data must be JSON") from None
-            if self._handler.text_pii_enabled and RESERVED_PLACEHOLDER_PREFIX_RE.search(event.data):
-                raise InvalidReversalError(
-                    "SSE response has unstructured placeholder output"
-                ) from None
-            self._plain_sse = True
-            return
+            raise InvalidReversalError("profile SSE data must be JSON") from None
         if self._profile is not None:
             self._profile.accept(event, payload)
         if not isinstance(payload, dict):
             raise InvalidReversalError("SSE event data must be a JSON object")
-        opaque_reasoning = _take_opaque_chat_reasoning(self._handler, payload, "delta")
         if self._handler.response_api_kind == "responses":
             self._transform_responses(payload)
         else:
@@ -655,7 +554,6 @@ class SseResponseProcessor:
             validated = _reverse_json_values(self._handler, payload)
             payload.clear()
             payload.update(validated)
-        _restore_opaque_chat_reasoning(payload, "delta", opaque_reasoning)
         event.replace_data(_json_dumps(payload))
 
     def _transform_chat(self, payload: dict[str, Any]) -> None:
@@ -983,10 +881,6 @@ class SseResponseProcessor:
                 event.replace_data(_json_dumps(payload))
 
     def _render_chat_notice(self, notice: str) -> list[str]:
-        if self._plain_sse:
-            return [SseEvent(lines=[("data", notice)]).render()] + [
-                event.render() for event in self._held
-            ]
         notice_event = self._chat_notice_event(notice)
         if notice_event is None:
             return [event.render() for event in self._held]
@@ -1190,32 +1084,8 @@ def process_response_chunk(
         transformed = handler.sse_processor.feed(chunk, final=end_of_stream)
     elif handler.response_format == "json":
         transformed = process_json_response(handler, chunk)
-    elif not handler.text_pii_enabled:
-        transformed = chunk + (_render_handler_notice(handler) if end_of_stream else "")
     else:
-        guarded = chunk
-        if handler.guard_injected:
-            if handler.plain_guard_stripper is None:
-                handler.plain_guard_stripper = GuardStreamStripper()
-            guarded = handler.plain_guard_stripper.feed(chunk, final=end_of_stream)
-        if handler.plain_rewriter is None:
-            handler.plain_rewriter = PlaceholderStreamRewriter(
-                handler.reversal_map,
-                mark_invalid=True,
-                entity_prefixes=handler.reversal_entity_prefixes or None,
-            )
-        transformed, hits, misses = handler.plain_rewriter.feed(guarded, final=end_of_stream)
-        _record(
-            handler,
-            hits,
-            misses,
-            report_target=(handler.response_notice_allowed and _notice_configured(handler)),
-            allow_invalid=True,
-        )
-        if end_of_stream:
-            transformed += _render_handler_notice(handler)
-            handler.plain_rewriter = None
-            handler.plain_guard_stripper = None
+        raise InvalidReversalError("unsupported response format")
     if end_of_stream:
         handler.reversal_map.clear()
         handler.notice_messages.clear()

@@ -18,14 +18,13 @@ from agentgateway_extproc.gen import ext_proc_pb2
 from agentgateway_extproc.lib.documents import MAX_TEXT, DocumentError, ImageBatch
 from agentgateway_extproc.lib.engine.client import EngineClient
 from agentgateway_extproc.lib.image_policy import image_output
-from agentgateway_extproc.lib.json_limits import JsonBudgetError
+from agentgateway_extproc.lib.json_limits import JsonBudgetError, strict_json_loads
 from agentgateway_extproc.lib.masking.reversal import placeholder_entity_prefixes
 from agentgateway_extproc.lib.pipeline.guard import inject_guard_instruction
 from agentgateway_extproc.lib.pipeline.mcp import (
     McpProtocolError,
     McpUnsupportedFeatureError,
     parse_mcp_message,
-    strict_json_loads,
 )
 from agentgateway_extproc.lib.pipeline.profiles import model_profile
 from agentgateway_extproc.lib.pipeline.reply_validation import (
@@ -69,15 +68,6 @@ from agentgateway_extproc.models.types import (
 if TYPE_CHECKING:
     from agentgateway_extproc.lib.pipeline.stream_handler import StreamHandler
 
-type OpaqueReasoning = dict[int, dict[str, object]]
-
-_OPAQUE_REQUEST_REASONING_FIELDS = (
-    "reasoning_content",
-    "reasoning",
-    "reasoning_details",
-    "thinking_blocks",
-    "reasoning_signature",
-)
 _UNCHECKED_IMAGE_MARKER = "[Image forwarded without privacy inspection]"
 _logger = logging.getLogger(__name__)
 
@@ -122,7 +112,6 @@ async def process_request(
         from agentgateway_extproc.lib.pipeline.native_request import process_native_request
 
         return await process_native_request(handler, payload)
-    opaque_reasoning: OpaqueReasoning = {}
     converted = False
     image_locations: dict[tuple[int, int], str] = {}
     unchecked_image_locations: dict[tuple[int, int], str] = {}
@@ -172,12 +161,6 @@ async def process_request(
         )
         handler.record_dispatch("mcp_analyzed")
     else:
-        try:
-            if handler.admission is None:
-                opaque_reasoning = _extract_opaque_chat_reasoning(payload)
-        except ValueError:
-            handler.record_dispatch("protocol_failure")
-            return immediate_response(400, '{"error":"invalid model request"}')
         try:
             path = handler.request_headers.get(":path", "").split("?", 1)[0]
             kind = (
@@ -308,7 +291,6 @@ async def process_request(
                         payload,
                         texts_by_index,
                         images,
-                        opaque_reasoning,
                         controls=request._controls,
                     )
                     unchecked_without_documents = not document_indexes
@@ -325,9 +307,7 @@ async def process_request(
                         visual_findings = _visual_findings(attachments, images)
                         if image_forwarding != "none":
                             image_locations = _image_locations(payload, images)
-                    request, body = _converted_request(
-                        payload, texts, opaque_reasoning, controls=request._controls
-                    )
+                    request, body = _converted_request(payload, texts, controls=request._controls)
             except DocumentError as exc:
                 if policy.contract_version == "4.1" and exc.reason.startswith(
                     ("extraction_", "image_analysis_", "image_inspection_")
@@ -377,9 +357,7 @@ async def process_request(
                         image_locations = _image_locations(payload, images)
                 else:
                     texts = await handler.docling.convert(attachments)
-                request, body = _converted_request(
-                    payload, texts, opaque_reasoning, controls=request._controls
-                )
+                request, body = _converted_request(payload, texts, controls=request._controls)
             except DocumentError as exc:
                 _clear_request(handler)
                 handler.record_dispatch("transport_failure")
@@ -421,7 +399,6 @@ async def process_request(
                 data = cast(dict[str, object], strict_json_loads(body.decode()))
                 try:
                     _replace_unchecked_images(data, unchecked_image_locations, offset=0)
-                    _restore_opaque_chat_reasoning(data, opaque_reasoning, offset=0)
                     body = json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode()
                     if len(body) > handler.max_transformed_request_bytes:
                         _raise_output_limit(len(body), handler.max_transformed_request_bytes)
@@ -614,9 +591,6 @@ async def process_request(
         for message in _dict_list(serialized.get("messages")):
             if message.get("tool_calls") == []:
                 del message["tool_calls"]
-        _restore_opaque_chat_reasoning(
-            serialized, opaque_reasoning, offset=int(handler.guard_injected)
-        )
     if image_locations:
         try:
             _restore_images(
@@ -817,7 +791,6 @@ def _image_policy_block(
 def _converted_request(
     payload: object,
     texts: list[str],
-    reasoning: OpaqueReasoning,
     *,
     controls: CompatibilitySettings | None = None,
 ) -> tuple[EngineChatRequest | EngineResponsesRequest, bytes]:
@@ -848,7 +821,6 @@ def _converted_request(
     if serialized_size > MAX_REQUEST_BYTES:
         _raise_output_limit(serialized_size, MAX_REQUEST_BYTES)
     _check_converted_text_limit(request)
-    _restore_opaque_chat_reasoning(data, reasoning, offset=0)
     body = json.dumps(data, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode()
     if len(body) > MAX_REQUEST_BYTES:
         _raise_output_limit(len(body), MAX_REQUEST_BYTES)
@@ -859,7 +831,6 @@ def _converted_unchecked_request(
     payload: object,
     texts: dict[int, str],
     images: ImageBatch,
-    reasoning: OpaqueReasoning,
     *,
     controls: CompatibilitySettings | None = None,
 ) -> tuple[
@@ -1022,57 +993,6 @@ def _clear_request(handler: StreamHandler) -> None:
     """Discard caller body and headers after request dispatch is complete."""
     handler.request_body_chunks.clear()
     handler.request_headers.clear()
-
-
-def _extract_opaque_chat_reasoning(payload: object) -> OpaqueReasoning:
-    """Remove trusted assistant reasoning before strict engine validation."""
-    if not isinstance(payload, dict):
-        return {}
-    messages = payload.get("messages")
-    if not isinstance(messages, list):
-        return {}
-    extracted: OpaqueReasoning = {}
-    for index, message in enumerate(messages):
-        if not isinstance(message, dict):
-            continue
-        present = {
-            field: message[field] for field in _OPAQUE_REQUEST_REASONING_FIELDS if field in message
-        }
-        if not present:
-            continue
-        if message.get("role") != "assistant":
-            raise ValueError(  # noqa: TRY003
-                "reasoning fields require an assistant message"
-            )
-        extracted[index] = present
-        for field in present:
-            del message[field]
-    return extracted
-
-
-def _restore_opaque_chat_reasoning(
-    payload: dict[str, object], reasoning: OpaqueReasoning, *, offset: int
-) -> None:
-    """Reattach reasoning with an explicit guard offset, including PII bypass."""
-    if not reasoning:
-        return
-    messages = payload.get("messages")
-    if not isinstance(messages, list):
-        raise InvalidEngineReplyError(  # noqa: TRY003
-            "transformed Chat request has no messages"
-        )
-    for original_index, fields in reasoning.items():
-        index = original_index + offset
-        if index >= len(messages):
-            raise InvalidEngineReplyError(  # noqa: TRY003
-                "transformed Chat request changed reasoning message"
-            )
-        message = messages[index]
-        if not isinstance(message, dict) or message.get("role") != "assistant":
-            raise InvalidEngineReplyError(  # noqa: TRY003
-                "transformed Chat request changed reasoning message"
-            )
-        message.update(fields)
 
 
 def _has_structured_chat_format(request: EngineChatRequest) -> bool:

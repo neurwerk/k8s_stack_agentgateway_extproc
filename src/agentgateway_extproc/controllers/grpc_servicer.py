@@ -23,8 +23,6 @@ from agentgateway_extproc.lib.notice.preferences import NoticePreferencesClient
 from agentgateway_extproc.lib.pipeline.mcp import McpProtocolError, McpUnsupportedFeatureError
 from agentgateway_extproc.lib.pipeline.request import immediate_response
 from agentgateway_extproc.lib.pipeline.stream_handler import StreamHandler
-from agentgateway_extproc.lib.rejection_capture import RejectionCapture, RejectionCaptureConfig
-from agentgateway_extproc.lib.rejection_langfuse import RejectionLangfuse
 from agentgateway_extproc.lib.rejections import annotate_rejection, log_limit_rejection
 from agentgateway_extproc.metrics import active_streams, errors_total, response_failures_total
 from agentgateway_extproc.models.exceptions import (
@@ -69,17 +67,12 @@ class ExtProcServicer(ext_proc_pb2_grpc.ExternalProcessorServicer):
         settings: Settings | None = None,
         docling: DoclingClient | None = None,
         preferences_client: NoticePreferencesClient | None = None,
-        rejection_langfuse: RejectionLangfuse | None = None,
     ) -> None:
         """Store the shared engine client used by all streams."""
         self._client = client
         self._settings = settings or Settings()
         self._docling = docling
         self._preferences_client = preferences_client
-        self._rejection_langfuse = rejection_langfuse
-        self._capture = RejectionCapture(
-            RejectionCaptureConfig(**self._settings.rejection_capture.model_dump())
-        )
         self._active = 0
         self._buffered_bytes = 0
 
@@ -117,17 +110,12 @@ class ExtProcServicer(ext_proc_pb2_grpc.ExternalProcessorServicer):
         )
         phase = StreamPhase()
         buffered_bytes = 0
-        original_body = b""
-        observed_bytes = 0
-        body_complete = False
         try:
             async for request in request_iterator:
                 kind = request.WhichOneof("request") or "unknown"
                 size = self._reserve_body(request)
                 if size is None:
-                    yield self._body_overloaded(
-                        handler.correlation_id, original_body, observed_bytes, body_complete
-                    )
+                    yield _overloaded(handler.correlation_id)
                     return
                 buffered_bytes += size
                 try:
@@ -136,12 +124,9 @@ class ExtProcServicer(ext_proc_pb2_grpc.ExternalProcessorServicer):
                         self._buffered_bytes -= buffered_bytes
                         buffered_bytes = 0
                     for output in outputs:
-                        await self._annotate_rejection(
-                            handler, output, original_body, observed_bytes, body_complete
-                        )
+                        self._annotate_rejection(handler, output)
                         phase.observe(output)
                         yield output
-                    original_body = b""
                 except asyncio.CancelledError:
                     # The peer can no longer receive an immediate response.
                     # Teardown still clears the stream-local reversal state.
@@ -150,9 +135,7 @@ class ExtProcServicer(ext_proc_pb2_grpc.ExternalProcessorServicer):
                     _record_dispatch_failure(handler, exc)
                     _log_committed_limit(handler, phase, exc)
                     output = await _failure_for_phase(context, phase, kind, exc, handler)
-                    await self._annotate_rejection(
-                        handler, output, original_body, observed_bytes, body_complete, exc
-                    )
+                    self._annotate_rejection(handler, output, exc)
                     yield output
                     return
                 if outputs and outputs[-1].HasField("immediate_response"):
@@ -160,41 +143,24 @@ class ExtProcServicer(ext_proc_pb2_grpc.ExternalProcessorServicer):
             try:
                 outputs = _finish_stream(handler)
                 for output in outputs:
-                    await self._annotate_rejection(handler, output, b"", 0, False)
+                    self._annotate_rejection(handler, output)
                     phase.observe(output)
                     yield output
             except Exception as exc:
                 _record_dispatch_failure(handler, exc)
                 _log_committed_limit(handler, phase, exc)
                 output = await _failure_for_phase(context, phase, "response_eof", exc, handler)
-                await self._annotate_rejection(handler, output, b"", 0, False, exc)
+                self._annotate_rejection(handler, output, exc)
                 yield output
         finally:
             handler.clear_sensitive_state()
             self._buffered_bytes -= buffered_bytes
             active_streams.dec()
 
-    def _body_overloaded(
-        self, correlation_id: str, body: bytes, observed_bytes: int, complete: bool
-    ) -> ext_proc_pb2.ProcessingResponse:
-        if observed_bytes > 0 and self._rejection_langfuse is not None:
-            self._rejection_langfuse.submit(
-                body,
-                request_id=correlation_id,
-                status=503,
-                observed_bytes=observed_bytes,
-                complete=complete,
-                reason="capacity_unavailable",
-            )
-        return _overloaded(correlation_id)
-
-    async def _annotate_rejection(
+    def _annotate_rejection(
         self,
         handler: StreamHandler,
         response: ext_proc_pb2.ProcessingResponse,
-        original_body: bytes,
-        observed_bytes: int,
-        complete: bool,
         error: Exception | None = None,
     ) -> None:
         if not response.HasField("immediate_response"):
@@ -231,43 +197,6 @@ class ExtProcServicer(ext_proc_pb2_grpc.ExternalProcessorServicer):
                 if code in {"provider_unsupported_parameter", "provider_stream_required"}
                 else "none",
             )
-            return
-        if (
-            status in {400, 413, 403, 503}
-            and observed_bytes > 0
-            and self._rejection_langfuse is not None
-        ):
-            self._rejection_langfuse.submit(
-                original_body,
-                request_id=handler.correlation_id,
-                status=status,
-                observed_bytes=observed_bytes,
-                complete=complete,
-                limit=limit,
-            )
-        if status not in {400, 413} or not self._capture.config.enabled:
-            return
-        declared = handler.request_headers.get("content-length", "")
-        declared_bytes = (
-            int(declared)
-            if declared.isascii() and declared.isdecimal() and len(declared) <= 20
-            else None
-        )
-        reference = await self._capture.capture_rejection(
-            original_body,
-            correlation_id=handler.correlation_id,
-            reason_code=limit.reason if limit is not None else "invalid_request",
-            complete=complete,
-            declared_bytes=declared_bytes,
-            observed_bytes=observed_bytes,
-        )
-        _logger.warning(
-            "rejection capture request_id=%s reference=%s observed_bytes=%d input_complete=%s",
-            handler.correlation_id,
-            reference or "unavailable",
-            observed_bytes,
-            complete,
-        )
 
 
 def _log_committed_limit(handler: StreamHandler, phase: StreamPhase, exc: Exception) -> None:
@@ -321,7 +250,6 @@ async def _handle_message(
     kind: str,
 ) -> tuple[ext_proc_pb2.ProcessingResponse, ...]:
     """Handle one input while preserving full-duplex headers-body-trailers order."""
-    handler.validate_destination_policy(request)
     expected_response = {
         "request_headers": "request_headers",
         "request_body": "request_body",
@@ -337,13 +265,14 @@ async def _handle_message(
         return (response,)
 
     outputs: list[ext_proc_pb2.ProcessingResponse] = []
+    # handle() validates admission before any trailer-triggered output is flushed.
+    response = await handler.handle(request)
     if kind == "response_trailers":
         final_body = handler.finish_response()
         if final_body is not None:
             outputs.extend(_ordered_response(handler, final_body))
             if final_body.HasField("immediate_response"):
                 return tuple(outputs)
-    response = await handler.handle(request)
     if response is not None:
         outputs.extend(_ordered_response(handler, response))
     return tuple(outputs)

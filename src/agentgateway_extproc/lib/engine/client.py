@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-import math
 import re
 import ssl
 import time
@@ -15,7 +13,7 @@ import httpx
 from neurwerk_request_segments import ExtractedRequest, TextSegment
 
 from agentgateway_extproc.config.settings import EngineSettings
-from agentgateway_extproc.lib.json_limits import JsonBudgetError, bounded_json_text
+from agentgateway_extproc.lib.json_limits import JsonBudgetError, strict_json_loads
 from agentgateway_extproc.lib.request_segments import extract_request
 from agentgateway_extproc.metrics import engine_request_latency_seconds, engine_requests_total
 from agentgateway_extproc.models.engine import (
@@ -131,12 +129,7 @@ class EngineClient:
                     response.status_code, content, correlation_id=correlation_id
                 )
             try:
-                payload = json.loads(
-                    _bounded_reply_json(content),
-                    object_pairs_hook=_unique_object,
-                    parse_constant=_reject_constant,
-                    parse_float=_finite_float,
-                )
+                payload = _parse_reply_json(content)
                 reply = _rebuild_reply(payload, extracted)
                 _validate_visual_reply(reply, request, visual_findings, text_pii_enabled)
             except InvalidEngineReplyError:
@@ -257,10 +250,10 @@ async def _read_bounded(response: httpx.Response, limit: int) -> bytes:
     return bytes(content)
 
 
-def _bounded_reply_json(content: bytes) -> str:
+def _parse_reply_json(content: bytes) -> object:
     """Preserve stopped structural counts when translating an invalid engine reply."""
     try:
-        return bounded_json_text(content)
+        return strict_json_loads(content)
     except JsonBudgetError as exc:
         raise InvalidEngineReplyError(limit=exc.limit) from exc
 
@@ -273,12 +266,7 @@ def _parse_engine_error(
 ) -> EnginePolicyError:
     """Validate a non-success envelope and bind its code to the HTTP status."""
     try:
-        payload = json.loads(
-            _bounded_reply_json(content),
-            object_pairs_hook=_unique_object,
-            parse_constant=_reject_constant,
-            parse_float=_finite_float,
-        )
+        payload = _parse_reply_json(content)
         reply = (
             EngineLimitErrorReply.model_validate(payload, strict=True)
             if isinstance(payload, dict) and payload.get("api_version") == "v2"
@@ -296,26 +284,3 @@ def _parse_engine_error(
         limit=reply.error.limit if isinstance(reply, EngineLimitErrorReply) else None,
         correlation_id=correlation_id,
     )
-
-
-def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
-    """Reject duplicate JSON keys before they can collapse trusted reply fields."""
-    result: dict[str, object] = {}
-    for key, value in pairs:
-        if key in result:
-            raise InvalidEngineReplyError
-        result[key] = value
-    return result
-
-
-def _reject_constant(_value: str) -> None:
-    """Reject NaN and infinity in trusted engine JSON."""
-    raise InvalidEngineReplyError
-
-
-def _finite_float(value: str) -> float:
-    """Reject JSON exponent overflow before typed engine validation."""
-    parsed = float(value)
-    if not math.isfinite(parsed):
-        raise InvalidEngineReplyError
-    return parsed

@@ -7,7 +7,6 @@ from __future__ import annotations
 import base64
 import binascii
 import json
-import math
 import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -19,7 +18,7 @@ from mcp_types import (
 )
 from mcp_types.methods import validate_client_request, validate_server_result
 
-from agentgateway_extproc.lib.json_limits import bounded_json_text
+from agentgateway_extproc.lib.json_limits import strict_json_loads
 from agentgateway_extproc.lib.masking.reversal import reverse_placeholders
 from agentgateway_extproc.lib.pipeline.sse import SseDecoder
 from agentgateway_extproc.models.destination import McpDestinationPolicy
@@ -266,34 +265,6 @@ def _parse_client_response(payload: dict[str, Any]) -> McpMessageContext:
         notification=False,
         engine_request=None,
         has_text_arguments=False,
-    )
-
-
-def strict_json_loads(value: str | bytes) -> Any:
-    """Decode strict JSON while rejecting duplicate names and non-finite numbers."""
-
-    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-        result: dict[str, Any] = {}
-        for key, item in pairs:
-            if key in result:
-                raise ValueError("JSON object contains duplicate keys")
-            result[key] = item
-        return result
-
-    def reject_constant(_value: str) -> None:
-        raise ValueError("JSON contains a non-finite number")
-
-    def finite_float(value: str) -> float:
-        parsed = float(value)
-        if not math.isfinite(parsed):
-            raise ValueError("JSON contains a non-finite number")
-        return parsed
-
-    return json.loads(
-        bounded_json_text(value),
-        object_pairs_hook=unique_object,
-        parse_constant=reject_constant,
-        parse_float=finite_float,
     )
 
 

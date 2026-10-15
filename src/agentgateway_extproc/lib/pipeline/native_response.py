@@ -16,9 +16,9 @@ from neurwerk_request_segments.native import (
 )
 from pydantic import Field, TypeAdapter
 
+from agentgateway_extproc.lib.json_limits import strict_json_loads
 from agentgateway_extproc.lib.masking.reversal import PlaceholderStreamRewriter
 from agentgateway_extproc.lib.pipeline.guard import GuardStreamStripper
-from agentgateway_extproc.lib.pipeline.mcp import strict_json_loads
 from agentgateway_extproc.lib.pipeline.sse import SseDecoder, SseEvent
 from agentgateway_extproc.models.exceptions import InvalidReversalError
 from agentgateway_extproc.models.types import RESERVED_PLACEHOLDER_PREFIX_RE

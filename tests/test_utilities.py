@@ -10,7 +10,6 @@ from agentgateway_extproc.lib.masking.reversal import (
     reverse_placeholders,
 )
 from agentgateway_extproc.lib.notice.inject import render_notice
-from agentgateway_extproc.lib.pipeline.response import split_safe_prefix
 from agentgateway_extproc.models.types import REVERSIBLE_CANDIDATE_RE
 
 from .conftest import REVERSIBLE_TOKEN
@@ -54,16 +53,6 @@ def test_invalid_human_placeholder_gets_a_history_safe_marker() -> None:
     assert text == f"before {marker} after"
     assert hits == {}
     assert misses == 1
-
-
-def test_split_safe_prefix_holds_incomplete_token() -> None:
-    """A trailing opening bracket is held for the next response chunk."""
-    assert split_safe_prefix("before <REV_PERSON_") == ("before ", "<REV_PERSON_")
-    assert split_safe_prefix(f"complete {REVERSIBLE_TOKEN}") == (
-        f"complete {REVERSIBLE_TOKEN}",
-        "",
-    )
-    assert split_safe_prefix("comparison < 10") == ("comparison < 10", "")
 
 
 def test_notice_rendering_omits_empty_messages() -> None:

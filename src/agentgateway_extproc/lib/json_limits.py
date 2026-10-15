@@ -1,8 +1,11 @@
-"""Bound JSON structure before the decoder allocates its object tree."""
+"""Shared strict JSON decoding with bounds before object-tree allocation."""
 
 from __future__ import annotations
 
+import json
+import math
 import re
+from typing import Any
 
 from agentgateway_extproc.models.exceptions import LimitDetail
 
@@ -11,6 +14,34 @@ MAX_JSON_TOKENS = 200_000
 # Possessive string runs avoid both per-character objects and regex backtracking
 # stacks for long base64 or escaped text. Matches are consumed lazily, not copied.
 _TOKENS = re.compile(r'"(?:[^"\\]++|\\.)*+"|[{}\[\]]|[^ \t\r\n{}\[\]",:]+|[ \t\r\n,:]++')
+
+
+def strict_json_loads(value: str | bytes) -> Any:  # noqa: ANN401
+    """Reject duplicate names, non-finite numbers and excessive JSON structure."""
+
+    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, item in pairs:
+            if key in result:
+                raise ValueError("JSON object contains duplicate keys")  # noqa: TRY003
+            result[key] = item
+        return result
+
+    def reject_constant(_value: str) -> None:
+        raise ValueError("JSON contains a non-finite number")  # noqa: TRY003
+
+    def finite_float(value: str) -> float:
+        parsed = float(value)
+        if not math.isfinite(parsed):
+            raise ValueError("JSON contains a non-finite number")  # noqa: TRY003
+        return parsed
+
+    return json.loads(
+        bounded_json_text(value),
+        object_pairs_hook=unique_object,
+        parse_constant=reject_constant,
+        parse_float=finite_float,
+    )
 
 
 class JsonBudgetError(ValueError):

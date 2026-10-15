@@ -12,7 +12,7 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from agentgateway_extproc.config.settings import ImageInspectionSettings
-from agentgateway_extproc.lib.pipeline.mcp import strict_json_loads
+from agentgateway_extproc.lib.json_limits import strict_json_loads
 
 _MAX_RESPONSE_BYTES = 262_144
 _IMAGE_ONLY = re.compile(r"(?:\s*!\[image\]\(image_\d+\.png\)\s*)+")
