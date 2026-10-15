@@ -19,7 +19,30 @@ from agentgateway_extproc.lib.pipeline.request import _converted_request
 from agentgateway_extproc.lib.pipeline.stream_handler import StreamHandler
 from agentgateway_extproc.models.engine import EngineChatRequest, EngineReply
 
-from .conftest import body_request, header_request
+from .conftest import REVERSIBLE_TOKEN, body_request, header_request
+
+
+@pytest.mark.parametrize("kind", ["chat", "responses", "anthropic", "google"])
+def test_long_history_roundtrip_preserves_every_leaf_and_control(kind):
+    count = 2_100
+    messages = [{"role": "user", "content": f"text {index}"} for index in range(count)]
+    payload = {"model": "test", "messages": messages}
+    if kind == "responses":
+        payload = {"model": "test", "input": messages}
+    elif kind == "anthropic":
+        payload["max_tokens"] = 10
+    elif kind == "google":
+        payload = {
+            "contents": [
+                {"role": "user", "parts": [{"text": f"text {index}"}]} for index in range(count)
+            ]
+        }
+    extracted = extract_request(parse_request(payload, kind=kind))
+    assert len(extracted.segments) == count
+    replacements = [TextSegment(id=s.id, text=f"masked {s.id}") for s in extracted.segments]
+    rebuilt = extracted.rebuild(replacements)
+    assert extract_request(rebuilt).segments == replacements
+    assert extract_request(rebuilt).control_shape() == extracted.control_shape()
 
 
 @pytest.mark.parametrize("max_tokens", [None, 2_000_001])
@@ -94,6 +117,19 @@ def test_chat_roundtrip_preserves_controls_null_false_and_argument_encoding(max_
     }
     assert wire["tools"][0]["function"]["parameters"]["properties"]["person"]["enum"] == ["KEEP"]
     assert extracted.control_shape() == extract_request(changed).control_shape()
+
+
+async def test_engine_client_rebuilds_more_than_2048_analyzed_leaves(engine_reply, engine_client):
+    messages = [{"role": "user", "content": "text"} for _ in range(2_099)]
+    original = {"model": "test", "messages": [*messages, {"role": "user", "content": "Jane Doe"}]}
+    engine_reply["request"] = {
+        "model": "test",
+        "messages": [*messages, {"role": "user", "content": REVERSIBLE_TOKEN}],
+    }
+    engine_reply["analysis"]["text_leaf_count"] = 2_100
+    result = await engine_client.analyze_request(parse_request(original), "session")
+    assert result.analysis.text_leaf_count == 2_100
+    assert result.request.model_dump(exclude_unset=True) == engine_reply["request"]
 
 
 def test_responses_flat_tools_and_short_messages():

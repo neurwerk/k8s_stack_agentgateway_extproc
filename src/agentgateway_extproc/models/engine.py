@@ -156,7 +156,7 @@ class AnalysisMetadata(EngineModel):
     overlap_count: int = Field(ge=0, le=10_000_000)
     overlap_resolution: Literal["strictest_action"]
     policy_version: str = Field(min_length=1, max_length=64)
-    text_leaf_count: int = Field(ge=0, le=2_048)
+    text_leaf_count: int = Field(ge=0)
     cached_decision_applied: bool
 
     @model_validator(mode="after")

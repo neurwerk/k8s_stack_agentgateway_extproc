@@ -20,6 +20,12 @@ keep their original encoding. Duplicate keys and non-finite numbers are rejected
 Schema prose, defaults and examples are inspected; identifiers and enums are not.
 Schema extensions remain open. Extraction limits raise `ExtractionLimitError`.
 
+History arrays have no separate fixed count ceiling. Callers must bound serialized
+bodies before parsing; Engine enforces its configured aggregate text-leaf and
+character limits before analysis. Protocol-specific tool/content-part collection
+limits remain independent. Response consumers must not impose a fixed leaf-count
+ceiling smaller than the configured Engine capacity.
+
 ## Compatibility
 
 Controls retain omitted/null/false distinctions. Chat tools are nested; Responses
