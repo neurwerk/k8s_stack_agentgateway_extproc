@@ -27,6 +27,10 @@ from agentgateway_extproc.lib.pipeline.mcp import (
 )
 from agentgateway_extproc.lib.pipeline.profiles import header_value
 from agentgateway_extproc.lib.pipeline.profiles import request_headers as profile_request_headers
+from agentgateway_extproc.lib.pipeline.provider_errors import (
+    MAX_PROVIDER_ERROR_BYTES,
+    provider_error_response,
+)
 from agentgateway_extproc.lib.pipeline.request import immediate_response, process_request
 from agentgateway_extproc.lib.pipeline.response import process_response_chunk
 from agentgateway_extproc.metrics import dispatcher_total, response_transport_total
@@ -116,6 +120,7 @@ class StreamHandler:
         self.response_format = "text"
         self.expected_response_format: Literal["json", "sse"] | None = None
         self.response_status = 200
+        self.provider_error_body: bytearray | None = None
         self.response_api_kind = "chat"
         self.response_is_gzip = False
         self.gzip_decompressor: GzipDecompressor | None = None
@@ -175,6 +180,9 @@ class StreamHandler:
         self.response_buffer = ""
         self.response_api_kind = "chat"
         self.response_body_chunks.clear()
+        if self.provider_error_body is not None:
+            self.provider_error_body.clear()
+            self.provider_error_body = None
         self.expected_response_format = None
         self.response_passthrough_chunks.clear()
         self.sse_processor = None
@@ -456,11 +464,19 @@ class StreamHandler:
             and self.response_api_kind != "mcp"
             and 400 <= self.response_status <= 599
         ):
-            # Do not consume provider error bodies or echo challenges/cookies with credentials.
-            return immediate_response(
-                self.response_status,
-                '{"error":{"code":"provider_error","message":"Provider request failed."}}',
-            )
+            # Only bounded, uncompressed JSON 400s are inspected for fixed diagnostics.
+            # Authentication errors are rejected at headers without consuming their bodies.
+            if (
+                self.response_status == 400
+                and not request.response_headers.end_of_stream
+                and self.response_content_type.partition(";")[0].strip().lower()
+                == "application/json"
+                and headers.get("content-encoding", "").strip().lower() in {"", "identity"}
+            ):
+                self.provider_error_body = bytearray()
+                self.response_headers_accepted = True
+                return None
+            return provider_error_response(self.response_status)
         if not 200 <= self.response_status < 300:
             self.notice_messages.clear()
             self.response_notice_allowed = False
@@ -677,6 +693,8 @@ class StreamHandler:
         self, chunk: bytes, end: bool
     ) -> ext_proc_pb2.ProcessingResponse | None:
         """Apply bounded decoding and buffer only formats requiring whole-body mutation."""
+        if self.provider_error_body is not None:
+            return self._provider_error_chunk(self.provider_error_body, chunk, end)
         preserve_encoded = self._retain_encoded_mcp_response(chunk)
         self.response_encoded_bytes += len(chunk)
         if self.response_encoded_bytes > self.max_response_bytes:
@@ -708,6 +726,22 @@ class StreamHandler:
             )
         if end:
             self.response_processed = True
+        return response
+
+    def _provider_error_chunk(
+        self, body: bytearray, chunk: bytes, end: bool
+    ) -> ext_proc_pb2.ProcessingResponse | None:
+        if len(body) + len(chunk) > min(MAX_PROVIDER_ERROR_BYTES, self.max_response_bytes):
+            body.clear()
+            end = True
+        else:
+            body.extend(chunk)
+        if not end:
+            return None
+        response = provider_error_response(self.response_status, bytes(body))
+        body.clear()
+        self.provider_error_body = None
+        self.response_processed = True
         return response
 
     def _response_removed_headers(self, headers: dict[str, str], *, preserve: bool) -> list[str]:
