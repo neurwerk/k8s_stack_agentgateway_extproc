@@ -105,6 +105,9 @@ class StreamHandler:
     ) -> None:
         """Initialize state for one HTTP request/response stream."""
         limits = settings or Settings()
+        self.debug_logging = limits.log_level == "DEBUG"
+        self.request_diagnostic: str | None = None
+        self.failed_response: object = None
         self._initial_correlation_id = correlation_id
         self.correlation_id = correlation_id or uuid4().hex
         self.compatibility = limits.compatibility
@@ -166,6 +169,8 @@ class StreamHandler:
 
     def clear_sensitive_state(self) -> None:
         """Discard request-scoped plaintext reversal material."""
+        self.request_diagnostic = None
+        self.failed_response = None
         self.reversal_map.clear()
         self.reversal_entity_prefixes = ()
         self.request_headers.clear()

@@ -20,6 +20,7 @@ from agentgateway_extproc.lib.engine.client import EngineClient
 from agentgateway_extproc.lib.image_policy import image_output
 from agentgateway_extproc.lib.json_limits import JsonBudgetError, strict_json_loads
 from agentgateway_extproc.lib.masking.reversal import placeholder_entity_prefixes
+from agentgateway_extproc.lib.pipeline.diagnostics import diagnostic_json
 from agentgateway_extproc.lib.pipeline.guard import inject_guard_instruction
 from agentgateway_extproc.lib.pipeline.mcp import (
     McpProtocolError,
@@ -102,6 +103,10 @@ async def process_request(
         ) from exc
     except (json.JSONDecodeError, TypeError, ValueError):
         return immediate_response(400, '{"error":"invalid request JSON"}')
+    if handler.debug_logging:
+        handler.request_diagnostic = diagnostic_json(
+            {"headers": handler.request_headers, "body": payload}, maximum=handler.max_request_bytes
+        )
     policy = handler.destination_policy
     if policy is None:
         raise ValueError("trusted destination policy is unavailable")  # noqa: TRY003
