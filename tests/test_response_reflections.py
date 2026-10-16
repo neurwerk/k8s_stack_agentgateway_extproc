@@ -141,10 +141,14 @@ async def inspect_request(client, admission, payload, *, stream):
     return handler, json.loads(reply.request_body.response.body_mutation.body)
 
 
-def provider_response(forwarded, *, stream, incomplete=False):
+def provider_response(forwarded, *, stream, incomplete=False, phase_fields=None):
     fields = {field: deepcopy(forwarded[field]) for field in REFLECTED if field in forwarded}
+    if fields.get("tools"):
+        fields["tools"][0].setdefault("output_schema", None)
     if not stream:
-        return json.dumps({**response_payload("responses", '{"person":"safe"}'), **fields}).encode()
+        payload = {**response_payload("responses", '{"person":"safe"}'), **fields}
+        payload["output"][0].update(phase_fields or {})
+        return json.dumps(payload).encode()
     events = stream_events("responses", '{"person":"safe"}')
     events.insert(1, {**deepcopy(events[0]), "type": "response.in_progress"})
     if incomplete:
@@ -154,14 +158,22 @@ def provider_response(forwarded, *, stream, incomplete=False):
         )
     for index, event in enumerate(events):
         event["sequence_number"] = index
+        if event.get("item", {}).get("type") == "message":
+            event["item"].update(phase_fields or {})
         if "response" in event:
             event["response"].update(deepcopy(fields))
+            for item in event["response"]["output"]:
+                if item["type"] == "message":
+                    item.update(phase_fields or {})
     return b"".join(event_bytes("responses", event) for event in events)
 
 
 @pytest.mark.parametrize("transport", ["json", "sse_completed", "sse_incomplete"])
+@pytest.mark.parametrize(
+    "phase_fields", [{}, {"phase": None}, {"phase": "commentary"}, {"phase": "final_answer"}]
+)
 async def test_actual_masked_reflections_restore_only_canonical_text(
-    admission, reflection_engine, reflected_request, transport
+    admission, reflection_engine, reflected_request, transport, phase_fields
 ):
     client, calls = reflection_engine
     stream = transport != "json"
@@ -177,7 +189,12 @@ async def test_actual_masked_reflections_restore_only_canonical_text(
     await handler.handle(
         response_headers("text/event-stream" if stream else "application/json", policy=admission)
     )
-    incoming = provider_response(forwarded, stream=stream, incomplete=transport == "sse_incomplete")
+    incoming = provider_response(
+        forwarded,
+        stream=stream,
+        incomplete=transport == "sse_incomplete",
+        phase_fields=phase_fields,
+    )
     output = b""
     for index in range(0, len(incoming), 113):
         reply = await handler.handle(
@@ -204,12 +221,42 @@ async def test_actual_masked_reflections_restore_only_canonical_text(
         snapshots = [json.loads(output)]
     for snapshot in snapshots:
         assert snapshot["instructions"] == "\n\n" + reflected_request["instructions"]
-        assert snapshot["tools"] == reflected_request["tools"]
+        assert snapshot["tools"] == [
+            reflected_request["tools"][0] | {"output_schema": None},
+            reflected_request["tools"][1],
+        ]
+        for item in snapshot["output"]:
+            assert {key: item[key] for key in ("phase",) if key in item} == phase_fields
         assert snapshot["text"] == reflected_request["text"]
         assert snapshot["model"] == "provider-chat"
         assert snapshot["metadata"] == {}
     assert GUARD_INSTRUCTION.encode() not in output and REVERSIBLE_TOKEN.encode() not in output
     assert handler.reversal_map == {} and len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    "phase_fields", [{}, {"phase": None}, {"phase": "commentary"}, {"phase": "final_answer"}]
+)
+async def test_assistant_phase_replay_preserves_controls_and_masks_text(
+    admission, reflection_engine, phase_fields
+):
+    client, calls = reflection_engine
+    message = {
+        "type": "message",
+        "id": "msg-replay",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": PRIVATE_TEXT}],
+        **phase_fields,
+    }
+    handler, forwarded = await inspect_request(
+        client, admission, {"model": "example-chat", "input": [message]}, stream=False
+    )
+    assert PRIVATE_TEXT in [segment["text"] for segment in calls[0]["segments"]]
+    assert handler.request_stats.analysis.scan_performed
+    assert forwarded["input"] == [
+        message | {"content": [{"type": "output_text", "text": REVERSIBLE_TOKEN}]}
+    ]
 
 
 @pytest.mark.parametrize("stream", [False, True])
@@ -223,6 +270,8 @@ async def test_actual_masked_reflections_restore_only_canonical_text(
         "extension",
         "tool_name",
         "unknown_tool_field",
+        "output_schema",
+        "phase",
         "metadata",
     ],
 )
@@ -246,7 +295,13 @@ async def test_reflections_reject_foreign_tokens_and_protocol_placeholders(
         forwarded["tools"][0]["name"] = REVERSIBLE_TOKEN
     elif violation == "unknown_tool_field":
         forwarded["tools"][0]["unqualified_feature"] = "synthetic-sentinel"
-    incoming = provider_response(forwarded, stream=stream)
+    elif violation == "output_schema":
+        forwarded["tools"][0]["output_schema"] = {"type": "object"}
+    incoming = provider_response(
+        forwarded,
+        stream=stream,
+        phase_fields={"phase": "invalid"} if violation == "phase" else None,
+    )
     if violation == "metadata":
         incoming = incoming.replace(
             b'"metadata": {}',

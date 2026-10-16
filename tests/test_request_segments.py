@@ -160,6 +160,28 @@ def test_responses_flat_tools_and_short_messages():
         parse_request(payload, kind="chat")
 
 
+@pytest.mark.parametrize("output_schema", [None, {"type": "object"}])
+def test_response_only_output_schema_remains_rejected_on_requests(output_schema):
+    with pytest.raises((ValidationError, UnsupportedFeatureError)):
+        parse_request(
+            {
+                "model": "test",
+                "input": "Hello",
+                "tools": [{"type": "function", "name": "lookup", "output_schema": output_schema}],
+            },
+            kind="responses",
+        )
+
+
+@pytest.mark.parametrize("phase", ["analysis", True, {"text": "Jane"}])
+def test_responses_replay_rejects_invalid_phase(phase):
+    with pytest.raises((ValidationError, UnsupportedFeatureError)):
+        parse_request(
+            {"model": "test", "input": [{"role": "assistant", "content": "Jane", "phase": phase}]},
+            kind="responses",
+        )
+
+
 def test_mcp_analyzes_only_argument_values_and_preserves_metadata():
     payload = {
         "jsonrpc": "2.0",

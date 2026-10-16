@@ -212,8 +212,14 @@ def _reverse_response_reflections(
         return {}
     # A reflection-only local view reuses the canonical schema traversal and rebuild.
     # Its empty input is not provider traffic or a new Engine analysis request.
+    projection = dict(fields)
+    if isinstance(fields.get("tools"), list):
+        projection["tools"] = [
+            {key: item for key, item in tool.items() if key != "output_schema"}
+            for tool in fields["tools"]
+        ]
     extracted = extract_request(
-        parse_request({"model": value["model"], "input": "", **fields}, kind="responses")
+        parse_request({"model": value["model"], "input": "", **projection}, kind="responses")
     )
     # Canonical control_shape removes only eligible text leaves, retaining schema
     # keys, enums, refs, identifiers and uninspected extensions for this strict check.
@@ -225,6 +231,11 @@ def _reverse_response_reflections(
             for segment in extracted.segments
         ]
     ).model_dump(mode="json", by_alias=True, exclude_unset=True)
+    if isinstance(fields.get("tools"), list):
+        restored["tools"] = [
+            original | tool
+            for original, tool in zip(fields["tools"], restored["tools"], strict=True)
+        ]
     return {key: restored[key] for key in fields}
 
 
@@ -300,7 +311,11 @@ def _reverse_structured_chat_content(handler: StreamHandler, payload: Any) -> No
 
 def process_json_response(handler: StreamHandler, text: str) -> str:
     """Transform one complete JSON document and insert one valid notice carrier."""
+    if handler.debug_logging:
+        handler.failed_response = text
     payload = strict_json_loads(text)
+    if handler.debug_logging:
+        handler.failed_response = payload
     _validate_profile_response(handler, payload)
     if handler.response_api_kind == "chat":
         _reverse_structured_chat_content(handler, payload)
@@ -324,7 +339,9 @@ def process_json_response(handler: StreamHandler, text: str) -> str:
         container[field] += notice
     if handler.admission is not None and handler.response_api_kind in {"chat", "responses"}:
         handler.reasoning_digests.update(response_receipts(handler.response_api_kind, payload))
-    return _json_dumps(payload)
+    result = _json_dumps(payload)
+    handler.failed_response = None
+    return result
 
 
 def _validate_profile_response(handler: StreamHandler, payload: Any) -> None:
@@ -575,10 +592,14 @@ class SseResponseProcessor:
             if self._profile is not None:
                 self._profile.done(event)
             return
+        if self._handler.debug_logging:
+            self._handler.failed_response = {"event": event.event, "data": event.data}
         try:
             payload = strict_json_loads(event.data)
         except (ValueError, json.JSONDecodeError):
             raise InvalidReversalError("profile SSE data must be JSON") from None
+        if self._handler.debug_logging:
+            self._handler.failed_response = {"event": event.event, "data": payload}
         if self._profile is not None:
             self._profile.accept(event, payload)
         if not isinstance(payload, dict):
@@ -592,6 +613,7 @@ class SseResponseProcessor:
             payload.clear()
             payload.update(validated)
         event.replace_data(_json_dumps(payload))
+        self._handler.failed_response = None
 
     def _transform_chat(self, payload: dict[str, Any]) -> None:
         for key in ("id", "model", "created", "object", "system_fingerprint"):

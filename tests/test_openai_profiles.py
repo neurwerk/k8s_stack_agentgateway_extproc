@@ -1,7 +1,9 @@
 """V5 closed response schemas and protocol completion at the real gRPC boundary."""
 
 import json
+import logging
 from copy import deepcopy
+from unittest.mock import patch
 
 import grpc
 import httpx
@@ -11,6 +13,7 @@ from agentgateway_extproc.config.settings import EngineSettings
 from agentgateway_extproc.controllers.grpc_servicer import ExtProcServicer
 from agentgateway_extproc.gen import ext_proc_pb2
 from agentgateway_extproc.lib.engine.client import EngineClient
+from agentgateway_extproc.lib.pipeline.diagnostics import diagnostic_json
 from agentgateway_extproc.lib.pipeline.sse import SseDecoder
 from agentgateway_extproc.lib.pipeline.stream_handler import StreamHandler
 
@@ -207,6 +210,158 @@ async def test_review_repros_reject_before_transformation(
         assert replies[-1].immediate_response.status.code == 503
     assert not any(reply.HasField("response_body") for reply in replies)
     assert SENTINEL not in str(replies) + caplog.text + context.details
+
+
+@pytest.mark.parametrize("debug", [False, True])
+@pytest.mark.parametrize("stream", [False, True])
+async def test_debug_failure_reports_exact_errors_and_full_payloads(
+    admission, engine_client, engine_reply, monkeypatch, caplog, debug, stream
+):
+    monkeypatch.setenv("EXTPROC_LOG_LEVEL", "DEBUG" if debug else "INFO")
+    caplog.set_level(logging.DEBUG, logger="agentgateway_extproc.controllers.grpc_servicer")
+    secrets = {
+        "api_key": "synthetic-api-secret",
+        "cookie": "synthetic-cookie-secret",
+        "recovery_phrase": "synthetic recovery material",
+        "private_key": "synthetic-private-key",
+        "secret_access_key": "synthetic-secret-access-key",
+    }
+    signed = {
+        "type": "reasoning",
+        "id": "rs-private",
+        "summary": [{"type": "summary_text", "text": "signed-summary-sentinel"}],
+        "encrypted_content": "opaque-continuation-sentinel",
+    }
+    payload = response_payload("responses", "ordinary response text", tools=True)
+    payload["output"][0]["phase"] = "invalid"
+    payload["output"][0]["content"][0]["unqualified"] = "ordinary extra text"
+    payload["output"][1]["arguments"] = json.dumps(
+        {
+            "ordinary": "ordinary nested argument",
+            **secrets,
+            "url": "https://synthetic-user:synthetic-password@example.test/path",
+            "signed_url": "https://example.test/path?token=synthetic-url-token",
+            "sas_url": "https://example.test/path?sig=synthetic-url-signature",
+            "nested": json.dumps({"ordinary": "ordinary encoded argument", "carrier": signed}),
+            "partial": '{"password":"partial-credential-sentinel"',
+            "Authorization": "Bearer credential-sentinel",
+            "echo": "credential-sentinel",
+            "chat": {
+                "content": "ordinary signed-carrier sibling",
+                "reasoning": "signed-chat-content",
+                "reasoning_signature": "signed-chat-signature",
+            },
+            "signed": {
+                "type": "thinking",
+                "signature": "signature-sentinel",
+                "thinking": "signed-thinking-sentinel",
+            },
+        }
+    )
+    payload["output"].append(signed)
+    payload["tools"] = [{"type": "function", "name": "lookup", "output_schema": {"type": "object"}}]
+    payload["instructions"] = "a-" * 40_000 + "response-trailing-sentinel"
+    failure = (
+        {"type": "response.completed", "sequence_number": 1, "response": payload}
+        if stream
+        else payload
+    )
+    messages = request_messages(admission, "responses", stream=stream)
+    request_payload = json.loads(body(responses=True, stream=stream))
+    request_payload["input"] = (
+        "Jane Doe " + "a-" * 40_000 + json.dumps(secrets) + "request-trailing-sentinel"
+    )
+    engine_reply["request"]["messages"][0]["content"] = request_payload["input"].replace(
+        "Jane Doe", REVERSIBLE_TOKEN
+    )
+    request_headers = headers(
+        **{":path": f"/bindings/{admission['request_context']['binding_id']}/v1/responses"}
+    )
+    del request_headers["authorization"]  # The request fixture strips platform credentials.
+    messages[1] = body_request(json.dumps(request_payload).encode(), policy=admission)
+    messages.append(
+        response_headers("text/event-stream" if stream else "application/json", policy=admission)
+    )
+    if stream:
+        initial = stream_events("responses")[0]
+        initial["response"]["instructions"] = "earlier-event-not-retained"
+        messages.append(
+            response_body(event_bytes("responses", initial), end_of_stream=False, policy=admission)
+        )
+    messages.append(
+        response_body(
+            event_bytes("responses", failure) if stream else json.dumps(failure).encode(),
+            policy=admission,
+        )
+    )
+    replies, context = [], FakeAioContext()
+    with patch(
+        "agentgateway_extproc.lib.pipeline.request.diagnostic_json", wraps=diagnostic_json
+    ) as capture:
+        if stream:
+            with pytest.raises(StreamAbortedError):
+                await collect(engine_client, messages, replies, context)
+            assert context.code == grpc.StatusCode.INTERNAL
+            assert context.details == "response processing failed closed"
+        else:
+            await collect(engine_client, messages, replies, context)
+            assert replies[-1].immediate_response.status.code == 503
+        assert capture.called is debug
+    forbidden = [
+        *secrets.values(),
+        "credential-sentinel",
+        "synthetic-user",
+        "synthetic-password",
+        "synthetic-url-token",
+        "synthetic-url-signature",
+        "signed-summary-sentinel",
+        "opaque-continuation-sentinel",
+        "signature-sentinel",
+        "signed-thinking-sentinel",
+        "partial-credential-sentinel",
+        "signed-chat-content",
+        "signed-chat-signature",
+    ]
+    client_replies = (
+        str([reply for reply in replies if reply.WhichOneof("response") != "request_body"])
+        + context.details
+    )
+    assert all(value not in client_replies for value in forbidden)
+    assert "response-trailing-sentinel" not in client_replies
+    assert "request-trailing-sentinel" not in client_replies
+    records = [
+        record for record in caplog.records if record.msg.startswith("ext_proc failure diagnostics")
+    ]
+    assert len(records) == int(debug)
+    if not debug:
+        assert all(value not in caplog.text for value in forbidden)
+        assert "ordinary response text" not in caplog.text and "Jane Doe" not in caplog.text
+        assert "response-trailing-sentinel" not in caplog.text
+        assert "request-trailing-sentinel" not in caplog.text
+        return
+    details = json.loads(records[0].args[2])
+    assert json.loads(records[0].args[3]) == {
+        "headers": request_headers,
+        "body": request_payload,
+    }
+    assert details["response"] == (
+        {"event": "response.completed", "data": failure} if stream else failure
+    )
+    prefix = ["response.completed", "response"] if stream else []
+    errors = {(tuple(error["path"]), error["code"]) for error in details["validation"]["errors"]}
+    assert ((*prefix, "output", 0, "message", "phase"), "literal_error") in errors
+    assert (
+        (*prefix, "output", 0, "message", "content", 0, "output_text", "unqualified"),
+        "extra_forbidden",
+    ) in errors
+    assert ((*prefix, "tools", 0, "output_schema"), "none_required") in errors
+    assert all(error["message"] for error in details["validation"]["errors"])
+    assert "ordinary response text" in caplog.text and "ordinary nested argument" in caplog.text
+    assert "ordinary encoded argument" in caplog.text
+    assert "ordinary signed-carrier sibling" in caplog.text
+    assert "earlier-event-not-retained" not in caplog.text
+    if stream:
+        assert details["response"]["event"] == "response.completed"
 
 
 @pytest.mark.parametrize(
