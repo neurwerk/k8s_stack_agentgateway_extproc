@@ -1,4 +1,4 @@
-"""Content-free client errors and correlated request-limit diagnostics."""
+"""Correlate local HTTP and JSON-RPC errors and request-limit diagnostics."""
 
 from __future__ import annotations
 
@@ -32,10 +32,11 @@ def annotate_rejection(
     correlation_id: str,
     *,
     limit: LimitDetail | None = None,
-) -> None:
-    """Normalize a local model-endpoint rejection without exposing request content."""
+    model: bool = True,
+) -> str | None:
+    """Annotate a local rejection and return its platform code for correlated logs."""
     if not response.HasField("immediate_response"):
-        return
+        return None
     immediate = response.immediate_response
     parsed = json.loads(immediate.body)
     raw_error = parsed.get("error")
@@ -46,11 +47,19 @@ def annotate_rejection(
         error = dict(raw_error)
     else:
         error = {"message": "Request processing failed."}
-    error.setdefault(
-        "type", "invalid_request_error" if immediate.status.code < 500 else "server_error"
-    )
-    error.setdefault("param", None)
-    error.setdefault(
+    json_rpc = parsed.get("jsonrpc") == "2.0"
+    if json_rpc:
+        data = error.get("data")
+        diagnostics = dict(data) if isinstance(data, dict) else {}
+        error["data"] = diagnostics
+    else:
+        diagnostics = error
+        if model:
+            error.setdefault(
+                "type", "invalid_request_error" if immediate.status.code < 500 else "server_error"
+            )
+            error.setdefault("param", None)
+    diagnostics.setdefault(
         "code",
         "request_too_large"
         if immediate.status.code == 413
@@ -60,8 +69,8 @@ def annotate_rejection(
         if immediate.status.code < 500
         else "processing_failed",
     )
-    error["request_id"] = correlation_id
-    if limit is not None:
+    diagnostics["request_id"] = correlation_id
+    if limit is not None and not json_rpc:
         error["limit"] = limit.model_dump()
         qualifier = "" if limit.exact else "at least "
         label = {
@@ -75,9 +84,11 @@ def annotate_rejection(
         error["message"] = (
             f"Limit exceeded: {qualifier}{limit.measured} {label}; maximum is {limit.maximum}."
         )
+    if limit is not None:
         log_limit_rejection(correlation_id, limit)
     parsed["error"] = error
     immediate.body = json.dumps(parsed, ensure_ascii=True, separators=(",", ":"))
     immediate.headers.set_headers.add(
         header={"key": "x-request-id", "value": correlation_id}, append_action=2
     )
+    return str(diagnostics["code"])

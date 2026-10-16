@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import grpc
 import grpc.aio
@@ -15,7 +16,7 @@ from .conftest import body_request, header_request
 
 
 async def test_aio_server_receives_processing_message_above_four_mibibytes(
-    engine_client,
+    engine_client, caplog
 ) -> None:
     settings = Settings(grpc_maximum_concurrent_rpcs=1)
     server = create_grpc_server(settings, engine_client)
@@ -34,12 +35,39 @@ async def test_aio_server_receives_processing_message_above_four_mibibytes(
     try:
         stub = ext_proc_pb2_grpc.ExternalProcessorStub(channel)
         responses = [response async for response in stub.Process(requests())]
+        mismatched = stub.Process(metadata=(("x-request-id", "stream-open-id"),))
+        await mismatched.write(header_request())
+        rejected = await asyncio.wait_for(mismatched.read(), timeout=5)
+        assert rejected.immediate_response.status.code == 503
+        assert json.loads(rejected.immediate_response.body)["error"] == {
+            "message": "internal processing error",
+            "code": "processing_failed",
+            "request_id": "stream-open-id",
+        }
+        assert any(
+            item.header.key == "x-request-id" and item.header.value == "stream-open-id"
+            for item in rejected.immediate_response.headers.set_headers
+        )
+        assert "request_id=stream-open-id" in caplog.text
+        assert await mismatched.read() is grpc.aio.EOF
+        await mismatched.done_writing()
         active = stub.Process()
         await active.write(header_request())
         assert (await active.read()).HasField("request_headers")
-        busy = stub.Process()
-        overload = await busy.read()
+        busy = stub.Process(metadata=(("x-request-id", "overload-request"),))
+        # No ProcessingRequest is sent: stream-open metadata must suffice for app admission.
+        overload = await asyncio.wait_for(busy.read(), timeout=5)
         assert overload.immediate_response.status.code == 503
+        error = json.loads(overload.immediate_response.body)["error"]
+        assert error["request_id"] == "overload-request"
+        assert error["code"] == "capacity_unavailable"
+        assert any(
+            item.header.key == "x-request-id" and item.header.value == error["request_id"]
+            for item in overload.immediate_response.headers.set_headers
+        )
+        assert (
+            "request_id=overload-request http.status=503 reason=capacity_unavailable" in caplog.text
+        )
         assert any(
             item.header.key == "retry-after"
             for item in overload.immediate_response.headers.set_headers

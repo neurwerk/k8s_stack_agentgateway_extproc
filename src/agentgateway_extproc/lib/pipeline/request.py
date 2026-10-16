@@ -540,6 +540,7 @@ async def process_request(
                     "error": {
                         "code": -32000,
                         "message": "Request blocked by data policy",
+                        "data": {"code": "policy_blocked"},
                     },
                 },
                 ensure_ascii=False,

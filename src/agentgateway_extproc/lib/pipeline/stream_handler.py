@@ -100,10 +100,13 @@ class StreamHandler:
         settings: Settings | None = None,
         docling: DoclingClient | None = None,
         preferences_client: NoticePreferencesClient | None = None,
+        *,
+        correlation_id: str | None = None,
     ) -> None:
         """Initialize state for one HTTP request/response stream."""
         limits = settings or Settings()
-        self.correlation_id = uuid4().hex
+        self._initial_correlation_id = correlation_id
+        self.correlation_id = correlation_id or uuid4().hex
         self.compatibility = limits.compatibility
         self.client = client
         self.docling = docling
@@ -241,6 +244,12 @@ class StreamHandler:
         except TrustedMetadataError:
             self.record_dispatch("metadata_failure")
             raise
+        if (
+            self._initial_correlation_id is not None
+            and metadata.request_context.request_id != self._initial_correlation_id
+        ):
+            self.record_dispatch("metadata_failure")
+            raise TrustedMetadataError
         if self._destination_metadata is not None and metadata != self._destination_metadata:
             self.record_dispatch("metadata_failure")
             raise TrustedMetadataError
@@ -508,7 +517,12 @@ class StreamHandler:
             )
         if self.response_is_gzip:
             self.gzip_decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
-        set_headers = []
+        set_headers = [
+            {
+                "header": {"key": "x-request-id", "value": self.correlation_id},
+                "append_action": 2,
+            }
+        ]
         if 200 <= self.response_status < 300 and self.presidio_code is not None:
             set_headers.append(
                 {

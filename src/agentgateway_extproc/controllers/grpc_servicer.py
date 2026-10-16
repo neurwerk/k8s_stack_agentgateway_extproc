@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import aclosing
 from dataclasses import dataclass
@@ -81,12 +82,13 @@ class ExtProcServicer(ext_proc_pb2_grpc.ExternalProcessorServicer):
         self, request_iterator: AsyncIterator[ext_proc_pb2.ProcessingRequest], context: object
     ) -> AsyncIterator[ext_proc_pb2.ProcessingResponse]:
         """Process one Envoy bidirectional stream."""
+        correlation_id = _initial_request_id(context)
         if self._active >= self._settings.grpc_maximum_concurrent_rpcs:
-            yield _overloaded()
+            yield _overloaded(correlation_id)
             return
         self._active += 1
         try:
-            async with aclosing(self._process(request_iterator, context)) as stream:
+            async with aclosing(self._process(request_iterator, context, correlation_id)) as stream:
                 async for response in stream:
                     yield response
         finally:
@@ -102,11 +104,18 @@ class ExtProcServicer(ext_proc_pb2_grpc.ExternalProcessorServicer):
         return size
 
     async def _process(
-        self, request_iterator: AsyncIterator[ext_proc_pb2.ProcessingRequest], context: object
+        self,
+        request_iterator: AsyncIterator[ext_proc_pb2.ProcessingRequest],
+        context: object,
+        correlation_id: str | None,
     ) -> AsyncGenerator[ext_proc_pb2.ProcessingResponse, None]:
         active_streams.inc()
         handler = StreamHandler(
-            self._client, self._settings, self._docling, self._preferences_client
+            self._client,
+            self._settings,
+            self._docling,
+            self._preferences_client,
+            correlation_id=correlation_id,
         )
         phase = StreamPhase()
         buffered_bytes = 0
@@ -168,19 +177,16 @@ class ExtProcServicer(ext_proc_pb2_grpc.ExternalProcessorServicer):
         limit = (
             error.limit if isinstance(error, (EnginePolicyError, InvalidEngineReplyError)) else None
         )
-        if (
-            handler.destination_policy is not None
-            and handler.destination_policy.destination_kind == "model"
-        ):
-            annotate_rejection(response, handler.correlation_id, limit=limit)
+        code = annotate_rejection(
+            response,
+            handler.correlation_id,
+            limit=limit,
+            model=handler.destination_policy is not None
+            and handler.destination_policy.destination_kind == "model",
+        )
         status = response.immediate_response.status.code
         if handler.admission is not None:
             error_body = json.loads(response.immediate_response.body).get("error", {})
-            code = (
-                error_body.get("code", "request_rejected")
-                if isinstance(error_body, dict)
-                else "request_rejected"
-            )
             admission = handler.admission.request_context
             _logger.warning(
                 "gateway rejection request_id=%s binding_id=%s provider_id=%s profile=%s "
@@ -199,6 +205,21 @@ class ExtProcServicer(ext_proc_pb2_grpc.ExternalProcessorServicer):
             )
 
 
+def _initial_request_id(context: object) -> str | None:
+    """Read only a single bounded gateway correlation value from gRPC stream metadata."""
+    metadata = getattr(context, "invocation_metadata", None)
+    if not callable(metadata):
+        return None
+    values = [value for key, value in metadata() if key == "x-request-id"]
+    if (
+        len(values) == 1
+        and isinstance(values[0], str)
+        and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", values[0])
+    ):
+        return values[0]
+    return None
+
+
 def _log_committed_limit(handler: StreamHandler, phase: StreamPhase, exc: Exception) -> None:
     if (
         phase.response_headers_committed
@@ -215,7 +236,12 @@ def _overloaded(correlation_id: str | None = None) -> ext_proc_pb2.ProcessingRes
         503,
         '{"error":{"message":"processor busy","code":"capacity_unavailable","retryable":true}}',
     )
-    annotate_rejection(response, correlation_id or uuid4().hex)
+    correlation_id = correlation_id or uuid4().hex
+    annotate_rejection(response, correlation_id)
+    _logger.warning(
+        "gateway rejection request_id=%s http.status=503 reason=capacity_unavailable",
+        correlation_id,
+    )
     response.immediate_response.headers.set_headers.add(
         header={"key": "retry-after", "value": "1"}, append_action=2
     )

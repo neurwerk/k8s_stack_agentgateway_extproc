@@ -171,7 +171,13 @@ async def test_missing_or_changing_metadata_is_a_platform_503(engine_client) -> 
 
     responses = [response async for response in servicer.Process(missing(), object())]
     assert responses[-1].immediate_response.status.code == 503
-    assert responses[-1].immediate_response.body == '{"error":"internal processing error"}'
+    error = json.loads(responses[-1].immediate_response.body)["error"]
+    assert error["message"] == "internal processing error"
+    assert error["code"] == "processing_failed"
+    assert any(
+        item.header.key == "x-request-id" and item.header.value == error["request_id"]
+        for item in responses[-1].immediate_response.headers.set_headers
+    )
 
     changed = {**MODEL_POLICY, "principal_id": "principal-2"}
 
@@ -372,12 +378,18 @@ async def test_mcp_header_session_rejection_and_positive_quality_values(
     assert responses[0].WhichOneof("response") == "immediate_response"
     immediate = responses[0].immediate_response
     assert immediate.status.code == 404
-    assert immediate.body == (
-        '{"error":"Stateful MCP sessions are currently unsupported pending an '
-        'AgentGateway session-ownership fix. Reinitialize without Mcp-Session-Id."}'
-    )
+    request_id = "0123456789abcdef0123456789abcdef"
+    assert json.loads(immediate.body) == {
+        "error": {
+            "message": "Stateful MCP sessions are currently unsupported pending an "
+            "AgentGateway session-ownership fix. Reinitialize without Mcp-Session-Id.",
+            "code": "invalid_request",
+            "request_id": request_id,
+        }
+    }
     assert {item.header.key: item.header.value for item in immediate.headers.set_headers} == {
-        "content-type": "application/json"
+        "content-type": "application/json",
+        "x-request-id": request_id,
     }
 
 
@@ -625,7 +637,10 @@ async def test_mcp_pii_disabled_text_call_is_protocol_only(engine_client) -> Non
     assert response.response_body.response.body_mutation.streamed_response.body == upstream
     headers = handler.pop_pending_response_headers()
     assert headers is not None
-    assert not headers.response_headers.response.header_mutation.set_headers
+    assert {
+        item.header.key: item.header.value
+        for item in headers.response_headers.response.header_mutation.set_headers
+    } == {"x-request-id": handler.correlation_id}
     assert list(headers.response_headers.response.header_mutation.remove_headers) == [
         "x-presidio-code"
     ]
@@ -844,11 +859,12 @@ async def test_mcp_text_call_analyzes_once_per_request_with_distinct_session_key
     assert analyze.await_args_list[0].args[1] != analyze.await_args_list[1].args[1]
 
 
-async def test_mcp_block_is_exact_json_rpc_200(engine_client, engine_reply) -> None:
+@pytest.mark.parametrize("rpc_id", [0, "call-1"])
+async def test_mcp_block_is_exact_json_rpc_200(engine_client, engine_reply, caplog, rpc_id) -> None:
     policy = mcp_policy()
     original = {
         "jsonrpc": "2.0",
-        "id": 7,
+        "id": rpc_id,
         "method": "tools/call",
         "params": {"name": "search", "arguments": {"query": "Jane Doe"}},
     }
@@ -865,15 +881,34 @@ async def test_mcp_block_is_exact_json_rpc_200(engine_client, engine_reply) -> N
     engine_reply["report"]["rows"][0].update(
         {"action": "block", "transformed_count": 0, "unique_transformed_count": 0}
     )
-    handler = StreamHandler(engine_client)
-    await handler.handle(header_request(mcp_headers(), policy=policy))
-    response = await handler.handle(body_request(json.dumps(original).encode(), policy=policy))
-    assert response is not None
+
+    async def requests():
+        yield header_request(mcp_headers(), policy=policy)
+        yield body_request(json.dumps(original).encode(), policy=policy)
+
+    responses = [
+        item async for item in ExtProcServicer(engine_client).Process(requests(), object())
+    ]
+    response = responses[-1]
     assert response.immediate_response.status.code == 200
-    assert response.immediate_response.body == (
-        '{"jsonrpc":"2.0","id":7,"error":{"code":-32000,'
-        '"message":"Request blocked by data policy"}}'
+    payload = json.loads(response.immediate_response.body)
+    request_id = "0123456789abcdef0123456789abcdef"
+    assert payload == {
+        "jsonrpc": "2.0",
+        "id": rpc_id,
+        "error": {
+            "code": -32000,
+            "message": "Request blocked by data policy",
+            "data": {"code": "policy_blocked", "request_id": request_id},
+        },
+    }
+    assert type(payload["id"]) is type(rpc_id)
+    assert any(
+        item.header.key == "x-request-id" and item.header.value == request_id
+        for item in response.immediate_response.headers.set_headers
     )
+    assert f"request_id={request_id}" in caplog.text
+    assert "reason=policy_blocked" in caplog.text
     assert response.immediate_response.headers.set_headers[0].header.value == "application/json"
 
 
@@ -1469,8 +1504,12 @@ async def test_mcp_http_errors_preserve_only_safe_transport_classification(
     assert not any(response.HasField("response_headers") for response in responses)
     immediate = responses[-1].immediate_response
     assert immediate.status.code == status
-    assert immediate.body == '{"error":"MCP HTTP request failed"}'
-    expected = {"content-type": "application/json"}
+    error = json.loads(immediate.body)["error"]
+    assert set(error) == {"message", "code", "request_id"}
+    assert error["message"] == "MCP HTTP request failed"
+    assert isinstance(error["code"], str)
+    assert error["request_id"] == "0123456789abcdef0123456789abcdef"
+    expected = {"content-type": "application/json", "x-request-id": error["request_id"]}
     if header_eos and status == 405:
         expected["allow"] = "POST, DELETE"
     if header_eos and status in {429, 503}:

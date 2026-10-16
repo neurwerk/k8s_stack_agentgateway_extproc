@@ -88,6 +88,41 @@ def test_modern_resource_name_header_decodes_utf8():
     assert context.protocol_version == MCP_MODERN_VERSION
 
 
+@pytest.mark.parametrize("rpc_id", [0, "call-1"])
+async def test_local_unsupported_feature_keeps_rpc_identity_and_correlates(
+    engine_client, caplog, rpc_id
+):
+    policy = mcp_policy()
+    payload = modern_request(name="search", inputResponses={})
+    payload["id"] = rpc_id
+
+    async def messages():
+        yield header_request(modern_headers(), policy=policy)
+        yield body_request(json.dumps(payload).encode(), policy=policy)
+
+    outputs = [item async for item in ExtProcServicer(engine_client).Process(messages(), None)]
+    immediate = outputs[-1].immediate_response
+    assert immediate.status.code == 400
+    request_id = "0123456789abcdef0123456789abcdef"
+    error = json.loads(immediate.body)
+    assert error == {
+        "jsonrpc": "2.0",
+        "id": rpc_id,
+        "error": {
+            "code": -32000,
+            "message": "This MCP feature is not supported by gateway inspection",
+            "data": {"code": "unsupported_feature", "request_id": request_id},
+        },
+    }
+    assert type(error["id"]) is type(rpc_id)
+    assert any(
+        item.header.key == "x-request-id" and item.header.value == request_id
+        for item in immediate.headers.set_headers
+    )
+    assert f"request_id={request_id}" in caplog.text
+    assert "reason=unsupported_feature" in caplog.text
+
+
 @pytest.mark.parametrize("pii_enabled", [True, False])
 @pytest.mark.parametrize("version", ["2025-11-25", MCP_MODERN_VERSION])
 async def test_mirrored_parameter_headers_cannot_bypass_pii(engine_client, pii_enabled, version):
@@ -214,7 +249,11 @@ async def test_unrecognized_modern_http_errors_preserve_fallback_status(
 
     outputs = [item async for item in ExtProcServicer(engine_client).Process(messages(), None)]
     assert outputs[-1].immediate_response.status.code == status
-    assert outputs[-1].immediate_response.body == '{"error":"MCP HTTP request failed"}'
+    assert json.loads(outputs[-1].immediate_response.body)["error"] == {
+        "message": "MCP HTTP request failed",
+        "code": "invalid_request",
+        "request_id": "0123456789abcdef0123456789abcdef",
+    }
     assert not any(
         item.HasField("response_headers") or item.HasField("response_body") for item in outputs
     )
