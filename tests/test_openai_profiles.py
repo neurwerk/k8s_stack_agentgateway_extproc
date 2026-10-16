@@ -393,11 +393,19 @@ async def test_v5_closes_nested_output_shapes(admission, engine_client, case):
     assert SENTINEL not in str(replies)
 
 
-@pytest.mark.parametrize("kind", ["chat", "responses"])
+@pytest.mark.parametrize(
+    ("kind", "stream", "empty_terminal"),
+    [
+        ("chat", False, False),
+        ("chat", True, False),
+        ("responses", False, False),
+        ("responses", True, False),
+        ("responses", True, True),
+    ],
+)
 @pytest.mark.parametrize("pii", [False, True])
-@pytest.mark.parametrize("stream", [False, True])
 async def test_qualified_v5_text_tools_and_usage_roundtrip(
-    admission, reasoning_engine, kind, pii, stream
+    admission, reasoning_engine, kind, pii, stream, empty_terminal
 ):
     engine_client, _ = reasoning_engine
     admission["destination_policy"]["models"]["example-chat"] = pii
@@ -411,7 +419,10 @@ async def test_qualified_v5_text_tools_and_usage_roundtrip(
     )
     incoming = (
         b"".join(
-            event_bytes(kind, event) for event in stream_events(kind, tools=True, reasoning=True)
+            event_bytes(kind, event)
+            for event in stream_events(
+                kind, tools=True, reasoning=True, empty_terminal=empty_terminal
+            )
         )
         if stream
         else json.dumps(response_payload(kind, tools=True, reasoning=True)).encode()
@@ -449,7 +460,16 @@ async def test_qualified_v5_text_tools_and_usage_roundtrip(
         else:
             terminal = json.loads(events[-1].data)
             assert terminal["type"] == "response.completed"
-            assert terminal["response"] == response_payload(kind, text, tools=True, reasoning=True)
+            expected = response_payload(kind, text, tools=True, reasoning=True)
+            completed_items = [
+                json.loads(event.data)["item"]
+                for event in events
+                if json.loads(event.data)["type"] == "response.output_item.done"
+            ]
+            assert completed_items == expected["output"]
+            if empty_terminal:
+                expected["output"] = []
+            assert terminal["response"] == expected
     assert handler.reversal_map == {}
 
 
@@ -519,6 +539,7 @@ async def test_v5_truncated_stream_aborts_after_commit(admission, engine_client,
         "responses_missing_args_done",
         "responses_open_arguments",
         "responses_missing_item_done",
+        "responses_missing_part_done",
         "responses_changed_snapshot",
         "responses_after_terminal",
     ],
@@ -529,7 +550,7 @@ async def test_v5_stream_requires_closed_consistent_tool_lifecycle(
 ):
     admission["destination_policy"]["models"]["example-chat"] = pii
     kind = "chat" if case.startswith("chat") else "responses"
-    events = stream_events(kind, tools=True)
+    events = stream_events(kind, tools=True, empty_terminal=case != "responses_changed_snapshot")
     if case == "chat_missing_finish":
         events = [*events[:-3], "[DONE]"]
     elif case == "chat_open_arguments":
@@ -537,10 +558,12 @@ async def test_v5_stream_requires_closed_consistent_tool_lifecycle(
             '{"incomplete":'
         )
         del events[4]
-    elif case == "responses_missing_args_done":
-        events = [
-            event for event in events if event["type"] != "response.function_call_arguments.done"
-        ]
+    elif case in {"responses_missing_args_done", "responses_missing_part_done"}:
+        missing_type = {
+            "responses_missing_args_done": "response.function_call_arguments.done",
+            "responses_missing_part_done": "response.content_part.done",
+        }[case]
+        events = [event for event in events if event["type"] != missing_type]
     elif case == "responses_open_arguments":
         delta_seen = False
         for event in events:

@@ -84,7 +84,9 @@ def response_payload(kind, text=REVERSIBLE_TOKEN, *, tools=False, reasoning=Fals
     return payload
 
 
-def stream_events(kind, text=REVERSIBLE_TOKEN, *, tools=False, reasoning=False):  # noqa: C901
+def stream_events(  # noqa: C901
+    kind, text=REVERSIBLE_TOKEN, *, tools=False, reasoning=False, empty_terminal=False
+):
     payload = response_payload(kind, text, tools=tools)
     if kind == "chat":
         envelope = {key: value for key, value in payload.items() if key not in {"choices", "usage"}}
@@ -228,6 +230,9 @@ def stream_events(kind, text=REVERSIBLE_TOKEN, *, tools=False, reasoning=False):
             {"type": "response.output_item.done", "output_index": 0, "item": item},
         ]
         events[1:1] = reasoning_events
+    if empty_terminal:
+        # Native streaming summaries may omit already completed output items.
+        events[-1]["response"] = {**payload, "output": []}
     return [
         deepcopy(event)
         | {"sequence_number": index}
