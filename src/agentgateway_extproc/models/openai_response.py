@@ -2,7 +2,11 @@
 
 from typing import Annotated, Literal
 
-from neurwerk_request_segments.models import EngineResponseTextConfig, EngineResponseToolDefinition
+from neurwerk_request_segments.models import (
+    EngineResponseTextConfig,
+    EngineResponseToolDefinition,
+    ResponseMessagePhase,
+)
 from neurwerk_request_segments.reasoning import ChatReasoning, ResponseReasoning, SummaryText
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
@@ -161,6 +165,7 @@ class OutputMessage(ResponseModel):
     id: Identifier
     role: Literal["assistant"]
     status: ItemStatus
+    phase: ResponseMessagePhase | None = None
     content: list[OutputPart] = Field(max_length=64)
 
 
@@ -207,6 +212,12 @@ class AllowedTools(ResponseModel):
     tools: list[FunctionChoice] = Field(min_length=1, max_length=128)
 
 
+class ReflectedFunctionTool(EngineResponseToolDefinition):
+    """Admit the provider's empty output-schema reflection only on responses."""
+
+    output_schema: None = None
+
+
 class ResponsesResponse(MetadataEnvelope):
     """Validate output and reflected content without mirroring provider accounting."""
 
@@ -230,7 +241,7 @@ class ResponsesResponse(MetadataEnvelope):
     service_tier: MetadataToken | None = None
     text: EngineResponseTextConfig | None = None
     tool_choice: Literal["auto", "none", "required"] | FunctionChoice | AllowedTools | None = None
-    tools: list[EngineResponseToolDefinition] | None = Field(default=None, max_length=128)
+    tools: list[ReflectedFunctionTool] | None = Field(default=None, max_length=128)
     top_logprobs: Literal[0] | None = None
     truncation: MetadataToken | None = None
     user: str | None = Field(default=None, max_length=256)

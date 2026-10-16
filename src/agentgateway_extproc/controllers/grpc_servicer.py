@@ -21,6 +21,7 @@ from agentgateway_extproc.gen import ext_proc_pb2, ext_proc_pb2_grpc
 from agentgateway_extproc.lib.docling import DoclingClient
 from agentgateway_extproc.lib.engine.client import EngineClient
 from agentgateway_extproc.lib.notice.preferences import NoticePreferencesClient
+from agentgateway_extproc.lib.pipeline.diagnostics import diagnostic_json, validation_details
 from agentgateway_extproc.lib.pipeline.mcp import McpProtocolError, McpUnsupportedFeatureError
 from agentgateway_extproc.lib.pipeline.request import immediate_response
 from agentgateway_extproc.lib.pipeline.stream_handler import StreamHandler
@@ -374,7 +375,7 @@ async def _abort_stream(
 
 
 def _record_failure(phase: str, exc: Exception, handler: StreamHandler) -> None:
-    """Record bounded failure metadata without response payloads or exception text."""
+    """Keep normal logs concise; DEBUG adds full request and failure context."""
     reason = _failure_reason(exc)
     errors_total.labels(type="processing").inc()
     if phase in {"response_headers", "response_body", "response_trailers", "response_eof"}:
@@ -387,6 +388,20 @@ def _record_failure(phase: str, exc: Exception, handler: StreamHandler) -> None:
         reason,
         type(exc).__name__,
     )
+    if handler.debug_logging and _logger.isEnabledFor(logging.DEBUG):
+        _logger.debug(
+            "ext_proc failure diagnostics request_id=%s phase=%s details=%s request=%s",
+            handler.correlation_id,
+            phase,
+            diagnostic_json(
+                {
+                    "validation": validation_details(exc),
+                    "response": handler.failed_response,
+                    "headers": handler.request_headers,
+                },
+            ),
+            handler.request_diagnostic,
+        )
 
 
 def _failure_reason(exc: Exception) -> str:

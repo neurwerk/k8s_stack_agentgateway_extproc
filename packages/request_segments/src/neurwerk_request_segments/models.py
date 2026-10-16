@@ -21,6 +21,7 @@ from .native import AnthropicRequest, GoogleRequest
 from .reasoning import CHAT_REASONING_FIELDS, ChatReasoning, ResponseReasoning
 
 type JsonScalar = str | int | float | bool | None
+type ResponseMessagePhase = Literal["commentary", "final_answer"]
 type JsonValue = JsonScalar | list[JsonValue] | dict[str, JsonValue]
 type McpJsonValue = (
     Annotated[str, Field(strict=True)]
@@ -312,6 +313,7 @@ class EngineResponseMessage(RequestModel):
     location = "message"
     type: Literal["message"] = "message"
     role: Literal["system", "developer", "user", "assistant"]
+    phase: ResponseMessagePhase | None = None
     content: (
         str
         | Annotated[
