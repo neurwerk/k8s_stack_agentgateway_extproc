@@ -11,7 +11,11 @@ from typing import TYPE_CHECKING, Any
 
 from neurwerk_request_segments.models import EngineChatRequest, EngineResponsesRequest
 
-from agentgateway_extproc.models.exceptions import GatewayPolicyError, InvalidReversalError
+from agentgateway_extproc.models.exceptions import (
+    GatewayPolicyError,
+    InvalidReversalError,
+    LimitDetail,
+)
 
 if TYPE_CHECKING:
     from _hashlib import HASH
@@ -19,7 +23,8 @@ if TYPE_CHECKING:
     from agentgateway_extproc.lib.pipeline.stream_handler import StreamHandler
     from agentgateway_extproc.models.admission import RequestContext
 
-MAX_RECEIPTS = 256
+MAX_RECEIPTS = 4096
+MAX_RESPONSE_BLOCKS = 256
 
 
 def _digest(value: object) -> str:
@@ -98,7 +103,7 @@ class ChatReasoningTracker:
 
     def _append(self, key: tuple[int, str, int], block: dict[str, Any]) -> None:
         if key not in self.blocks:
-            if len(self.blocks) >= MAX_RECEIPTS:
+            if len(self.blocks) >= MAX_RESPONSE_BLOCKS:
                 raise InvalidReversalError("too many reasoning blocks")
             self.blocks[key] = _Fingerprint("chat." + key[1])
         self.blocks[key].append(block)
@@ -149,8 +154,20 @@ async def verify_reasoning(
         }
     if not digests:
         return
-    if len(digests) > MAX_RECEIPTS or handler.request_context is None:
-        raise GatewayPolicyError("unverified_reasoning")
+    if len(digests) > MAX_RECEIPTS:
+        raise GatewayPolicyError(
+            "reasoning_history_limit",
+            limit=LimitDetail(
+                stage="admission",
+                reason="reasoning_fingerprints",
+                measured=len(digests),
+                maximum=MAX_RECEIPTS,
+                unit="items",
+                exact=True,
+            ),
+        )
+    if handler.request_context is None:
+        raise GatewayPolicyError("reasoning_context_missing")
     await handler.client.reasoning_receipts(
         reasoning_scope(handler.request_context),
         sorted(digests),
