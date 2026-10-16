@@ -246,6 +246,7 @@ async def test_reasoning_survives_completed_exchange_and_verified_replay(
         ]
         assert events[1] == native_reasoning_events(kind)[1]
         assert events[2]["item"] == native_reasoning_events(kind)[2]["item"]
+        assert events[-1]["response"]["usage"] == response_payload(kind)["usage"]
     assert state["values"]
     state["segments"].clear()
     admission["request_context"]["request_id"] = "next-request"
@@ -395,6 +396,15 @@ async def test_incomplete_reasoning_never_authorizes_replay(admission, reasoning
         ((2, "item", "content"), [{"type": "reasoning_text", "text": "premature text"}]),
         ((1, "response_id"), "other-response"),
         ((1, "sequence_number"), 0),
+        ((-1, "response", "usage", "attribution"), {"items": [1]}),
+        ((-1, "response", "usage", "attribution"), {"items": ["unclassified-text"]}),
+        ((-1, "response", "usage", "attribution"), {"items": [{"input_tokens": "1"}]}),
+        ((-1, "response", "usage", "attribution"), {"items": [{"input_tokens": -1}]}),
+        ((-1, "response", "usage", "attribution"), {"items": [{}] * 129}),
+        (
+            (-1, "response", "usage", "attribution"),
+            {"items": [{f"counter_{i}": 0 for i in range(129)}]},
+        ),
         (
             (
                 1,
@@ -417,6 +427,12 @@ async def test_incomplete_reasoning_never_authorizes_replay(admission, reasoning
         "initial-content",
         "metadata-identity",
         "metadata-sequence",
+        "usage-scalar-entry",
+        "usage-string-entry",
+        "usage-string-count",
+        "usage-negative-count",
+        "usage-oversized-list",
+        "usage-oversized-map",
         "metadata-shape",
     ],
 )
