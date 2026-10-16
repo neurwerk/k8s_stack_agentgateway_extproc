@@ -38,6 +38,7 @@ from agentgateway_extproc.metrics import dispatcher_total, response_transport_to
 from agentgateway_extproc.models.admission import (
     AdmissionEnvelope,
     RequestContext,
+    RequestTextInspection,
     admission_snapshot,
     metadata_from_request,
 )
@@ -382,6 +383,13 @@ class StreamHandler:
         self.request_processed = True
         response = await process_request(self, self.client)
         if self.request_context is not None and response.HasField("request_body"):
+            self.request_context = self.request_context.model_copy(
+                update={
+                    "request_text_inspection": self._request_text_inspection(
+                        self.request_context.pii_policy.enabled
+                    )
+                }
+            )
             response.dynamic_metadata.update(
                 {"neurwerk.request_context": self.request_context.model_dump(mode="json")}
             )
@@ -390,10 +398,31 @@ class StreamHandler:
             and self.admission.request_context.destination_kind == "mcp"
             and response.HasField("request_body")
         ):
+            context = self.admission.resolve_mcp()
             response.dynamic_metadata.update(
-                {"neurwerk.request_context": self.admission.resolve_mcp().model_dump(mode="json")}
+                {
+                    "neurwerk.request_context": {
+                        **context.model_dump(mode="json"),
+                        "request_text_inspection": self._request_text_inspection(
+                            context.pii_policy.enabled
+                        ),
+                    }
+                }
             )
         return response
+
+    def _request_text_inspection(self, enabled: bool) -> RequestTextInspection:
+        """Describe validated request analysis, never configured policy alone as a scan."""
+        if not enabled:
+            return "disabled"
+        if self.request_stats is None:
+            return "unknown"
+        analysis = self.request_stats.analysis
+        if analysis.scan_performed:
+            return "scanned"
+        if analysis.cached_decision_applied:
+            return "cached_decision"
+        return "not_scanned"
 
     def _response_headers(  # noqa: C901
         self, request: ext_proc_pb2.ProcessingRequest
