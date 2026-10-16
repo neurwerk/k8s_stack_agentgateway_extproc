@@ -162,6 +162,41 @@ def replay_payload(kind, reasoning):
     return {"model": "example-chat", "input": [reasoning, {"role": "user", "content": "Continue"}]}
 
 
+def native_reasoning_events(kind):
+    events = stream_events(kind, tools=True, reasoning=True)
+    if kind == "responses":
+        events[1]["item"]["encrypted_content"] = reasoning_value(kind)["encrypted_content"]
+        events[1]["item"]["content"] = []
+        events.insert(
+            1,
+            {
+                "type": "response.metadata",
+                "response_id": events[0]["response"]["id"],
+                "metadata": {
+                    "openai_chatgpt_moderation_metadata": {
+                        "prompt": {
+                            "omnimod": {
+                                "protection_type": "synthetic",
+                                "outputs": [
+                                    {
+                                        "results": [{"category_flags": {"A1": False}}],
+                                        "is_blocked": False,
+                                    }
+                                ],
+                            }
+                        },
+                        "generation": {},
+                        "tool_call": {},
+                        "tool_response": {},
+                    }
+                },
+            },
+        )
+        for index, event in enumerate(events):
+            event["sequence_number"] = index
+    return events
+
+
 @pytest.mark.parametrize("kind", ["chat", "responses"])
 @pytest.mark.parametrize("stream", [False, True])
 @pytest.mark.parametrize("reroute", [False, True])
@@ -185,9 +220,7 @@ async def test_reasoning_survives_completed_exchange_and_verified_replay(
             }
         }
     incoming = (
-        b"".join(
-            event_bytes(kind, event) for event in stream_events(kind, tools=True, reasoning=True)
-        )
+        b"".join(event_bytes(kind, event) for event in native_reasoning_events(kind))
         if stream
         else json.dumps(response_payload(kind, tools=True, reasoning=True)).encode()
     )
@@ -204,6 +237,15 @@ async def test_reasoning_survives_completed_exchange_and_verified_replay(
     assert replies[-1].response_body.response.body_mutation.streamed_response.end_of_stream
     reasoning = emitted_reasoning(kind, stream, replies)
     assert reasoning == reasoning_value(kind)
+    if kind == "responses" and stream:
+        emitted = b"".join(
+            reply.response_body.response.body_mutation.streamed_response.body for reply in replies
+        )
+        events = [
+            json.loads(frame.data) for frame in SseDecoder().feed(emitted.decode(), final=True)
+        ]
+        assert events[1] == native_reasoning_events(kind)[1]
+        assert events[2]["item"] == native_reasoning_events(kind)[2]["item"]
     assert state["values"]
     state["segments"].clear()
     admission["request_context"]["request_id"] = "next-request"
@@ -303,7 +345,7 @@ async def test_incomplete_reasoning_never_authorizes_replay(admission, reasoning
         if failure in {"late_reasoning", "changed_identity", "trailing_chat"}
         else "responses"
     )
-    events = stream_events(kind, tools=True, reasoning=True)
+    events = native_reasoning_events(kind)
     if failure == "truncated":
         events.pop()
     elif failure == "missing_item":
@@ -342,6 +384,68 @@ async def test_incomplete_reasoning_never_authorizes_replay(admission, reasoning
     assert not state["values"]
     replies = await exchange(
         client, request_messages(admission, kind, replay_payload(kind, reasoning_value(kind)))
+    )
+    assert replies[-1].immediate_response.status.code == 400
+
+
+@pytest.mark.parametrize(
+    ("path", "replacement"),
+    [
+        ((2, "item", "summary"), [{"type": "summary_text", "text": "premature text"}]),
+        ((2, "item", "content"), [{"type": "reasoning_text", "text": "premature text"}]),
+        ((1, "response_id"), "other-response"),
+        ((1, "sequence_number"), 0),
+        (
+            (
+                1,
+                "metadata",
+                "openai_chatgpt_moderation_metadata",
+                "prompt",
+                "omnimod",
+                "outputs",
+                0,
+                "results",
+                0,
+                "category_flags",
+                "A1",
+            ),
+            "false",
+        ),
+    ],
+    ids=[
+        "initial-summary",
+        "initial-content",
+        "metadata-identity",
+        "metadata-sequence",
+        "metadata-shape",
+    ],
+)
+async def test_invalid_native_reasoning_events_never_authorize_replay(
+    admission, reasoning_engine, path, replacement
+):
+    client, state = reasoning_engine
+    events = native_reasoning_events("responses")
+    target = events
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = replacement
+    messages = [
+        *request_messages(admission, "responses", stream=True),
+        response_headers("text/event-stream", policy=admission),
+        *[
+            response_body(event_bytes("responses", event), end_of_stream=False, policy=admission)
+            for event in events
+        ],
+        response_body(b"", policy=None),
+    ]
+    with pytest.raises(StreamAbortedError):
+        await exchange(client, messages)
+    assert state["receipts"] == [] and not state["values"]
+    replies = await exchange(
+        client,
+        request_messages(
+            admission, "responses", replay_payload("responses", reasoning_value("responses"))
+        ),
     )
     assert replies[-1].immediate_response.status.code == 400
 
