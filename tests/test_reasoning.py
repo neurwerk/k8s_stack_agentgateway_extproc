@@ -10,6 +10,7 @@ import pytest
 from agentgateway_extproc.config.settings import EngineSettings, Settings
 from agentgateway_extproc.controllers.grpc_servicer import ExtProcServicer
 from agentgateway_extproc.lib.engine.client import EngineClient
+from agentgateway_extproc.lib.json_limits import MAX_JSON_DEPTH, MAX_JSON_TOKENS
 from agentgateway_extproc.lib.pipeline.sse import SseDecoder
 
 from .conftest import (
@@ -306,6 +307,115 @@ async def test_reasoning_survives_completed_exchange_and_verified_replay(
         assert private not in wire + retained
 
 
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("size", [129, 201, 1000])
+@pytest.mark.parametrize("container", ["map", "list"])
+async def test_growing_accounting_survives_completion_and_replay(
+    admission, reasoning_engine, stream, size, container
+):
+    client, state = reasoning_engine
+    facts = {"future_count": 1, "future_ratio": 0.5, "future_flag": True, "future_null": None}
+    items = (
+        {f"item_{index}": facts for index in range(size)} if container == "map" else [facts] * size
+    )
+    usage = {**response_payload("responses")["usage"], "attribution": {"items": items}}
+    if stream:
+        events = native_reasoning_events("responses")
+        events[-1]["response"]["usage"] = usage
+        incoming = b"".join(event_bytes("responses", event) for event in events)
+    else:
+        payload = response_payload("responses", tools=True, reasoning=True)
+        payload["usage"] = usage
+        incoming = json.dumps(payload).encode()
+    messages = [
+        *request_messages(admission, "responses", stream=stream),
+        response_headers("text/event-stream" if stream else "application/json", policy=admission),
+        *[
+            response_body(incoming[index : index + 1021], end_of_stream=False, policy=admission)
+            for index in range(0, len(incoming), 1021)
+        ],
+        response_body(b"", policy=None),
+    ]
+    replies = await exchange(client, messages)
+    assert replies[-1].response_body.response.body_mutation.streamed_response.end_of_stream
+    emitted = b"".join(
+        reply.response_body.response.body_mutation.streamed_response.body for reply in replies
+    )
+    result = (
+        json.loads(SseDecoder().feed(emitted.decode(), final=True)[-1].data)["response"]
+        if stream
+        else json.loads(emitted)
+    )
+    assert result["usage"] == usage
+    assert (
+        result["usage"]["attribution"]["items"]["item_0" if container == "map" else 0][
+            "future_flag"
+        ]
+        is True
+    )
+    assert state["values"]
+    reasoning = emitted_reasoning("responses", stream, replies)
+    admission["request_context"]["request_id"] = "next-request"
+    replies = await exchange(
+        client, request_messages(admission, "responses", replay_payload("responses", reasoning))
+    )
+    assert replies[-1].HasField("request_body")
+    assert len(state["receipts"]) == 2
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("failure", ["bytes", "depth", "structure", "duplicate", "nan", "infinity"])
+async def test_accounting_limits_and_invalid_json_never_authorize_replay(
+    admission, reasoning_engine, stream, failure
+):
+    client, state = reasoning_engine
+    accounting = {"probe": 0}
+    if failure == "depth":
+        for _ in range(MAX_JSON_DEPTH):
+            accounting = {"nested": accounting}
+    elif failure == "structure":
+        accounting = {"items": [{}] * (MAX_JSON_TOKENS // 2)}
+    elif failure in {"nan", "infinity"}:
+        accounting = {"probe": float("nan" if failure == "nan" else "inf")}
+    payload = response_payload("responses", reasoning=True)
+    payload["usage"]["attribution"] = accounting
+    if stream:
+        events = native_reasoning_events("responses")
+        events[-1]["response"]["usage"]["attribution"] = accounting
+        incoming = b"".join(event_bytes("responses", event) for event in events)
+    else:
+        incoming = json.dumps(payload).encode()
+    if failure == "duplicate":
+        assert incoming.count(b'"probe": 0') == 1
+        incoming = incoming.replace(b'"probe": 0', b'"probe": 0, "probe": 1')
+    settings = Settings(max_response_bytes=len(incoming) - 1) if failure == "bytes" else None
+    messages = [
+        *request_messages(admission, "responses", stream=stream),
+        response_headers("text/event-stream" if stream else "application/json", policy=admission),
+        response_body(incoming, end_of_stream=False, policy=admission),
+        response_body(b"", policy=None),
+    ]
+    replies = []
+    if stream:
+        with pytest.raises(StreamAbortedError):
+            await exchange(client, messages, replies, settings)
+    else:
+        await exchange(client, messages, replies, settings)
+        assert replies[-1].immediate_response.status.code == 503
+    assert not state["receipts"] and not state["values"]
+    assert not any(
+        reply.response_body.response.body_mutation.streamed_response.end_of_stream
+        for reply in replies
+    )
+    replies = await exchange(
+        client,
+        request_messages(
+            admission, "responses", replay_payload("responses", reasoning_value("responses"))
+        ),
+    )
+    assert replies[-1].immediate_response.status.code == 400
+
+
 @pytest.mark.parametrize(
     "change", ["missing", "edited", "principal", "binding", "model", "policy", "outage"]
 )
@@ -420,11 +530,6 @@ async def test_incomplete_reasoning_never_authorizes_replay(admission, reasoning
         ((-1, "response", "usage", "attribution"), {"items": ["unclassified-text"]}),
         ((-1, "response", "usage", "attribution"), {"items": [{"input_tokens": "1"}]}),
         ((-1, "response", "usage", "attribution"), {"items": [{"input_tokens": -1}]}),
-        ((-1, "response", "usage", "attribution"), {"items": [{}] * 129}),
-        (
-            (-1, "response", "usage", "attribution"),
-            {"items": [{f"counter_{i}": 0 for i in range(129)}]},
-        ),
         (
             (
                 1,
@@ -451,8 +556,6 @@ async def test_incomplete_reasoning_never_authorizes_replay(admission, reasoning
         "usage-string-entry",
         "usage-string-count",
         "usage-negative-count",
-        "usage-oversized-list",
-        "usage-oversized-map",
         "metadata-shape",
     ],
 )

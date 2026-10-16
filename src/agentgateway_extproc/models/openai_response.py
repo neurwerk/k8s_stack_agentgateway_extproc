@@ -19,16 +19,11 @@ type ItemStatus = Literal["in_progress", "completed", "incomplete"]
 type EmptyList = Annotated[list[None], Field(max_length=0)]
 type MetadataToken = Annotated[str, Field(pattern=r"^[a-z][a-z0-9_-]*$", max_length=64)]
 type ControlMetadata = Annotated[dict[MetadataToken, MetadataToken | None], Field(max_length=64)]
-type UsageMetadata = Annotated[
-    dict[
-        MetadataToken,
-        Annotated[int | float, Field(ge=0)]
-        | bool
-        | UsageMetadata
-        | Annotated[list[UsageMetadata], Field(max_length=128)]
-        | None,
-    ],
-    Field(max_length=128),
+# Accounting cardinality grows with conversation history. The shared JSON depth,
+# structure and response-byte budgets bound it before this validation view.
+type UsageMetadata = dict[
+    MetadataToken,
+    Annotated[int | float, Field(ge=0)] | bool | UsageMetadata | list[UsageMetadata] | None,
 ]
 
 
