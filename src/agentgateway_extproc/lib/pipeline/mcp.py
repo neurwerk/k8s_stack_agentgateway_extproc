@@ -57,7 +57,7 @@ class McpUnsupportedFeatureError(McpProtocolError):
                 "error": {
                     "code": -32000,
                     "message": "This MCP feature is not supported by gateway inspection",
-                    "data": {"reason": "unsupported_feature"},
+                    "data": {"code": "unsupported_feature"},
                 },
             }
         )
