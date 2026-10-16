@@ -176,7 +176,9 @@ class ExtProcServicer(ext_proc_pb2_grpc.ExternalProcessorServicer):
         if not response.HasField("immediate_response"):
             return
         limit = (
-            error.limit if isinstance(error, (EnginePolicyError, InvalidEngineReplyError)) else None
+            error.limit
+            if isinstance(error, (EnginePolicyError, InvalidEngineReplyError, GatewayPolicyError))
+            else None
         )
         code = annotate_rejection(
             response,
@@ -313,7 +315,8 @@ def _failure_response(
         return immediate_response(
             exc.status_code,
             json.dumps(
-                {"error": {"code": exc.code, "message": exc.message}}, separators=(",", ":")
+                {"error": {"code": exc.code, "message": exc.message, "retryable": exc.retryable}},
+                separators=(",", ":"),
             ),
         )
     if isinstance(exc, ContextForgeAccountRequiredError):
@@ -405,6 +408,8 @@ def _record_failure(phase: str, exc: Exception, handler: StreamHandler) -> None:
 
 
 def _failure_reason(exc: Exception) -> str:
+    if isinstance(exc, GatewayPolicyError):
+        return exc.code
     if isinstance(exc, EnginePolicyError):
         return f"engine_{exc.code}"
     if isinstance(exc, InvalidReversalError):

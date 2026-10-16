@@ -35,6 +35,7 @@ class LimitDetail(BaseModel):
         "segments",
         "text_leaves",
         "empty_chunks",
+        "reasoning_fingerprints",
     ]
     measured: int = Field(ge=0)
     maximum: int = Field(ge=0)
@@ -177,6 +178,9 @@ type GatewayErrorCode = Literal[
     "invalid_provider_credential",
     "unsupported_reroute",
     "unverified_reasoning",
+    "reasoning_history_limit",
+    "reasoning_context_missing",
+    "reasoning_service_unavailable",
 ]
 
 _GATEWAY_ERRORS: dict[GatewayErrorCode, tuple[int, str]] = {
@@ -189,7 +193,21 @@ _GATEWAY_ERRORS: dict[GatewayErrorCode, tuple[int, str]] = {
     "unsupported_reroute": (403, "Rerouting is not supported on this binding."),
     "unverified_reasoning": (
         400,
-        "Reasoning continuation is unverified or expired. Start a new conversation.",
+        "Reasoning verification records are missing for the current context. "
+        "They may have expired, been evicted, or never been recorded, or the model, "
+        "credentials or policy may have changed. Retry with the original context "
+        "or start a new conversation.",
+    ),
+    "reasoning_history_limit": (413, "Reasoning history exceeds the supported limit."),
+    "reasoning_context_missing": (
+        500,
+        "The gateway is missing the context required to verify reasoning. "
+        "Contact the operator with the request ID.",
+    ),
+    "reasoning_service_unavailable": (
+        503,
+        "The reasoning verification service is unavailable or timed out. "
+        "Retry this request; a new conversation is not required.",
     ),
 }
 
@@ -197,11 +215,13 @@ _GATEWAY_ERRORS: dict[GatewayErrorCode, tuple[int, str]] = {
 class GatewayPolicyError(Exception):
     """Carry only a fixed, content-free profile rejection."""
 
-    def __init__(self, code: GatewayErrorCode) -> None:
+    def __init__(self, code: GatewayErrorCode, *, limit: LimitDetail | None = None) -> None:
         """Derive the status and public message from a closed vocabulary."""
         super().__init__()
         self.code = code
         self.status_code, self.message = _GATEWAY_ERRORS[code]
+        self.limit = limit
+        self.retryable = code == "reasoning_service_unavailable"
 
 
 class ContextForgeAccountRequiredError(Exception):
