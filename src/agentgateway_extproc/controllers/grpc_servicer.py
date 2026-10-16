@@ -141,7 +141,7 @@ class ExtProcServicer(ext_proc_pb2_grpc.ExternalProcessorServicer):
                 if outputs and outputs[-1].HasField("immediate_response"):
                     return
             try:
-                outputs = _finish_stream(handler)
+                outputs = await _finish_stream(handler)
                 for output in outputs:
                     self._annotate_rejection(handler, output)
                     phase.observe(output)
@@ -233,12 +233,12 @@ def _ordered_response(
     return (response,)
 
 
-def _finish_stream(handler: StreamHandler) -> tuple[ext_proc_pb2.ProcessingResponse, ...]:
+async def _finish_stream(handler: StreamHandler) -> tuple[ext_proc_pb2.ProcessingResponse, ...]:
     """Finalize an incomplete request or flush a normal response iterator EOF."""
     incomplete_request = handler.finish_request()
     if incomplete_request is not None:
         return (incomplete_request,)
-    final_body = handler.finish_response()
+    final_body = await handler.finish_response()
     if final_body is None:
         return ()
     return _ordered_response(handler, final_body)
@@ -268,7 +268,7 @@ async def _handle_message(
     # handle() validates admission before any trailer-triggered output is flushed.
     response = await handler.handle(request)
     if kind == "response_trailers":
-        final_body = handler.finish_response()
+        final_body = await handler.finish_response()
         if final_body is not None:
             outputs.extend(_ordered_response(handler, final_body))
             if final_body.HasField("immediate_response"):

@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import re
 from typing import cast
+
+from neurwerk_request_segments.models import EngineChatRequest, EngineResponsesRequest
+from neurwerk_request_segments.reasoning import CHAT_REASONING_FIELDS
 
 from agentgateway_extproc.lib.request_segments import extract_request
 from agentgateway_extproc.models.engine import EngineReply, EngineRequest
@@ -21,7 +25,7 @@ type TextLeaves = dict[tuple[PathPart, ...], str]
 def validate_reversal(original: EngineRequest, reply: EngineReply) -> None:
     """Require reversal tokens, plaintext and counts to match the current request."""
     transformed_request = reply.request
-    if RESERVED_PLACEHOLDER_PREFIX_RE.search(original.model_dump_json(exclude_none=True)):
+    if _untrusted_placeholder(original):
         raise InvalidEngineReplyError(  # noqa: TRY003
             "reversal placeholder already existed in request"
         )
@@ -48,6 +52,24 @@ def validate_reversal(original: EngineRequest, reply: EngineReply) -> None:
         raise InvalidEngineReplyError(  # noqa: TRY003
             "reversal occurrence counts disagree with the current request report"
         )
+
+
+def _untrusted_placeholder(request: EngineRequest) -> bool:
+    # Opaque fields require a receipt before forwarding. Exclude them from placeholder
+    # interpretation while still checking all editable leaves and other protocol data.
+    data = request.model_dump(mode="json", exclude_none=True)
+    if isinstance(request, EngineChatRequest):
+        for message in data["messages"]:
+            for key in CHAT_REASONING_FIELDS:
+                message.pop(key, None)
+    elif isinstance(request, EngineResponsesRequest) and isinstance(data["input"], list):
+        for item in data["input"]:
+            if item.get("type") == "reasoning":
+                item.pop("encrypted_content", None)
+    return bool(RESERVED_PLACEHOLDER_PREFIX_RE.search(json.dumps(data))) or any(
+        RESERVED_PLACEHOLDER_PREFIX_RE.search(segment.text)
+        for segment in extract_request(request).segments
+    )
 
 
 def _restore_reversal_leaves(

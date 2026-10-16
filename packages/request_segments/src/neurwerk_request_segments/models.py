@@ -18,6 +18,7 @@ from pydantic.json_schema import JsonDict, SkipJsonSchema
 
 from .compatibility import CompatibilitySettings, UnsupportedFeatureError
 from .native import AnthropicRequest, GoogleRequest
+from .reasoning import CHAT_REASONING_FIELDS, ChatReasoning, ResponseReasoning
 
 type JsonScalar = str | int | float | bool | None
 type JsonValue = JsonScalar | list[JsonValue] | dict[str, JsonValue]
@@ -214,7 +215,7 @@ class EngineResponseToolDefinition(RequestModel):
     parameters: dict[str, JsonValue] | None = None
 
 
-class EngineMessage(RequestModel):
+class EngineMessage(RequestModel, ChatReasoning):
     """Chat message with current and deprecated function-call forms."""
 
     endpoint = "chat"
@@ -234,10 +235,15 @@ class EngineMessage(RequestModel):
             raise ValueError("tool messages require tool_call_id")  # noqa: TRY003
         if (self.tool_calls or self.function_call) and self.role != "assistant":
             raise ValueError("tool calls require an assistant message")  # noqa: TRY003
+        if self.role != "assistant" and any(
+            getattr(self, key) is not None for key in CHAT_REASONING_FIELDS
+        ):
+            raise ValueError("reasoning requires an assistant message")  # noqa: TRY003
         if (
             self.role == "assistant"
             and self.content is None
             and not (self.tool_calls or self.function_call or self.refusal)
+            and not any(getattr(self, key) for key in CHAT_REASONING_FIELDS)
         ):
             raise ValueError("assistant messages require content or tool calls")  # noqa: TRY003
         return self
@@ -280,6 +286,7 @@ class EngineChatRequest(RequestModel):
     logit_bias: dict[str, float] | None = None
     functions: list[EngineToolFunction] | None = None
     function_call: Literal["none", "auto"] | dict[str, str] | None = None
+    reasoning: ChatReasoningConfig | None = None
 
     @model_validator(mode="after")
     def validate_stream_options(self) -> EngineChatRequest:
@@ -294,6 +301,8 @@ class EngineResponseTextPart(RequestModel):
 
     type: Literal["input_text", "output_text"]
     text: str
+    annotations: Annotated[list[None], Field(max_length=0)] | None = None
+    logprobs: Annotated[list[None], Field(max_length=0)] | None = None
 
 
 class EngineResponseMessage(RequestModel):
@@ -377,6 +386,19 @@ class ReasoningConfig(RequestModel):
     effort: str | None = None
     summary: str | None = None
     generate_summary: str | None = None
+    context: Literal["auto", "all_turns", "current_turn"] | None = None
+    mode: Literal["standard", "pro"] | None = None
+
+
+class ChatReasoningConfig(RequestModel):
+    """Shared Chat reasoning controls, with no content-bearing extension fields."""
+
+    effort: str | None = None
+    max_tokens: int | None = Field(default=None, ge=0)
+    enabled: bool | None = None
+    exclude: bool | None = None
+    context: Literal["auto", "all_turns", "current_turn"] | None = None
+    mode: Literal["standard", "pro"] | None = None
 
 
 class ResponseStreamOptions(RequestModel):
@@ -387,7 +409,10 @@ class ResponseStreamOptions(RequestModel):
 
 
 type EngineResponseInputItem = (
-    EngineResponseMessage | EngineResponseFunctionCall | EngineResponseFunctionOutput
+    EngineResponseMessage
+    | EngineResponseFunctionCall
+    | EngineResponseFunctionOutput
+    | ResponseReasoning
 )
 type EngineResponseInput = str | Annotated[list[EngineResponseInputItem], Field(min_length=1)]
 

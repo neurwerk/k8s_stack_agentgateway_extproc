@@ -27,6 +27,7 @@ from agentgateway_extproc.models.exceptions import (
     ENGINE_ERROR_CONTRACT,
     EnginePolicyError,
     EngineUnavailableError,
+    GatewayPolicyError,
     InvalidEngineReplyError,
     LimitDetail,
 )
@@ -82,6 +83,34 @@ class EngineClient:
                 response.raise_for_status()
         except (TimeoutError, httpx.HTTPError) as exc:
             _logger.debug("PII engine readiness failed error=%s", type(exc).__name__)
+            raise EngineUnavailableError from exc
+
+    async def reasoning_receipts(
+        self,
+        scope: str,
+        digests: list[str],
+        *,
+        record: bool,
+        correlation_id: str,
+        policy_version: str | None = None,
+    ) -> None:
+        """Exchange only fingerprints over the existing workload-authenticated channel."""
+        try:
+            async with (
+                asyncio.timeout(self._settings.timeout),
+                self._client.stream(
+                    "PUT" if record else "POST",
+                    f"{self._settings.base_url.rstrip('/')}/v2/adapter/reasoning-receipts",
+                    json={"scope": scope, "digests": digests, "policy_version": policy_version},
+                    headers={"x-correlation-id": _correlation_id(correlation_id)},
+                ) as response,
+            ):
+                if response.status_code == 204:
+                    return
+                if not record and response.status_code == 403:
+                    raise GatewayPolicyError("unverified_reasoning")
+                raise EngineUnavailableError
+        except (TimeoutError, httpx.HTTPError) as exc:
             raise EngineUnavailableError from exc
 
     async def analyze_request(

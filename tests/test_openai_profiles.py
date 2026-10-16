@@ -4,10 +4,13 @@ import json
 from copy import deepcopy
 
 import grpc
+import httpx
 import pytest
 
+from agentgateway_extproc.config.settings import EngineSettings
 from agentgateway_extproc.controllers.grpc_servicer import ExtProcServicer
 from agentgateway_extproc.gen import ext_proc_pb2
+from agentgateway_extproc.lib.engine.client import EngineClient
 from agentgateway_extproc.lib.pipeline.sse import SseDecoder
 from agentgateway_extproc.lib.pipeline.stream_handler import StreamHandler
 
@@ -23,6 +26,7 @@ from .openai_fixtures import event_bytes, response_payload, stream_events
 from .test_admission import admission as admission
 from .test_admission import body, headers
 from .test_fail_closed import FakeAioContext, StreamAbortedError
+from .test_reasoning import reasoning_engine as reasoning_engine
 
 SENTINEL = "synthetic-sentinel"
 
@@ -48,6 +52,120 @@ async def collect(engine_client, messages, replies, context):
         replies.append(reply)
 
 
+async def test_buffered_chat_preserves_reasoning_values(admission, engine_client):
+    reasoning = {
+        "reasoning": "Think about " + REVERSIBLE_TOKEN,
+        "reasoning_content": "Alias " + REVERSIBLE_TOKEN,
+        "reasoning_details": [{"type": "reasoning.text", "text": "Thought", "index": 0}],
+    }
+    payload = response_payload("chat")
+    payload["choices"][0]["message"].update(reasoning)
+    replies = []
+    await collect(
+        engine_client,
+        [
+            *request_messages(admission, "chat", stream=False),
+            response_headers("application/json", policy=admission),
+            response_body(json.dumps(payload).encode(), policy=admission),
+        ],
+        replies,
+        FakeAioContext(),
+    )
+    assert replies[-1].HasField("response_body")
+    value = json.loads(replies[-1].response_body.response.body_mutation.streamed_response.body)
+    message = value["choices"][0]["message"]
+    assert {key: message[key] for key in reasoning} == reasoning
+    assert "Jane Doe" in message["content"]
+
+
+async def test_streaming_chat_preserves_reasoning_deltas(admission, engine_client):
+    events = stream_events("chat", tools=True)
+    reasoning = {
+        "reasoning": "Thought " + REVERSIBLE_TOKEN,
+        "reasoning_content": "Alias thought",
+        "reasoning_details": [{"type": "reasoning.text", "text": "Thought", "index": 0}],
+    }
+    events[1]["choices"][0]["delta"].update(reasoning)
+    replies = []
+    await collect(
+        engine_client,
+        [
+            *request_messages(admission, "chat", stream=True),
+            response_headers("text/event-stream", policy=admission),
+            response_body(
+                b"".join(event_bytes("chat", event) for event in events), policy=admission
+            ),
+        ],
+        replies,
+        FakeAioContext(),
+    )
+    emitted = b"".join(
+        reply.response_body.response.body_mutation.streamed_response.body for reply in replies
+    )
+    frames = SseDecoder().feed(emitted.decode(), final=True)
+    assert frames[-1].data == "[DONE]"
+    deltas = [
+        choice["delta"] for frame in frames[:-1] for choice in json.loads(frame.data)["choices"]
+    ]
+    actual = next(delta for delta in deltas if "reasoning_details" in delta)
+    assert {key: actual[key] for key in reasoning} == reasoning
+    assert "Jane Doe" in "".join(delta.get("content") or "" for delta in deltas)
+
+
+@pytest.mark.parametrize(
+    "field", ["reasoning", "reasoning_content", "reasoning_details", "thinking_blocks"]
+)
+async def test_assistant_reasoning_replay_inspects_client_modified_text(
+    admission, engine_reply, field
+):
+    history = {"role": "assistant", "content": "Earlier answer", field: "Jane Doe"}
+    if field == "reasoning_details":
+        history[field] = [{"type": "reasoning.text", "text": "Jane Doe", "index": 0}]
+    elif field == "thinking_blocks":
+        history[field] = [{"type": "thinking", "thinking": "Jane Doe"}]
+    payload = {
+        "model": "example-chat",
+        "messages": [history, {"role": "user", "content": "Continue"}],
+    }
+    seen = []
+
+    def analyze(request):
+        wire = json.loads(request.content)
+        seen.extend(segment["text"] for segment in wire["segments"])
+        reply = deepcopy(engine_reply)
+        reply.pop("request")
+        reply["api_version"] = "v2"
+        reply["analysis"]["text_leaf_count"] = len(wire["segments"])
+        reply["segments"] = [
+            {**segment, "text": segment["text"].replace("Jane Doe", REVERSIBLE_TOKEN)}
+            for segment in wire["segments"]
+        ]
+        return httpx.Response(200, json=reply)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(analyze)) as http:
+        client = EngineClient(EngineSettings(base_url="https://engine.example.test"), http)
+        replies = []
+        await collect(
+            client,
+            [
+                header_request(headers(), policy=admission),
+                body_request(json.dumps(payload).encode(), policy=admission),
+            ],
+            replies,
+            FakeAioContext(),
+        )
+    assert "Jane Doe" in seen
+    assert replies[-1].HasField("request_body")
+    forwarded = json.loads(replies[-1].request_body.response.body_mutation.body)["messages"][1]
+    assert forwarded[field] == (
+        [{"type": "reasoning.text", "text": REVERSIBLE_TOKEN, "index": 0}]
+        if field == "reasoning_details"
+        else [{"type": "thinking", "thinking": REVERSIBLE_TOKEN}]
+        if field == "thinking_blocks"
+        else REVERSIBLE_TOKEN
+    )
+
+
 @pytest.mark.parametrize("pii", [False, True])
 @pytest.mark.parametrize(
     "case", ["unknown_json", "unknown_event", "chat_reasoning", "chat_reasoning_sse"]
@@ -64,10 +182,14 @@ async def test_review_repros_reject_before_transformation(
         payload = {"type": "response.unqualified_content", "raw": SENTINEL, "sequence_number": 0}
     elif case == "chat_reasoning":
         payload = response_payload("chat", "safe text")
-        payload["choices"][0]["message"]["reasoning_content"] = REVERSIBLE_TOKEN + SENTINEL
+        payload["choices"][0]["message"]["reasoning_details"] = [
+            {"type": "reasoning.text", "unqualified": SENTINEL}
+        ]
     else:
         payload = stream_events("chat", "safe text")[0]
-        payload["choices"][0]["delta"]["reasoning_content"] = REVERSIBLE_TOKEN + SENTINEL
+        payload["choices"][0]["delta"]["reasoning_details"] = [
+            {"type": "reasoning.text", "unqualified": SENTINEL}
+        ]
     messages = request_messages(admission, kind, stream=stream)
     messages += [
         response_headers("text/event-stream" if stream else "application/json", policy=admission),
@@ -103,7 +225,7 @@ async def test_v5_closes_nested_output_shapes(admission, engine_client, case):
         payload["output"][0]["content"][0]["encrypted_content"] = SENTINEL
     else:
         payload["output"] = [
-            {"id": "rs-example", "type": "reasoning", "summary": [], "encrypted_content": SENTINEL}
+            {"id": "rs-example", "type": "reasoning", "summary": [], "unqualified": SENTINEL}
         ]
     messages = [
         *request_messages(admission, kind, stream=False),
@@ -120,8 +242,9 @@ async def test_v5_closes_nested_output_shapes(admission, engine_client, case):
 @pytest.mark.parametrize("pii", [False, True])
 @pytest.mark.parametrize("stream", [False, True])
 async def test_qualified_v5_text_tools_and_usage_roundtrip(
-    admission, engine_client, kind, pii, stream
+    admission, reasoning_engine, kind, pii, stream
 ):
+    engine_client, _ = reasoning_engine
     admission["destination_policy"]["models"]["example-chat"] = pii
     handler = StreamHandler(engine_client)
     for message in request_messages(admission, kind, stream=stream):
@@ -132,9 +255,11 @@ async def test_qualified_v5_text_tools_and_usage_roundtrip(
         response_headers("text/event-stream" if stream else "application/json", policy=admission)
     )
     incoming = (
-        b"".join(event_bytes(kind, event) for event in stream_events(kind, tools=True))
+        b"".join(
+            event_bytes(kind, event) for event in stream_events(kind, tools=True, reasoning=True)
+        )
         if stream
-        else json.dumps(response_payload(kind, tools=True)).encode()
+        else json.dumps(response_payload(kind, tools=True, reasoning=True)).encode()
     )
     emitted = b""
     for position in range(0, len(incoming), 37):
@@ -151,7 +276,7 @@ async def test_qualified_v5_text_tools_and_usage_roundtrip(
     emitted += reply.response_body.response.body_mutation.streamed_response.body
     text = "Jane Doe" if pii else REVERSIBLE_TOKEN
     if not stream:
-        assert json.loads(emitted) == response_payload(kind, text, tools=True)
+        assert json.loads(emitted) == response_payload(kind, text, tools=True, reasoning=True)
     else:
         events = SseDecoder().feed(emitted.decode(), final=True)
         if kind == "chat":
@@ -169,7 +294,7 @@ async def test_qualified_v5_text_tools_and_usage_roundtrip(
         else:
             terminal = json.loads(events[-1].data)
             assert terminal["type"] == "response.completed"
-            assert terminal["response"] == response_payload(kind, text, tools=True)
+            assert terminal["response"] == response_payload(kind, text, tools=True, reasoning=True)
     assert handler.reversal_map == {}
 
 

@@ -428,7 +428,11 @@ async def test_unqualified_features_stop_before_analysis(admission, engine_clien
     elif change == "reasoning":
         data = json.loads(payload)
         data["messages"].append(
-            {"role": "assistant", "content": "text", "reasoning_content": SECRET}
+            {
+                "role": "assistant",
+                "content": "text",
+                "reasoning_details": [{"type": "unqualified", "text": SECRET}],
+            }
         )
         payload = json.dumps(data).encode()
     elif change in {"background", "history"}:

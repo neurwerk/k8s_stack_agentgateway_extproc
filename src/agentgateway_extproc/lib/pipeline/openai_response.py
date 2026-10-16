@@ -9,7 +9,13 @@ from dataclasses import dataclass, field
 from hashlib import sha256
 from typing import TYPE_CHECKING
 
+from neurwerk_request_segments.reasoning import CHAT_REASONING_FIELDS
+
 from agentgateway_extproc.lib.json_limits import strict_json_loads
+from agentgateway_extproc.lib.pipeline.reasoning import (
+    ChatReasoningTracker,
+    response_reasoning_digest,
+)
 from agentgateway_extproc.lib.pipeline.sse import SseEvent
 from agentgateway_extproc.models.exceptions import InvalidReversalError
 from agentgateway_extproc.models.openai_response import (
@@ -25,10 +31,16 @@ from agentgateway_extproc.models.openai_response import (
     OutputItem,
     OutputMessage,
     OutputPart,
+    OutputReasoning,
     OutputText,
     PartEvent,
+    ReasoningDeltaEvent,
+    ReasoningDoneEvent,
     RefusalDoneEvent,
     ResponsesResponse,
+    SummaryDeltaEvent,
+    SummaryDoneEvent,
+    SummaryPartEvent,
     TextDeltaEvent,
     TextDoneEvent,
     ToolDelta,
@@ -141,6 +153,8 @@ class _Item:
     initial: OutputItem
     arguments: _Arguments = field(default_factory=_Arguments)
     parts: dict[int, _Part] = field(default_factory=dict)
+    summaries: dict[int, _Part] = field(default_factory=dict)
+    encrypted_digest: str | None = None
     closed: bool = False
 
     def check(self, item: OutputItem) -> None:
@@ -161,6 +175,19 @@ class _Item:
                 if state.kind != part.type:
                     raise InvalidReversalError("output part type changed")
                 state.check(_part_text(part))
+        elif isinstance(item, OutputReasoning):
+            self._check_reasoning(item)
+
+    def _check_reasoning(self, item: OutputReasoning) -> None:
+        for parts, snapshots in ((self.summaries, item.summary), (self.parts, item.content or [])):
+            if len(parts) != len(snapshots) or any(not part.closed for part in parts.values()):
+                raise InvalidReversalError("reasoning item has open text parts")
+            for index, part in enumerate(snapshots):
+                parts[index].check(part.text)
+        digest = response_reasoning_digest(item.model_dump())
+        if self.closed and self.encrypted_digest != digest:
+            raise InvalidReversalError("reasoning snapshot disagrees")
+        self.encrypted_digest = digest
 
 
 class OpenAIStreamValidator:
@@ -179,6 +206,8 @@ class OpenAIStreamValidator:
         self.tools: dict[tuple[int, int], _ChatTool] = {}
         self.items: dict[int, _Item] = {}
         self.sequence = -1
+        self.reasoning = ChatReasoningTracker()
+        self.reasoning_digests: set[str] = set()
 
     def frame(self, event: SseEvent) -> bool:
         """Drop comment keepalives and reject unknown SSE carriers before forwarding."""
@@ -207,6 +236,7 @@ class OpenAIStreamValidator:
         ):
             raise InvalidReversalError("premature protocol terminal")
         self.terminal = True
+        self.reasoning_digests = self.reasoning.digests()
 
     def accept(self, event: SseEvent, payload: object) -> None:
         """Validate a native event and its lifecycle before the transformer sees it."""
@@ -238,6 +268,7 @@ class OpenAIStreamValidator:
             if choice.index in self.finished_choices:
                 raise InvalidReversalError("choice continued after completion")
             self.choices.add(choice.index)
+            self.reasoning.append(choice.index, choice.delta.model_dump(exclude_none=True))
             tools = choice.delta.tool_calls or []
             _unique([tool.index for tool in tools])
             for tool in tools:
@@ -266,6 +297,7 @@ class OpenAIStreamValidator:
                 or c.delta.content
                 or c.delta.refusal
                 or c.delta.tool_calls
+                or any(getattr(c.delta, key) for key in CHAT_REASONING_FIELDS)
                 for c in chunk.choices
             )
         ):
@@ -313,6 +345,15 @@ class OpenAIStreamValidator:
                 state.arguments.append(parsed.delta)
             else:
                 state.arguments.finish(parsed.arguments)
+        elif isinstance(
+            parsed,
+            SummaryPartEvent
+            | SummaryDeltaEvent
+            | SummaryDoneEvent
+            | ReasoningDeltaEvent
+            | ReasoningDoneEvent,
+        ):
+            self._reasoning_part(parsed)
         else:
             self._part(parsed)
 
@@ -338,6 +379,9 @@ class OpenAIStreamValidator:
             raise InvalidReversalError("Responses completed with open output items")
         for index, item in enumerate(response.output):
             self.items[index].check(item)
+        self.reasoning_digests = {
+            item.encrypted_digest for item in self.items.values() if item.encrypted_digest
+        }
         self.terminal = True
 
     def _item(self, event: ItemEvent) -> None:
@@ -348,7 +392,11 @@ class OpenAIStreamValidator:
             ):
                 raise InvalidReversalError("duplicate or out-of-order output item")
             if item.status not in {None, "in_progress"} or (
-                item.content if isinstance(item, OutputMessage) else item.arguments
+                item.content
+                if isinstance(item, OutputMessage)
+                else (item.summary or item.content or item.encrypted_content)
+                if isinstance(item, OutputReasoning)
+                else item.arguments
             ):
                 raise InvalidReversalError("output item must start empty")
             self.items[event.output_index] = _Item(item)
@@ -394,3 +442,54 @@ class OpenAIStreamValidator:
                 raise InvalidReversalError("duplicate text completion")
             part.check(event.text if isinstance(event, TextDoneEvent) else event.refusal)
             part.text_done = True
+
+    def _reasoning_part(
+        self,
+        event: SummaryPartEvent
+        | SummaryDeltaEvent
+        | SummaryDoneEvent
+        | ReasoningDeltaEvent
+        | ReasoningDoneEvent,
+    ) -> None:
+        item = self._get_item(event)
+        if not isinstance(item.initial, OutputReasoning):
+            raise InvalidReversalError("reasoning event does not name a reasoning item")
+        if isinstance(event, ReasoningDeltaEvent | ReasoningDoneEvent):
+            self._reasoning_text(item, event)
+            return
+        index = event.summary_index
+        if isinstance(event, SummaryPartEvent) and event.type.endswith(".added"):
+            if index != len(item.summaries) or event.part.text:
+                raise InvalidReversalError("reasoning summary must start once and empty")
+            item.summaries[index] = _Part("summary_text")
+            return
+        part = item.summaries.get(index)
+        if part is None or part.closed:
+            raise InvalidReversalError("reasoning summary has no open start")
+        if isinstance(event, SummaryDeltaEvent):
+            part.append(event.delta)
+        elif isinstance(event, SummaryDoneEvent):
+            if part.text_done:
+                raise InvalidReversalError("duplicate reasoning text completion")
+            part.check(event.text)
+            part.text_done = True
+        else:
+            if not part.text_done:
+                raise InvalidReversalError("reasoning summary closed before text completion")
+            part.check(event.part.text)
+            part.closed = True
+
+    def _reasoning_text(self, item: _Item, event: ReasoningDeltaEvent | ReasoningDoneEvent) -> None:
+        index = event.content_index
+        if index not in item.parts:
+            if index != len(item.parts):
+                raise InvalidReversalError("out-of-order reasoning content")
+            item.parts[index] = _Part("reasoning_text")
+        part = item.parts[index]
+        if isinstance(event, ReasoningDeltaEvent):
+            part.append(event.delta)
+        else:
+            if part.closed:
+                raise InvalidReversalError("duplicate reasoning completion")
+            part.check(event.text)
+            part.closed = part.text_done = True
