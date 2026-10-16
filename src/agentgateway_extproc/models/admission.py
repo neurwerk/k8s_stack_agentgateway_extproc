@@ -34,6 +34,9 @@ type ProfileId = Literal[
     "gamma-web-v1",
     "mcp-streamable-http-v1",
 ]
+type RequestTextInspection = Literal[
+    "scanned", "cached_decision", "not_scanned", "disabled", "unknown"
+]
 
 
 def _permission_tuple(value: object) -> object:
@@ -156,6 +159,8 @@ class RequestContext(AdmissionContext):
     resolved_model: ModelId
     dispatch_binding_id: Identifier
     dispatch_destination_id: ModelId
+    target_credential_mode: Literal["caller_supplied", "company", "none"]
+    request_text_inspection: RequestTextInspection = "unknown"
     pii_policy: PiiPolicy
     content_tracing_enabled: bool
     billing_classification: Literal["company_api", "personal_api", "subscription", "unknown"]
@@ -166,6 +171,9 @@ class McpRequestContext(AdmissionContext):
     """Resolved MCP identity and policy without invented model usage."""
 
     destination_id: str
+    dispatch_binding_id: Identifier
+    dispatch_destination_id: str
+    request_text_inspection: RequestTextInspection = "unknown"
     pii_policy: PiiPolicy
     content_tracing_enabled: bool
     billing_classification: Literal["unknown"] = "unknown"
@@ -259,6 +267,7 @@ class AdmissionEnvelope(AdmissionModel):
             resolved_model=binding.upstream_model,
             dispatch_binding_id=context.binding_id,
             dispatch_destination_id=model,
+            target_credential_mode=context.provider_credential_source,
             pii_policy=PiiPolicy(enabled=policy.models[model]),
             content_tracing_enabled=binding.content_tracing_enabled,
             billing_classification=(
@@ -283,6 +292,7 @@ class AdmissionEnvelope(AdmissionModel):
                 "resolved_model": target.upstream_model,
                 "dispatch_binding_id": target.binding_id,
                 "dispatch_destination_id": target_id,
+                "target_credential_mode": "none",
                 "content_tracing_enabled": context.content_tracing_enabled
                 and target.content_tracing_enabled,
                 "billing_classification": "unknown",
@@ -307,6 +317,8 @@ class AdmissionEnvelope(AdmissionModel):
         return McpRequestContext(
             **context.model_dump(),
             destination_id=policy.destination_id,
+            dispatch_binding_id=context.binding_id,
+            dispatch_destination_id=policy.destination_id,
             pii_policy=PiiPolicy(enabled=policy.pii_enabled),
             content_tracing_enabled=policy.content_tracing_enabled,
         )

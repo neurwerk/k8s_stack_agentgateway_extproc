@@ -125,6 +125,8 @@ async def test_one_resolution_drives_permissions_policy_and_final_provider_model
         assert metadata == context.model_dump(mode="json")
         assert metadata["billing_classification"] == "unknown"
         assert metadata["usage_completeness"] == "unknown"
+        assert metadata["request_text_inspection"] == ("scanned" if pii else "disabled")
+        assert metadata["target_credential_mode"] == "caller_supplied"
         if not responses and requested != "provider-chat" and pii:
             expected = json.loads(
                 (Path(__file__).parent / "fixtures/resolved-context-v5.json").read_text()
@@ -289,6 +291,7 @@ async def test_company_use_requires_extra_permission_and_strips_credentials(
             "company_api" if source == "company" else "unknown"
         )
         assert context["usage_completeness"] == "unknown"
+        assert context["target_credential_mode"] == source
 
 
 @pytest.mark.parametrize(
@@ -470,8 +473,9 @@ async def test_unqualified_features_stop_before_analysis(admission, engine_clien
     analyze.assert_not_awaited()
 
 
+@pytest.mark.parametrize("cached", [False, True])
 async def test_reroute_requires_company_source_and_explicit_local_permission(
-    engine_client, engine_reply, admission
+    engine_client, engine_reply, admission, cached
 ):
     engine_reply.update(
         decision="reroute",
@@ -492,6 +496,13 @@ async def test_reroute_requires_company_source_and_explicit_local_permission(
             ]
         },
     )
+    if cached:
+        engine_reply["analysis"].update(
+            source="cached_decision",
+            scan_performed=False,
+            duration_ms=None,
+            cached_decision_applied=True,
+        )
     replies = await exchange(
         engine_client,
         [header_request(headers(), policy=admission), body_request(body(), policy=admission)],
@@ -527,6 +538,10 @@ async def test_reroute_requires_company_source_and_explicit_local_permission(
             assert context["resolved_model"] == "local-provider-model"
             assert context["destination_id"] == "example-chat"
             assert context["provider_credential_source"] == "company"
+            assert context["target_credential_mode"] == "none"
+            assert context["request_text_inspection"] == (
+                "cached_decision" if cached else "scanned"
+            )
             assert context["content_tracing_enabled"] is False
             assert context["billing_classification"] == "unknown"
 
@@ -706,6 +721,10 @@ async def test_in_band_provider_error_never_echoes_error_content(
         await collect()
         assert replies[-1].immediate_response.status.code == 503
     assert SECRET not in str(replies) + caplog.text + context.details
+    # A later rejection must not overwrite the delivered request facts with success.
+    assert all(
+        not reply.dynamic_metadata.fields for reply in replies if not reply.HasField("request_body")
+    )
 
 
 @pytest.mark.parametrize(
