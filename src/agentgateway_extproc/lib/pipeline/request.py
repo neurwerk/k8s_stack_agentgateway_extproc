@@ -105,7 +105,7 @@ async def process_request(
         return immediate_response(400, '{"error":"invalid request JSON"}')
     if handler.debug_logging:
         handler.request_diagnostic = diagnostic_json(
-            {"headers": handler.request_headers, "body": payload}, maximum=handler.max_request_bytes
+            {"headers": handler.request_headers, "body": payload}
         )
     policy = handler.destination_policy
     if policy is None:

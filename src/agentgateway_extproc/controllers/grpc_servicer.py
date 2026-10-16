@@ -375,7 +375,7 @@ async def _abort_stream(
 
 
 def _record_failure(phase: str, exc: Exception, handler: StreamHandler) -> None:
-    """Keep normal logs concise; DEBUG adds bounded, redacted validation context."""
+    """Keep normal logs concise; DEBUG adds full request and failure context."""
     reason = _failure_reason(exc)
     errors_total.labels(type="processing").inc()
     if phase in {"response_headers", "response_body", "response_trailers", "response_eof"}:
@@ -399,7 +399,6 @@ def _record_failure(phase: str, exc: Exception, handler: StreamHandler) -> None:
                     "response": handler.failed_response,
                     "headers": handler.request_headers,
                 },
-                maximum=handler.max_response_bytes,
             ),
             handler.request_diagnostic,
         )

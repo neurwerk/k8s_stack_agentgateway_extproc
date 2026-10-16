@@ -214,8 +214,8 @@ async def test_review_repros_reject_before_transformation(
 
 @pytest.mark.parametrize("debug", [False, True])
 @pytest.mark.parametrize("stream", [False, True])
-async def test_debug_failure_reports_exact_errors_and_redacts_payloads(
-    admission, engine_client, monkeypatch, caplog, debug, stream
+async def test_debug_failure_reports_exact_errors_and_full_payloads(
+    admission, engine_client, engine_reply, monkeypatch, caplog, debug, stream
 ):
     monkeypatch.setenv("EXTPROC_LOG_LEVEL", "DEBUG" if debug else "INFO")
     caplog.set_level(logging.DEBUG, logger="agentgateway_extproc.controllers.grpc_servicer")
@@ -260,12 +260,25 @@ async def test_debug_failure_reports_exact_errors_and_redacts_payloads(
     )
     payload["output"].append(signed)
     payload["tools"] = [{"type": "function", "name": "lookup", "output_schema": {"type": "object"}}]
+    payload["instructions"] = "a-" * 40_000 + "response-trailing-sentinel"
     failure = (
         {"type": "response.completed", "sequence_number": 1, "response": payload}
         if stream
         else payload
     )
     messages = request_messages(admission, "responses", stream=stream)
+    request_payload = json.loads(body(responses=True, stream=stream))
+    request_payload["input"] = (
+        "Jane Doe " + "a-" * 40_000 + json.dumps(secrets) + "request-trailing-sentinel"
+    )
+    engine_reply["request"]["messages"][0]["content"] = request_payload["input"].replace(
+        "Jane Doe", REVERSIBLE_TOKEN
+    )
+    request_headers = headers(
+        **{":path": f"/bindings/{admission['request_context']['binding_id']}/v1/responses"}
+    )
+    del request_headers["authorization"]  # The request fixture strips platform credentials.
+    messages[1] = body_request(json.dumps(request_payload).encode(), policy=admission)
     messages.append(
         response_headers("text/event-stream" if stream else "application/json", policy=admission)
     )
@@ -288,6 +301,8 @@ async def test_debug_failure_reports_exact_errors_and_redacts_payloads(
         if stream:
             with pytest.raises(StreamAbortedError):
                 await collect(engine_client, messages, replies, context)
+            assert context.code == grpc.StatusCode.INTERNAL
+            assert context.details == "response processing failed closed"
         else:
             await collect(engine_client, messages, replies, context)
             assert replies[-1].immediate_response.status.code == 503
@@ -307,15 +322,31 @@ async def test_debug_failure_reports_exact_errors_and_redacts_payloads(
         "signed-chat-content",
         "signed-chat-signature",
     ]
-    assert all(value not in caplog.text + str(replies) + context.details for value in forbidden)
+    client_replies = (
+        str([reply for reply in replies if reply.WhichOneof("response") != "request_body"])
+        + context.details
+    )
+    assert all(value not in client_replies for value in forbidden)
+    assert "response-trailing-sentinel" not in client_replies
+    assert "request-trailing-sentinel" not in client_replies
     records = [
         record for record in caplog.records if record.msg.startswith("ext_proc failure diagnostics")
     ]
     assert len(records) == int(debug)
     if not debug:
+        assert all(value not in caplog.text for value in forbidden)
         assert "ordinary response text" not in caplog.text and "Jane Doe" not in caplog.text
+        assert "response-trailing-sentinel" not in caplog.text
+        assert "request-trailing-sentinel" not in caplog.text
         return
     details = json.loads(records[0].args[2])
+    assert json.loads(records[0].args[3]) == {
+        "headers": request_headers,
+        "body": request_payload,
+    }
+    assert details["response"] == (
+        {"event": "response.completed", "data": failure} if stream else failure
+    )
     prefix = ["response.completed", "response"] if stream else []
     errors = {(tuple(error["path"]), error["code"]) for error in details["validation"]["errors"]}
     assert ((*prefix, "output", 0, "message", "phase"), "literal_error") in errors
@@ -326,13 +357,11 @@ async def test_debug_failure_reports_exact_errors_and_redacts_payloads(
     assert ((*prefix, "tools", 0, "output_schema"), "none_required") in errors
     assert all(error["message"] for error in details["validation"]["errors"])
     assert "ordinary response text" in caplog.text and "ordinary nested argument" in caplog.text
-    assert "ordinary encoded argument" in caplog.text and "Jane Doe" in caplog.text
+    assert "ordinary encoded argument" in caplog.text
     assert "ordinary signed-carrier sibling" in caplog.text
     assert "earlier-event-not-retained" not in caplog.text
     if stream:
         assert details["response"]["event"] == "response.completed"
-    truncated = diagnostic_json({"text": "ordinary long text " * 200}, maximum=1024)
-    assert json.loads(truncated)["truncated"] is True and len(truncated) <= 1024
 
 
 @pytest.mark.parametrize(
