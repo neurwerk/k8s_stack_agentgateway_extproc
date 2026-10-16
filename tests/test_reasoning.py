@@ -125,7 +125,15 @@ def emitted_reasoning(kind, stream, replies):  # noqa: C901
         )
     frames = SseDecoder().feed(emitted.decode(), final=True)
     if kind == "responses":
-        return json.loads(frames[-1].data)["response"]["output"][0]
+        output = json.loads(frames[-1].data)["response"]["output"]
+        if output:
+            return output[0]
+        return next(
+            value["item"]
+            for frame in frames
+            if (value := json.loads(frame.data))["type"] == "response.output_item.done"
+            and value["item"]["type"] == "reasoning"
+        )
     assert frames[-1].data == "[DONE]"
     # Assemble the client's received deltas, including late signatures.
     value = {}
@@ -162,8 +170,8 @@ def replay_payload(kind, reasoning):
     return {"model": "example-chat", "input": [reasoning, {"role": "user", "content": "Continue"}]}
 
 
-def native_reasoning_events(kind):
-    events = stream_events(kind, tools=True, reasoning=True)
+def native_reasoning_events(kind, *, empty_terminal=False):
+    events = stream_events(kind, tools=True, reasoning=True, empty_terminal=empty_terminal)
     if kind == "responses":
         events[1]["item"]["encrypted_content"] = reasoning_value(kind)["encrypted_content"]
         events[1]["item"]["content"] = []
@@ -197,11 +205,19 @@ def native_reasoning_events(kind):
     return events
 
 
-@pytest.mark.parametrize("kind", ["chat", "responses"])
-@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    ("kind", "stream", "empty_terminal"),
+    [
+        ("chat", False, False),
+        ("chat", True, False),
+        ("responses", False, False),
+        ("responses", True, False),
+        ("responses", True, True),
+    ],
+)
 @pytest.mark.parametrize("reroute", [False, True])
 async def test_reasoning_survives_completed_exchange_and_verified_replay(
-    admission, reasoning_engine, engine_reply, kind, stream, reroute, caplog
+    admission, reasoning_engine, engine_reply, kind, stream, empty_terminal, reroute, caplog
 ):
     client, state = reasoning_engine
     if reroute:
@@ -220,7 +236,10 @@ async def test_reasoning_survives_completed_exchange_and_verified_replay(
             }
         }
     incoming = (
-        b"".join(event_bytes(kind, event) for event in native_reasoning_events(kind))
+        b"".join(
+            event_bytes(kind, event)
+            for event in native_reasoning_events(kind, empty_terminal=empty_terminal)
+        )
         if stream
         else json.dumps(response_payload(kind, tools=True, reasoning=True)).encode()
     )
@@ -247,6 +266,7 @@ async def test_reasoning_survives_completed_exchange_and_verified_replay(
         assert events[1] == native_reasoning_events(kind)[1]
         assert events[2]["item"] == native_reasoning_events(kind)[2]["item"]
         assert events[-1]["response"]["usage"] == response_payload(kind)["usage"]
+        assert bool(events[-1]["response"]["output"]) is not empty_terminal
     assert state["values"]
     state["segments"].clear()
     admission["request_context"]["request_id"] = "next-request"
@@ -346,7 +366,7 @@ async def test_incomplete_reasoning_never_authorizes_replay(admission, reasoning
         if failure in {"late_reasoning", "changed_identity", "trailing_chat"}
         else "responses"
     )
-    events = native_reasoning_events(kind)
+    events = native_reasoning_events(kind, empty_terminal=failure != "changed_snapshot")
     if failure == "truncated":
         events.pop()
     elif failure == "missing_item":

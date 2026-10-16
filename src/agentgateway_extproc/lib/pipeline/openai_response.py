@@ -381,7 +381,8 @@ class OpenAIStreamValidator:
         if response.status != event.type.removeprefix("response."):
             raise InvalidReversalError("Responses terminal status disagrees")
         _complete_response(response)
-        if len(response.output) != len(self.items) or any(
+        # Native streams may complete without repeating their already closed items.
+        if len(response.output) not in {0, len(self.items)} or any(
             not item.closed for item in self.items.values()
         ):
             raise InvalidReversalError("Responses completed with open output items")
