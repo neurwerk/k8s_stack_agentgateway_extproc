@@ -271,6 +271,8 @@ async def test_native_inspection_routing_and_metadata(native, native_engine, pii
     )
     assert metadata["requested_model"] == model
     assert metadata["usage_completeness"] == metadata["billing_classification"] == "unknown"
+    assert metadata["request_text_inspection"] == ("scanned" if pii else "disabled")
+    assert metadata["target_credential_mode"] == "caller_supplied"
     assert CREDENTIAL not in str(reply) + repr(vars(handler))
     assert not any(
         h.header.key == ":path" for h in reply.request_body.response.header_mutation.set_headers

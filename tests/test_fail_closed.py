@@ -13,7 +13,7 @@ from agentgateway_extproc.controllers.grpc_servicer import ExtProcServicer
 from agentgateway_extproc.lib.engine.client import EngineClient
 from agentgateway_extproc.models.exceptions import ENGINE_ERROR_CONTRACT
 
-from .conftest import body_request, header_request, request_json
+from .conftest import body_request, header_request, request_json, segment_reply
 
 ERROR_CASES = tuple((code, *contract) for code, contract in ENGINE_ERROR_CONTRACT.items())
 
@@ -34,10 +34,14 @@ class FakeAioContext:
         raise StreamAbortedError
 
 
-async def test_grpc_servicer_returns_503_on_engine_failure() -> None:
-    """Unexpected engine transport errors become an immediate 503 response."""
+@pytest.mark.parametrize("failure", ["transport", "analysis"])
+async def test_grpc_servicer_returns_503_on_engine_failure(engine_reply, failure) -> None:
+    """Unavailable or invalid analysis cannot emit claimed inspection facts."""
 
     async def handler(request: httpx.Request) -> httpx.Response:
+        if failure == "analysis":
+            engine_reply["analysis"]["scan_performed"] = False
+            return httpx.Response(200, json=segment_reply(engine_reply), request=request)
         raise httpx.ConnectError("offline", request=request)
 
     client = EngineClient(
@@ -54,6 +58,7 @@ async def test_grpc_servicer_returns_503_on_engine_failure() -> None:
 
     responses = [response async for response in servicer.Process(requests(), object())]
     assert responses[-1].immediate_response.status.code == 503
+    assert all(not response.dynamic_metadata.fields for response in responses)
 
 
 @pytest.mark.parametrize(("code", "status", "message", "retryable"), ERROR_CASES)
