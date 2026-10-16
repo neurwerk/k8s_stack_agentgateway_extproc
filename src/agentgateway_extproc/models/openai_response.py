@@ -20,7 +20,14 @@ type EmptyList = Annotated[list[None], Field(max_length=0)]
 type MetadataToken = Annotated[str, Field(pattern=r"^[a-z][a-z0-9_-]*$", max_length=64)]
 type ControlMetadata = Annotated[dict[MetadataToken, MetadataToken | None], Field(max_length=64)]
 type UsageMetadata = Annotated[
-    dict[MetadataToken, Annotated[int | float, Field(ge=0)] | bool | UsageMetadata | None],
+    dict[
+        MetadataToken,
+        Annotated[int | float, Field(ge=0)]
+        | bool
+        | UsageMetadata
+        | Annotated[list[UsageMetadata], Field(max_length=128)]
+        | None,
+    ],
     Field(max_length=128),
 ]
 
