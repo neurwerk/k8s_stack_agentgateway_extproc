@@ -3,15 +3,24 @@
 import json
 from copy import deepcopy
 from typing import Any
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
+from neurwerk_request_segments.models import EngineResponsesRequest
 
 from agentgateway_extproc.config.settings import EngineSettings, Settings
 from agentgateway_extproc.controllers.grpc_servicer import ExtProcServicer
 from agentgateway_extproc.lib.engine.client import EngineClient
 from agentgateway_extproc.lib.json_limits import MAX_JSON_DEPTH, MAX_JSON_TOKENS
+from agentgateway_extproc.lib.pipeline.reasoning import (
+    ChatReasoningTracker,
+    response_reasoning_digest,
+    verify_reasoning,
+)
 from agentgateway_extproc.lib.pipeline.sse import SseDecoder
+from agentgateway_extproc.lib.pipeline.stream_handler import StreamHandler
+from agentgateway_extproc.models.exceptions import GatewayPolicyError, InvalidReversalError
 
 from .conftest import (
     REVERSIBLE_TOKEN,
@@ -453,8 +462,98 @@ async def test_opaque_replay_cannot_borrow_or_forge_evidence(admission, reasonin
         client, request_messages(admission, kind, replay_payload(kind, reasoning))
     )
     assert replies[-1].immediate_response.status.code == (503 if change == "outage" else 400)
+    error = json.loads(replies[-1].immediate_response.body)["error"]
+    assert error["code"] == (
+        "reasoning_service_unavailable" if change == "outage" else "unverified_reasoning"
+    )
+    assert error["retryable"] is (change == "outage")
+    assert error["request_id"]
     assert "signature" not in json.dumps(state["segments"])
     assert not any(reply.HasField("request_body") for reply in replies)
+    if change == "outage":
+        state["unavailable"] = False
+        recovered = await exchange(
+            client, request_messages(admission, kind, replay_payload(kind, reasoning))
+        )
+        assert any(reply.HasField("request_body") for reply in recovered)
+
+
+@pytest.mark.parametrize("kind", ["chat", "responses"])
+@pytest.mark.parametrize("count", [257, 4096, 4097])
+async def test_long_reasoning_history(admission, reasoning_engine, kind, count):
+    client, state = reasoning_engine
+    # Obtain the real admission scope, then seed distinct previously verified receipts.
+    await exchange(
+        client,
+        [
+            *request_messages(admission, kind),
+            response_headers("application/json", policy=admission),
+            response_body(
+                json.dumps(response_payload(kind, reasoning=True)).encode(), policy=admission
+            ),
+        ],
+    )
+    scope = state["receipts"][0]["scope"]
+    history = []
+    for index in range(count):
+        if kind == "responses":
+            item = {"type": "reasoning", "encrypted_content": f"synthetic-{index}"}
+            digest = response_reasoning_digest(item)
+        else:
+            item = {
+                "role": "assistant",
+                "content": None,
+                "reasoning_signature": f"synthetic-{index}",
+            }
+            tracker = ChatReasoningTracker()
+            tracker.append(0, item)
+            digest = next(iter(tracker.digests()))
+        history.append(item)
+        state["values"].add((scope, digest))
+    history.append({"role": "user", "content": "Continue"})
+    payload = {"model": "example-chat", "messages" if kind == "chat" else "input": history}
+    state["receipts"].clear()
+    replies = await exchange(client, request_messages(admission, kind, payload))
+    if count <= 4096:
+        assert any(reply.HasField("request_body") for reply in replies)
+        assert len(state["receipts"][0]["digests"]) == count
+    else:
+        assert not state["receipts"]
+        assert replies[-1].immediate_response.status.code == 413
+        error = json.loads(replies[-1].immediate_response.body)["error"]
+        assert error["code"] == "reasoning_history_limit"
+        assert error["limit"]["measured"] == count
+        assert error["limit"]["maximum"] == 4096
+        assert error["request_id"]
+
+
+async def test_reasoning_without_gateway_context_has_distinct_error():
+    client = AsyncMock(spec=EngineClient)
+    handler = StreamHandler(client)
+    request = EngineResponsesRequest.model_validate(
+        replay_payload("responses", {"type": "reasoning", "encrypted_content": "synthetic"})
+    )
+    with pytest.raises(GatewayPolicyError) as error:
+        await verify_reasoning(handler, request)
+    assert error.value.code == "reasoning_context_missing"
+    assert error.value.status_code == 500
+    client.reasoning_receipts.assert_not_called()
+
+
+def test_single_response_reasoning_stays_bounded():
+    tracker = ChatReasoningTracker()
+    tracker.append(
+        0,
+        {
+            "reasoning_details": [
+                {"type": "reasoning.encrypted", "data": f"synthetic-{index}", "index": index}
+                for index in range(256)
+            ]
+        },
+    )
+    assert len(tracker.digests()) == 256
+    with pytest.raises(InvalidReversalError, match="too many reasoning blocks"):
+        tracker.append(0, {"reasoning_signature": "synthetic-extra"})
 
 
 @pytest.mark.parametrize(

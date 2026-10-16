@@ -109,9 +109,21 @@ class EngineClient:
                     return
                 if not record and response.status_code == 403:
                     raise GatewayPolicyError("unverified_reasoning")
-                raise EngineUnavailableError
+                _logger.warning(
+                    "reasoning receipts failed request_id=%s operation=%s http.status=%d",
+                    _correlation_id(correlation_id),
+                    "record" if record else "verify",
+                    response.status_code,
+                )
+                raise GatewayPolicyError("reasoning_service_unavailable")
         except (TimeoutError, httpx.HTTPError) as exc:
-            raise EngineUnavailableError from exc
+            _logger.warning(
+                "reasoning receipts failed request_id=%s operation=%s error=%s",
+                _correlation_id(correlation_id),
+                "record" if record else "verify",
+                type(exc).__name__,
+            )
+            raise GatewayPolicyError("reasoning_service_unavailable") from exc
 
     async def analyze_request(
         self,
