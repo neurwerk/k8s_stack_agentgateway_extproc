@@ -27,6 +27,7 @@ from agentgateway_extproc.models.openai_response import (
     ItemCoordinate,
     ItemEvent,
     LifecycleEvent,
+    MetadataEvent,
     OutputFunction,
     OutputItem,
     OutputMessage,
@@ -331,7 +332,7 @@ class OpenAIStreamValidator:
         if event.event not in {"message", parsed.type} or parsed.sequence_number <= self.sequence:
             raise InvalidReversalError("invalid Responses event sequence")
         self.sequence = parsed.sequence_number
-        if isinstance(parsed, LifecycleEvent):
+        if isinstance(parsed, LifecycleEvent | MetadataEvent):
             self._lifecycle(parsed)
         elif self.identity is None:
             raise InvalidReversalError("Responses stream has no start")
@@ -357,7 +358,14 @@ class OpenAIStreamValidator:
         else:
             self._part(parsed)
 
-    def _lifecycle(self, event: LifecycleEvent) -> None:
+    def _metadata(self, event: MetadataEvent) -> None:
+        if self.identity is None or event.response_id != self.identity[0]:
+            raise InvalidReversalError("Responses metadata has no matching start")
+
+    def _lifecycle(self, event: LifecycleEvent | MetadataEvent) -> None:
+        if isinstance(event, MetadataEvent):
+            self._metadata(event)
+            return
         response = event.response
         identity = (response.id, response.model, response.created_at)
         if event.type == "response.created":
@@ -394,7 +402,7 @@ class OpenAIStreamValidator:
             if item.status not in {None, "in_progress"} or (
                 item.content
                 if isinstance(item, OutputMessage)
-                else (item.summary or item.content or item.encrypted_content)
+                else (item.summary or item.content)
                 if isinstance(item, OutputReasoning)
                 else item.arguments
             ):

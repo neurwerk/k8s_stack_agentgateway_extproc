@@ -280,6 +280,55 @@ class ItemEvent(ResponseEvent):
     item: OutputItem
 
 
+class ModerationResult(ResponseModel):
+    """Moderation categories carry boolean flags, never model text."""
+
+    category_flags: dict[Identifier, bool]
+
+
+class ModerationOutput(ResponseModel):
+    """One native moderation decision."""
+
+    results: list[ModerationResult]
+    is_blocked: bool
+
+
+class OmniModeration(ResponseModel):
+    """The observed prompt moderation envelope."""
+
+    protection_type: Identifier
+    outputs: list[ModerationOutput]
+
+
+class PromptModeration(ResponseModel):
+    """The qualified prompt moderation classifier."""
+
+    omnimod: OmniModeration
+
+
+class ChatGPTModeration(ResponseModel):
+    """Only the observed prompt facts and empty later-stage envelopes are supported."""
+
+    prompt: PromptModeration
+    generation: Annotated[dict[str, None], Field(max_length=0)]
+    tool_call: Annotated[dict[str, None], Field(max_length=0)]
+    tool_response: Annotated[dict[str, None], Field(max_length=0)]
+
+
+class ModerationMetadata(ResponseModel):
+    """Explicitly classified native moderation metadata."""
+
+    openai_chatgpt_moderation_metadata: ChatGPTModeration
+
+
+class MetadataEvent(ResponseEvent):
+    """Response-scoped moderation facts, separate from output content."""
+
+    type: Literal["response.metadata"]
+    response_id: Identifier
+    metadata: ModerationMetadata
+
+
 class ItemCoordinate(ResponseEvent):
     """Coordinate an event with its already opened output item."""
 
@@ -385,6 +434,7 @@ class ReasoningDoneEvent(PartCoordinate):
 RESPONSES_EVENT = TypeAdapter(
     Annotated[
         LifecycleEvent
+        | MetadataEvent
         | ItemEvent
         | PartEvent
         | TextDeltaEvent
