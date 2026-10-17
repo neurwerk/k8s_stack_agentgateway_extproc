@@ -479,8 +479,11 @@ async def test_opaque_replay_cannot_borrow_or_forge_evidence(admission, reasonin
 
 
 @pytest.mark.parametrize("kind", ["chat", "responses"])
-@pytest.mark.parametrize("count", [257, 4096, 4097])
-async def test_long_reasoning_history(admission, reasoning_engine, kind, count):
+@pytest.mark.parametrize(
+    ("count", "configured_limit"),
+    [(257, None), (4096, None), (4097, None), (2, 2), (3, 2), (4097, 8192)],
+)
+async def test_long_reasoning_history(admission, reasoning_engine, kind, count, configured_limit):
     client, state = reasoning_engine
     # Obtain the real admission scope, then seed distinct previously verified receipts.
     await exchange(
@@ -513,8 +516,13 @@ async def test_long_reasoning_history(admission, reasoning_engine, kind, count):
     history.append({"role": "user", "content": "Continue"})
     payload = {"model": "example-chat", "messages" if kind == "chat" else "input": history}
     state["receipts"].clear()
-    replies = await exchange(client, request_messages(admission, kind, payload))
-    if count <= 4096:
+    settings = (
+        Settings()
+        if configured_limit is None
+        else Settings(max_reasoning_fingerprints=configured_limit)
+    )
+    replies = await exchange(client, request_messages(admission, kind, payload), settings=settings)
+    if count <= settings.max_reasoning_fingerprints:
         assert any(reply.HasField("request_body") for reply in replies)
         assert len(state["receipts"][0]["digests"]) == count
     else:
@@ -523,7 +531,7 @@ async def test_long_reasoning_history(admission, reasoning_engine, kind, count):
         error = json.loads(replies[-1].immediate_response.body)["error"]
         assert error["code"] == "reasoning_history_limit"
         assert error["limit"]["measured"] == count
-        assert error["limit"]["maximum"] == 4096
+        assert error["limit"]["maximum"] == settings.max_reasoning_fingerprints
         assert error["request_id"]
 
 
@@ -554,6 +562,16 @@ def test_single_response_reasoning_stays_bounded():
     assert len(tracker.digests()) == 256
     with pytest.raises(InvalidReversalError, match="too many reasoning blocks"):
         tracker.append(0, {"reasoning_signature": "synthetic-extra"})
+
+
+def test_reasoning_limit_environment(monkeypatch):
+    assert Settings().max_reasoning_fingerprints == 4096
+    monkeypatch.setenv("EXTPROC_MAX_REASONING_FINGERPRINTS", "8192")
+    assert Settings().max_reasoning_fingerprints == 8192
+    for invalid in ("0", "-1", "1.5", "invalid"):
+        monkeypatch.setenv("EXTPROC_MAX_REASONING_FINGERPRINTS", invalid)
+        with pytest.raises(ValueError):
+            Settings()
 
 
 @pytest.mark.parametrize(

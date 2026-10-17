@@ -23,7 +23,6 @@ if TYPE_CHECKING:
     from agentgateway_extproc.lib.pipeline.stream_handler import StreamHandler
     from agentgateway_extproc.models.admission import RequestContext
 
-MAX_RECEIPTS = 4096
 MAX_RESPONSE_BLOCKS = 256
 
 
@@ -154,14 +153,14 @@ async def verify_reasoning(
         }
     if not digests:
         return
-    if len(digests) > MAX_RECEIPTS:
+    if len(digests) > handler.max_reasoning_fingerprints:
         raise GatewayPolicyError(
             "reasoning_history_limit",
             limit=LimitDetail(
                 stage="admission",
                 reason="reasoning_fingerprints",
                 measured=len(digests),
-                maximum=MAX_RECEIPTS,
+                maximum=handler.max_reasoning_fingerprints,
                 unit="items",
                 exact=True,
             ),
