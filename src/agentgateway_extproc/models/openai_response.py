@@ -259,10 +259,19 @@ class ResponsesResponse(MetadataEnvelope):
     ) = None
 
 
+class SafetyBuffering(ResponseModel):
+    """Provider safety facts, forwarded without changing stream handling."""
+
+    use_cases: list[str]
+    reasons: list[str]
+    retry_model: str | None = None
+
+
 class ResponseEvent(ResponseModel):
     """Every Responses SSE event carries a monotonic sequence number."""
 
     sequence_number: Count
+    safety_buffering: bool | SafetyBuffering | None = None
 
 
 class LifecycleEvent(ResponseEvent):
@@ -323,12 +332,18 @@ class ModerationMetadata(ResponseModel):
     openai_chatgpt_moderation_metadata: ChatGPTModeration
 
 
+class SafetyBufferingMetadata(SafetyBuffering):
+    """The explicitly tagged safety-buffering metadata form."""
+
+    type: Literal["safety_buffering"]
+
+
 class MetadataEvent(ResponseEvent):
-    """Response-scoped moderation facts, separate from output content."""
+    """Response-scoped moderation and safety facts, separate from output content."""
 
     type: Literal["response.metadata"]
     response_id: Identifier
-    metadata: ModerationMetadata
+    metadata: ModerationMetadata | SafetyBufferingMetadata
 
 
 class ItemCoordinate(ResponseEvent):
