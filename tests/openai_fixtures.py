@@ -246,6 +246,39 @@ def stream_events(  # noqa: C901
     ]
 
 
+def safety_buffering_events(events):
+    """Exercise presence-sensitive safety facts alongside a complete native stream."""
+    events = deepcopy(events)
+    facts = {"use_cases": ["example use case"], "reasons": ["example reason"]}
+    for event_type, value in (
+        ("response.created", False),
+        ("response.output_item.added", True),
+        ("response.content_part.added", None),
+        ("response.completed", {**facts, "retry_model": "example"}),
+    ):
+        next(event for event in events if event["type"] == event_type)["safety_buffering"] = value
+    deltas = [event for event in events if event["type"] == "response.output_text.delta"]
+    deltas[0]["safety_buffering"] = facts
+    deltas[1]["safety_buffering"] = {**facts, "retry_model": None}
+    for top_level, retry in (
+        ({}, {}),
+        ({"safety_buffering": False}, {"retry_model": "example"}),
+        ({"safety_buffering": None}, {"retry_model": None}),
+    ):
+        events.insert(
+            -1,
+            {
+                "type": "response.metadata",
+                "response_id": events[0]["response"]["id"],
+                "metadata": {"type": "safety_buffering", **facts, **retry},
+                **top_level,
+            },
+        )
+    for index, event in enumerate(events):
+        event["sequence_number"] = index
+    return events
+
+
 def event_bytes(kind, event):
     if isinstance(event, str):
         return f"data: {event}\n\n".encode()

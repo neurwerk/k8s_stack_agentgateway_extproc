@@ -25,7 +25,7 @@ from .conftest import (
     response_body,
     response_headers,
 )
-from .openai_fixtures import event_bytes, response_payload, stream_events
+from .openai_fixtures import event_bytes, response_payload, safety_buffering_events, stream_events
 from .test_admission import admission as admission
 from .test_admission import body, headers
 from .test_fail_closed import FakeAioContext, StreamAbortedError
@@ -398,18 +398,20 @@ async def test_v5_closes_nested_output_shapes(admission, engine_client, case):
 
 
 @pytest.mark.parametrize(
-    ("kind", "stream", "empty_terminal"),
+    ("kind", "stream", "empty_terminal", "decorated"),
     [
-        ("chat", False, False),
-        ("chat", True, False),
-        ("responses", False, False),
-        ("responses", True, False),
-        ("responses", True, True),
+        ("chat", False, False, False),
+        ("chat", True, False, False),
+        ("responses", False, False, False),
+        ("responses", True, False, False),
+        ("responses", True, True, False),
+        ("responses", True, False, True),
+        ("responses", True, True, True),
     ],
 )
 @pytest.mark.parametrize("pii", [False, True])
 async def test_qualified_v5_text_tools_and_usage_roundtrip(
-    admission, reasoning_engine, kind, pii, stream, empty_terminal
+    admission, reasoning_engine, kind, pii, stream, empty_terminal, decorated
 ):
     engine_client, _ = reasoning_engine
     admission["destination_policy"]["models"]["example-chat"] = pii
@@ -421,13 +423,11 @@ async def test_qualified_v5_text_tools_and_usage_roundtrip(
     await handler.handle(
         response_headers("text/event-stream" if stream else "application/json", policy=admission)
     )
+    source_events = stream_events(kind, tools=True, reasoning=True, empty_terminal=empty_terminal)
+    if decorated:
+        source_events = safety_buffering_events(source_events)
     incoming = (
-        b"".join(
-            event_bytes(kind, event)
-            for event in stream_events(
-                kind, tools=True, reasoning=True, empty_terminal=empty_terminal
-            )
-        )
+        b"".join(event_bytes(kind, event) for event in source_events)
         if stream
         else json.dumps(response_payload(kind, tools=True, reasoning=True)).encode()
     )
@@ -462,8 +462,37 @@ async def test_qualified_v5_text_tools_and_usage_roundtrip(
             assert json.loads(arguments) == {"person": text, "count": 1}
             assert chunks[-1]["usage"]["total_tokens"] == 30
         else:
+            actual = [json.loads(event.data) for event in events]
+            assert [
+                {key: event[key] for key in ("safety_buffering", "metadata") if key in event}
+                for event in actual
+            ] == [
+                {key: event[key] for key in ("safety_buffering", "metadata") if key in event}
+                for event in source_events
+            ]
             terminal = json.loads(events[-1].data)
             assert terminal["type"] == "response.completed"
+            if decorated:
+                assert actual[0]["safety_buffering"] is False
+                assert (
+                    next(
+                        event for event in actual if event["type"] == "response.output_item.added"
+                    )["safety_buffering"]
+                    is True
+                )
+                assert (
+                    next(
+                        event for event in actual if event["type"] == "response.content_part.added"
+                    )["safety_buffering"]
+                    is None
+                )
+                deltas = [
+                    event for event in actual if event["type"] == "response.output_text.delta"
+                ]
+                assert isinstance(deltas[0]["safety_buffering"], dict)
+                assert "retry_model" not in deltas[0]["safety_buffering"]
+                assert deltas[1]["safety_buffering"]["retry_model"] is None
+                assert terminal["safety_buffering"]["retry_model"] == "example"
             expected = response_payload(kind, text, tools=True, reasoning=True)
             completed_items = [
                 json.loads(event.data)["item"]
@@ -475,6 +504,59 @@ async def test_qualified_v5_text_tools_and_usage_roundtrip(
                 expected["output"] = []
             assert terminal["response"] == expected
     assert handler.reversal_map == {}
+
+
+@pytest.mark.parametrize(
+    ("tagged", "value"),
+    [
+        (False, "false"),
+        (False, 0),
+        (False, []),
+        (False, {"use_cases": []}),
+        (True, {"reasons": []}),
+        (False, {"use_cases": [], "reasons": [], "unknown": True}),
+        (True, {"use_cases": [], "reasons": [], "unknown": True}),
+        (False, {"use_cases": [1], "reasons": []}),
+        (True, {"use_cases": [], "reasons": "reason"}),
+        (True, {"use_cases": [], "reasons": [], "retry_model": False}),
+        (False, {"use_cases": [REVERSIBLE_TOKEN], "reasons": []}),
+        (True, {"use_cases": [], "reasons": [REVERSIBLE_TOKEN]}),
+        (True, {"use_cases": [], "reasons": [], "retry_model": REVERSIBLE_TOKEN}),
+    ],
+)
+async def test_safety_buffering_rejects_malformed_or_reflected_metadata(
+    admission, engine_client, tagged, value
+):
+    events = stream_events("responses")
+    if tagged:
+        events.insert(
+            1,
+            {
+                "type": "response.metadata",
+                "response_id": events[0]["response"]["id"],
+                "metadata": {"type": "safety_buffering", **value},
+            },
+        )
+    else:
+        events[0]["safety_buffering"] = value
+    for index, event in enumerate(events):
+        event["sequence_number"] = index
+    replies, context = [], FakeAioContext()
+    with pytest.raises(StreamAbortedError):
+        await collect(
+            engine_client,
+            [
+                *request_messages(admission, "responses", stream=True),
+                response_headers("text/event-stream", policy=admission),
+                response_body(
+                    b"".join(event_bytes("responses", event) for event in events), policy=admission
+                ),
+            ],
+            replies,
+            context,
+        )
+    assert context.code == grpc.StatusCode.INTERNAL
+    assert not any(reply.HasField("response_body") for reply in replies)
 
 
 @pytest.mark.parametrize("kind", ["chat", "responses"])
