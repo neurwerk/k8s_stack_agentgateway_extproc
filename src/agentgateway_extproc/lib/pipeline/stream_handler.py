@@ -106,6 +106,7 @@ class StreamHandler:
         """Initialize state for one HTTP request/response stream."""
         limits = settings or Settings()
         self.debug_logging = limits.log_level == "DEBUG"
+        self.debug_errors = limits.error_log_level == "debug"
         self.request_diagnostic: str | None = None
         self.failed_response: object = None
         self._initial_correlation_id = correlation_id

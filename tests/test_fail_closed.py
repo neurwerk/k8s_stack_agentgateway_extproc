@@ -109,7 +109,7 @@ async def test_grpc_servicer_propagates_valid_typed_engine_errors(
         }
     }
     assert immediate.headers.set_headers[0].header.value == "application/json"
-    assert message not in caplog.text
+    assert message in caplog.text  # The validated fixed message is safe diagnostic context.
 
 
 async def test_grpc_servicer_does_not_forward_invalid_engine_error_body(caplog) -> None:
@@ -135,7 +135,10 @@ async def test_grpc_servicer_does_not_forward_invalid_engine_error_body(caplog) 
     immediate = responses[-1].immediate_response
     assert immediate.status.code == 503
     assert json.loads(immediate.body)["error"]["code"] == "processing_failed"
-    assert json.loads(immediate.body)["error"]["message"] == "internal processing error"
+    assert (
+        "invalid_engine_reply (InvalidEngineReplyError"
+        in json.loads(immediate.body)["error"]["message"]
+    )
     assert upstream_text not in caplog.text
 
 

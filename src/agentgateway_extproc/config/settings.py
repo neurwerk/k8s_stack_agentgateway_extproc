@@ -6,7 +6,7 @@ from typing import Literal
 from urllib.parse import urlsplit
 
 from neurwerk_request_segments import CompatibilitySettings
-from pydantic import BaseModel, Field, SecretStr, model_validator
+from pydantic import AliasChoices, BaseModel, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 MEBIBYTE = 1_048_576
@@ -144,6 +144,9 @@ class Settings(BaseSettings):
     image_inspection: ImageInspectionSettings = Field(default_factory=ImageInspectionSettings)
     notice_preferences: NoticePreferencesSettings = Field(default_factory=NoticePreferencesSettings)
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "WARNING"
+    error_log_level: Literal["info", "debug"] = Field(
+        default="info", validation_alias=AliasChoices("ERROR_LOG_LEVEL", "error_log_level")
+    )
     max_request_bytes: int = Field(default=MAX_REQUEST_BYTES, ge=1_024, le=MAX_UPLOAD_REQUEST_BYTES)
     max_reasoning_fingerprints: int = Field(default=4096, ge=1)
     max_response_bytes: int = Field(default=MAX_RESPONSE_BYTES, ge=1_024, le=MAX_RESPONSE_BYTES)
@@ -157,6 +160,12 @@ class Settings(BaseSettings):
     )
     grpc_maximum_concurrent_rpcs: int = Field(default=4, ge=1, le=128)
     shutdown_grace_seconds: int = Field(default=300, ge=1, le=1200)
+
+    @field_validator("error_log_level", mode="before")
+    @classmethod
+    def normalize_error_log_level(cls, value: object) -> object:
+        """Accept case-insensitive error verbosity independently of general logging."""
+        return value.lower() if isinstance(value, str) else value
 
     @model_validator(mode="after")
     def validate_transport_limits(self) -> Settings:

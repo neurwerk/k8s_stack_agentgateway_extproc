@@ -214,10 +214,12 @@ async def test_review_repros_reject_before_transformation(
 
 @pytest.mark.parametrize("debug", [False, True])
 @pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("error_debug", [False, True])
 async def test_debug_failure_reports_exact_errors_and_full_payloads(
-    admission, engine_client, engine_reply, monkeypatch, caplog, debug, stream
+    admission, engine_client, engine_reply, monkeypatch, caplog, debug, stream, error_debug
 ):
     monkeypatch.setenv("EXTPROC_LOG_LEVEL", "DEBUG" if debug else "INFO")
+    monkeypatch.setenv("ERROR_LOG_LEVEL", "debug" if error_debug else "info")
     caplog.set_level(logging.DEBUG, logger="agentgateway_extproc.controllers.grpc_servicer")
     secrets = {
         "api_key": "synthetic-api-secret",
@@ -302,7 +304,9 @@ async def test_debug_failure_reports_exact_errors_and_full_payloads(
             with pytest.raises(StreamAbortedError):
                 await collect(engine_client, messages, replies, context)
             assert context.code == grpc.StatusCode.INTERNAL
-            assert context.details == "response processing failed closed"
+            assert context.details.startswith("response processing failed closed; request_id=")
+            assert ("traceback" in context.details) is error_debug
+            assert not any(reply.HasField("immediate_response") for reply in replies)
         else:
             await collect(engine_client, messages, replies, context)
             assert replies[-1].immediate_response.status.code == 503
