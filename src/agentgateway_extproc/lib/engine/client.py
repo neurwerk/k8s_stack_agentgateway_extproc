@@ -109,6 +109,15 @@ class EngineClient:
                     return
                 if not record and response.status_code == 403:
                     raise GatewayPolicyError("unverified_reasoning")
+                if response.status_code == 413:
+                    error = _parse_engine_error(
+                        response.status_code,
+                        await _read_bounded(response, self._settings.max_response_bytes),
+                        correlation_id=correlation_id,
+                    )
+                    if error.limit and error.limit.reason == "reasoning_fingerprints":
+                        raise GatewayPolicyError("reasoning_history_limit", limit=error.limit)
+                    raise error
                 _logger.warning(
                     "reasoning receipts failed request_id=%s operation=%s http.status=%d",
                     _correlation_id(correlation_id),

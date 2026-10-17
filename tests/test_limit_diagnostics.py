@@ -12,7 +12,11 @@ from agentgateway_extproc.config.settings import EngineSettings
 from agentgateway_extproc.lib import json_limits
 from agentgateway_extproc.lib.engine.client import EngineClient, _parse_engine_error, _read_bounded
 from agentgateway_extproc.models.engine import EngineChatRequest
-from agentgateway_extproc.models.exceptions import EnginePolicyError, InvalidEngineReplyError
+from agentgateway_extproc.models.exceptions import (
+    EnginePolicyError,
+    GatewayPolicyError,
+    InvalidEngineReplyError,
+)
 
 
 def _error():
@@ -46,6 +50,23 @@ def test_v2_limit_is_preserved_and_v1_still_accepted():
     payload["api_version"] = "v1"
     del payload["error"]["limit"]
     assert _parse_engine_error(413, json.dumps(payload).encode()).limit is None
+
+
+async def test_receipt_limit_from_engine_preserves_configured_maximum():
+    payload = _error()
+    payload["error"]["limit"].update(reason="reasoning_fingerprints", unit="items", exact=True)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(413, json=payload))
+    ) as transport:
+        client = EngineClient(EngineSettings(base_url="https://engine.test"), transport)
+        with pytest.raises(GatewayPolicyError) as caught:
+            await client.reasoning_receipts(
+                "a" * 64, [f"{i:064x}" for i in range(6)], record=False, correlation_id="limit-test"
+            )
+    assert caught.value.code == "reasoning_history_limit"
+    assert caught.value.status_code == 413
+    assert caught.value.limit is not None
+    assert caught.value.limit.maximum == 5
 
 
 async def test_engine_call_threads_correlation_header_and_rejection():
