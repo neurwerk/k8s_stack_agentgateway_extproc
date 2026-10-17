@@ -172,7 +172,7 @@ async def test_missing_or_changing_metadata_is_a_platform_503(engine_client) -> 
     responses = [response async for response in servicer.Process(missing(), object())]
     assert responses[-1].immediate_response.status.code == 503
     error = json.loads(responses[-1].immediate_response.body)["error"]
-    assert error["message"] == "internal processing error"
+    assert "invalid_metadata (TrustedMetadataError" in error["message"]
     assert error["code"] == "processing_failed"
     assert any(
         item.header.key == "x-request-id" and item.header.value == error["request_id"]
@@ -898,7 +898,7 @@ async def test_mcp_block_is_exact_json_rpc_200(engine_client, engine_reply, capl
         "id": rpc_id,
         "error": {
             "code": -32000,
-            "message": "Request blocked by data policy",
+            "message": "request blocked by policy: reported blocking entity categories: PERSON",
             "data": {"code": "policy_blocked", "request_id": request_id},
         },
     }

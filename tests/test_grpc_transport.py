@@ -40,7 +40,8 @@ async def test_aio_server_receives_processing_message_above_four_mibibytes(
         rejected = await asyncio.wait_for(mismatched.read(), timeout=5)
         assert rejected.immediate_response.status.code == 503
         assert json.loads(rejected.immediate_response.body)["error"] == {
-            "message": "internal processing error",
+            "message": "Processing failed: invalid_metadata (TrustedMetadataError); "
+            "request_id=stream-open-id",
             "code": "processing_failed",
             "request_id": "stream-open-id",
         }

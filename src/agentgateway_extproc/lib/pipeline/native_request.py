@@ -12,6 +12,7 @@ from pydantic import ValidationError
 
 from agentgateway_extproc.gen import ext_proc_pb2
 from agentgateway_extproc.lib.masking.reversal import placeholder_entity_prefixes
+from agentgateway_extproc.lib.pipeline.diagnostics import policy_block_message
 from agentgateway_extproc.lib.pipeline.guard import GUARD_INSTRUCTION
 from agentgateway_extproc.lib.pipeline.profiles import (
     google_model_path,
@@ -104,7 +105,8 @@ async def process_native_request(  # noqa: C901
             handler.request_context = admission.resolve_reroute(context, reply.route_class)
         if reply.decision == "block" or reply.request is None:
             handler.record_dispatch("policy_block")
-            return immediate_response(403, '{"error":"request blocked by policy"}')
+            message = policy_block_message(reply, handler, input_data=request.model_dump())
+            return immediate_response(403, json.dumps({"error": message}))
         handler.reversal_map.update(reply.reversal)
         handler.reversal_entity_prefixes = placeholder_entity_prefixes(handler.reversal_map)
         handler.request_stats = RequestStats(reply.report, reply.analysis, reply.decision)

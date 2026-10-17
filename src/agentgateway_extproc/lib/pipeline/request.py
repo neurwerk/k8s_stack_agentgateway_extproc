@@ -20,7 +20,11 @@ from agentgateway_extproc.lib.engine.client import EngineClient
 from agentgateway_extproc.lib.image_policy import image_output
 from agentgateway_extproc.lib.json_limits import JsonBudgetError, strict_json_loads
 from agentgateway_extproc.lib.masking.reversal import placeholder_entity_prefixes
-from agentgateway_extproc.lib.pipeline.diagnostics import diagnostic_json
+from agentgateway_extproc.lib.pipeline.diagnostics import (
+    diagnostic_json,
+    policy_block_message,
+    validation_rejection_message,
+)
 from agentgateway_extproc.lib.pipeline.guard import inject_guard_instruction
 from agentgateway_extproc.lib.pipeline.mcp import (
     McpProtocolError,
@@ -94,15 +98,25 @@ async def process_request(
         )
     try:
         payload = strict_json_loads(body.decode("utf-8"))
-    except UnicodeDecodeError:
-        return immediate_response(400, '{"error":"invalid request encoding"}')
+    except UnicodeDecodeError as exc:
+        return immediate_response(
+            400,
+            json.dumps(
+                {"error": validation_rejection_message("invalid request encoding", exc, handler)}
+            ),
+        )
     except JsonBudgetError as exc:
         _clear_request(handler)
         raise EnginePolicyError(
             "request_too_large", limit=exc.limit, correlation_id=handler.correlation_id
         ) from exc
-    except (json.JSONDecodeError, TypeError, ValueError):
-        return immediate_response(400, '{"error":"invalid request JSON"}')
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        return immediate_response(
+            400,
+            json.dumps(
+                {"error": validation_rejection_message("invalid request JSON", exc, handler)}
+            ),
+        )
     if handler.debug_logging:
         handler.request_diagnostic = diagnostic_json(
             {"headers": handler.request_headers, "body": payload}
@@ -199,14 +213,27 @@ async def process_request(
             handler.record_dispatch("protocol_failure")
             return immediate_response(
                 400,
-                '{"error":{"code":"unsupported_feature",'
-                '"message":"This request contains an unsupported feature."}}',
+                json.dumps(
+                    {
+                        "error": {
+                            "code": "unsupported_feature",
+                            "message": validation_rejection_message(
+                                "This request contains an unsupported feature.", exc, handler
+                            ),
+                        }
+                    }
+                ),
             )
         except ValidationError as exc:
             log_model_validation_failure(payload, exc)
             handler.record_dispatch("protocol_failure")
-            return immediate_response(400, '{"error":"invalid model request"}')
-        except (TypeError, ValueError):
+            return immediate_response(
+                400,
+                json.dumps(
+                    {"error": validation_rejection_message("invalid model request", exc, handler)}
+                ),
+            )
+        except (TypeError, ValueError) as exc:
             _logger.warning(
                 "model request validation failed family=%s reason=%s scope=%s count=%d",
                 model_request_family(payload),
@@ -215,7 +242,12 @@ async def process_request(
                 1,
             )
             handler.record_dispatch("protocol_failure")
-            return immediate_response(400, '{"error":"invalid model request"}')
+            return immediate_response(
+                400,
+                json.dumps(
+                    {"error": validation_rejection_message("invalid model request", exc, handler)}
+                ),
+            )
         if not isinstance(request, EngineChatRequest | EngineResponsesRequest):
             handler.record_dispatch("protocol_failure")
             return immediate_response(400, '{"error":"invalid model request"}')
@@ -496,7 +528,10 @@ async def process_request(
         error = DocumentError(
             403, reason=("image_pii_detected" if reply.entities else "policy_blocked")
         )
-        return immediate_response(error.status, json.dumps({"error": error.message}))
+        message = policy_block_message(reply, handler, input_data=request.model_dump())
+        return immediate_response(
+            error.status, json.dumps({"error": error.message + " " + message})
+        )
     if isinstance(request, EngineMcpRequest) and (
         reply.decision == "reroute" or reply.route_class is not None
     ):
@@ -532,6 +567,7 @@ async def process_request(
     )
     if reply.decision == "block" or reply.request is None:
         handler.record_dispatch("policy_block")
+        message = policy_block_message(reply, handler, input_data=request.model_dump())
         if is_mcp:
             context = handler.mcp_context
             if context is None or context.request_id is None:
@@ -544,7 +580,7 @@ async def process_request(
                     "id": context.request_id,
                     "error": {
                         "code": -32000,
-                        "message": "Request blocked by data policy",
+                        "message": message,
                         "data": {"code": "policy_blocked"},
                     },
                 },
@@ -554,14 +590,14 @@ async def process_request(
             )
             return immediate_response(200, body)
         if visual_findings is not None:
-            return _image_policy_block(handler)
+            return _image_policy_block(handler, detail=message)
         return immediate_response(
             403,
             json.dumps(
                 {
-                    "error": DocumentError(403).message
+                    "error": DocumentError(403).message + " " + message
                     if image_locations
-                    else "request blocked by policy"
+                    else message
                 }
             ),
         )
@@ -732,7 +768,7 @@ def _allow_inspected_textless(
 
 
 def _image_policy_block(
-    handler: StreamHandler, error: DocumentError | None = None
+    handler: StreamHandler, error: DocumentError | None = None, *, detail: str | None = None
 ) -> ext_proc_pb2.ProcessingResponse:
     """Report the actual rejection reason without rewriting the engine's FACE action."""
     _clear_request(handler)
@@ -748,7 +784,7 @@ def _image_policy_block(
             403,
             reason=("face_policy_blocked" if blocked_entities == {"FACE"} else "policy_blocked"),
         )
-    message = error.message
+    message = error.message + (" " + detail if detail else "")
     stage = (
         "extraction"
         if error.reason.startswith("extraction_")
