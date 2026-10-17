@@ -19,11 +19,15 @@ class ModelProfile:
     request_kind: Literal["chat", "responses", "anthropic", "google"]
     path: str
     credential_headers: frozenset[str] = frozenset({"authorization"})
+    forward_proxy_path: str | None = None
 
 
 _PROFILES = {
     "openai-chat-completions-v1": ModelProfile("chat", "/v1/chat/completions"),
     "openai-responses-v1": ModelProfile("responses", "/v1/responses"),
+    "openai-codex-responses-v1": ModelProfile(
+        "responses", "/v1/responses", forward_proxy_path="/backend-api/codex/responses"
+    ),
     "anthropic-messages-v1": ModelProfile("anthropic", "/v1/messages", frozenset({"x-api-key"})),
     "google-generate-content-v1": ModelProfile("google", "", frozenset({"x-goog-api-key"})),
 }
@@ -77,7 +81,7 @@ def google_model_path(path: str, operation: str) -> str:
 def operation_path(path: str, admission: AdmissionEnvelope) -> str:
     """Normalize only the verified API mount for validation, never an upstream mutation."""
     context = admission.request_context
-    prefix = f"/bindings/{context.binding_id}"
+    prefix = context.api_path_prefix or f"/bindings/{context.binding_id}"
     if context.entry_mode == "api":
         if not path.startswith(prefix + "/"):
             raise GatewayPolicyError("invalid_request")
@@ -114,9 +118,14 @@ def request_headers(  # noqa: C901
         return headers, [name for name in names if name in REQUEST_HEADERS]
     profile = model_profile(admission)
     path = operation_path(headers.get(":path", ""), admission)
+    expected_path = (
+        profile.forward_proxy_path
+        if admission.request_context.entry_mode == "forward_proxy" and profile.forward_proxy_path
+        else profile.path
+    )
     if (
         headers.get(":method") != "POST"
-        or (profile.request_kind != "google" and path != profile.path)
+        or (profile.request_kind != "google" and path != expected_path)
         or re.fullmatch(
             r'application/json(?:\s*;\s*charset\s*=\s*(?:utf-8|"utf-8"))?',
             headers.get("content-type", "").strip(),

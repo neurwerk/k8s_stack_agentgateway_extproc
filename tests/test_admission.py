@@ -137,10 +137,10 @@ async def test_one_resolution_drives_permissions_policy_and_final_provider_model
         assert context.content_tracing_enabled is False
         assert len(calls) == int(pii)
         assert handler.admission is not None
-        assert (
-            handler.admission.request_context.model_dump(mode="json")
-            == admission["request_context"]
-        )
+        assert handler.admission.request_context.model_dump(mode="json") == {
+            "api_path_prefix": None,
+            **admission["request_context"],
+        }
         with pytest.raises(ValidationError):
             context.resolved_model = "another-provider-model"  # ty: ignore[invalid-assignment]
         response = json.dumps(response_payload("responses" if responses else "chat")).encode()
@@ -221,6 +221,8 @@ async def test_invalid_admission_fails_before_engine(admission, engine_client, c
         ("permissions", ["llm:invoke"]),
         ("policy_revision", "other-revision"),
         ("provider_credential_source", "company"),
+        ("api_path_prefix", "/openai/api"),
+        ("api_path_prefix", None),
     ],
 )
 async def test_envelope_is_locked_including_binding_and_permissions(
@@ -786,22 +788,31 @@ async def test_v5_notice_identity_uses_neurwerk_key_and_existing_cache(
         assert calls == [expected]
 
 
-@pytest.mark.parametrize("responses", [False, True])
 @pytest.mark.parametrize(
-    "mode,prefix,accepted",
+    "profile",
+    ["openai-chat-completions-v1", "openai-responses-v1", "openai-codex-responses-v1"],
+)
+@pytest.mark.parametrize(
+    "mode,prefix,api_prefix,accepted",
     [
-        ("api", "/bindings/openai-api", True),
-        ("api", "", False),
-        ("api", "/bindings/another-binding", False),
-        ("forward_proxy", "/bindings/openai-api", False),
-        ("forward_proxy", "", True),
-        ("api", "/arbitrary", False),
-        ("api", "/bindings/openai-api/..", False),
-        ("api", "/bindings/openai-api%2f", False),
+        ("api", "/bindings/openai-api", None, True),
+        ("api", "", None, False),
+        ("api", "/bindings/another-binding", None, False),
+        ("forward_proxy", "/bindings/openai-api", None, False),
+        ("forward_proxy", "", None, True),
+        ("api", "/arbitrary", None, False),
+        ("api", "/bindings/openai-api/..", None, False),
+        ("api", "/bindings/openai-api%2f", None, False),
+        ("api", "/openai/api", "/openai/api", True),
+        ("api", "/openai/api-other", "/openai/api", False),
+        ("api", "/bindings/openai-api", "/openai/api", False),
+        ("api", "/openai/api/..", "/openai/api", False),
+        ("forward_proxy", "", "/openai/api", True),
+        ("forward_proxy", "/openai/api", "/openai/api", False),
     ],
 )
 async def test_api_mount_uses_only_verified_binding_for_validation(
-    admission, engine_client, engine_reply, responses, mode, prefix, accepted
+    admission, engine_client, engine_reply, profile, mode, prefix, api_prefix, accepted
 ):
     # Ordinary Engine passes classify content without requesting a reroute.
     engine_reply.update(
@@ -815,9 +826,13 @@ async def test_api_mount_uses_only_verified_binding_for_validation(
         reversal={},
     )
     admission["request_context"]["entry_mode"] = mode
-    if responses:
-        admission["request_context"]["protocol_profile"] = "openai-responses-v1"
-    path = prefix + ("/v1/responses" if responses else "/v1/chat/completions")
+    admission["request_context"]["api_path_prefix"] = api_prefix
+    admission["request_context"]["protocol_profile"] = profile
+    responses = profile != "openai-chat-completions-v1"
+    operation = "/v1/responses" if responses else "/v1/chat/completions"
+    if profile == "openai-codex-responses-v1" and mode == "forward_proxy":
+        operation = "/backend-api/codex/responses"
+    path = prefix + operation
     handler = StreamHandler(engine_client)
     event = header_request(
         headers(**{":path": path, "x-forwarded-prefix": prefix}), policy=admission
@@ -846,6 +861,59 @@ async def test_api_mount_uses_only_verified_binding_for_validation(
         assert handler.request_context is not None
         assert handler.request_context.resolved_model == "provider-chat"
         analyze.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "",
+        "/",
+        "/Openai/api",
+        "/-openai/api",
+        "/openai//api",
+        "/openai/../api",
+        "/openai/./api",
+        "/openai/%61pi",
+        "/openai/api?x=1",
+        "/openai/api#fragment",
+        "/openai/api/",
+        "/openai/api\n",
+        "/openai\\api",
+        1,
+        "/" + "a" * 256,
+    ],
+)
+async def test_api_prefix_rejects_ambiguous_trusted_mounts(admission, engine_client, prefix):
+    admission["request_context"]["api_path_prefix"] = prefix
+    handler = StreamHandler(engine_client)
+    with pytest.raises(TrustedMetadataError):
+        await handler.handle(header_request(headers(), policy=admission))
+    assert handler.request_headers == {}
+
+
+@pytest.mark.parametrize(
+    "profile,mode,path",
+    [
+        ("openai-codex-responses-v1", "api", "/openai/api"),
+        ("openai-codex-responses-v1", "api", "/openai/api/backend-api/codex/responses"),
+        ("openai-codex-responses-v1", "forward_proxy", "/v1/responses"),
+        ("openai-codex-responses-v1", "forward_proxy", "/backend-api/codex/responses/"),
+        ("openai-codex-responses-v1", "forward_proxy", "/backend-api/codex/responses?x=1"),
+        ("openai-codex-responses-v1", "api", "/openai/api/v1/responses/"),
+        ("openai-codex-responses-v1", "api", "/openai/api/v1/responses?x=1"),
+        ("openai-responses-v1", "forward_proxy", "/backend-api/codex/responses"),
+    ],
+)
+async def test_responses_paths_are_exact_and_profile_specific(
+    admission, engine_client, profile, mode, path
+):
+    admission["request_context"].update(
+        protocol_profile=profile, entry_mode=mode, api_path_prefix="/openai/api"
+    )
+    handler = StreamHandler(engine_client)
+    with pytest.raises(GatewayPolicyError):
+        await handler.handle(header_request(headers(**{":path": path}), policy=admission))
+    assert handler.request_headers == {}
 
 
 @pytest.mark.parametrize("binding", [".", "..", "a/..", "a\\b", "a%2fb", "a%5cb", "%2e%2e"])
