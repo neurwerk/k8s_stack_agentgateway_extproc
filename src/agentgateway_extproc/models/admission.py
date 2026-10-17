@@ -28,6 +28,7 @@ type Permission = Annotated[
 type ProfileId = Literal[
     "openai-chat-completions-v1",
     "openai-responses-v1",
+    "openai-codex-responses-v1",
     "anthropic-messages-v1",
     "google-generate-content-v1",
     "chatgpt-web-v1",
@@ -65,6 +66,9 @@ class AdmissionContext(AdmissionModel):
     destination_kind: Literal["model", "mcp", "application"]
     provider_id: Identifier | None
     binding_id: Identifier
+    api_path_prefix: (
+        Annotated[str, Field(max_length=256, pattern=r"^(/[a-z0-9][a-z0-9-]*)+$")] | None
+    ) = None
     protocol_profile: ProfileId
     operation_id: Identifier
     provider_credential_source: Literal["caller_supplied", "company", "none"]

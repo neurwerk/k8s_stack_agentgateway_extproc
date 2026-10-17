@@ -9,6 +9,7 @@
     "destination_kind": "model",
     "provider_id": "openai",
     "binding_id": "openai-api",
+    "api_path_prefix": null,
     "protocol_profile": "openai-chat-completions-v1",
     "operation_id": "create",
     "provider_credential_source": "caller_supplied",
