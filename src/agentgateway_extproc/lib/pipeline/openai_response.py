@@ -194,10 +194,13 @@ class _Item:
 class OpenAIStreamValidator:
     """Track bounded v5 choices/items and require a real protocol terminal at EOF."""
 
-    def __init__(self, kind: str, *, openrouter: bool = False) -> None:
+    def __init__(
+        self, kind: str, *, openrouter: bool = False, local_created_drift: bool = False
+    ) -> None:
         """Keep only stream-local identities, hashes and incomplete tool arguments."""
         self.kind = kind
         self.openrouter = openrouter
+        self.local_created_drift = local_created_drift
         self._router_usage_seen = False
         self._finish_reasons: dict[int, str] = {}
         self.terminal = False
@@ -255,9 +258,12 @@ class OpenAIStreamValidator:
 
     def _chat(self, chunk: ChatChunk) -> None:
         identity = (chunk.id, chunk.model, chunk.created)
-        if self.identity is not None and self.identity != identity:
+        if self.identity is not None and (
+            self.identity[:2] != identity[:2]
+            or (not self.local_created_drift and self.identity[2] != identity[2])
+        ):
             raise InvalidReversalError("Chat response identity changed")
-        self.identity = identity
+        self.identity = self.identity or identity
         _unique([choice.index for choice in chunk.choices])
         if self._router_usage_echo(chunk):
             return
