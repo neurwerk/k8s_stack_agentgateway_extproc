@@ -35,6 +35,11 @@ if TYPE_CHECKING:
 MAX_TEXT = 4_000_000
 MAX_NODES = 20_000
 MAX_CELLS = 100_000
+NATIVE_PDF_NOTICE = (
+    "neurwerk: PDF native text only; embedded images, diagrams, and other visual content "
+    "were not read or forwarded. No PDF OCR or vision was used. "
+    "Use an approved local vision model if you need visual content read."
+)
 _MIMES = {
     "pdf": "application/pdf",
     "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -81,6 +86,12 @@ class DocumentError(Exception):
                 "extraction_unavailable": "text extraction service unavailable.",
                 "extraction_failed": "text extraction could not be completed.",
                 "extraction_timeout": "text extraction timed out.",
+                "pdf_native_text_unavailable": (
+                    "PDF has no readable native text. Embedded images and scanned pages were not "
+                    "read or forwarded; PDF OCR/vision is disabled for remote models. "
+                    "Choose an approved local vision model to read visual content, or upload "
+                    "a PDF with selectable text."
+                ),
                 "image_analysis_failed": "required image safety analysis could not be completed.",
                 "image_inspection_failed": "required image inspection could not be completed.",
                 "image_inspection_timeout": "image inspection timed out. Please retry.",
@@ -361,6 +372,55 @@ def _pdf_pages(
     if result.returncode or not re.fullmatch(rb"[1-9][0-9]{0,9}", result.stdout):
         raise DocumentError(400)
     return int(result.stdout)
+
+
+def extract_native_pdf(
+    upload: Upload, page_limit: int, abandoned: threading.Event, deadline: float
+) -> str:
+    """Extract bounded native text in a disposable worker, without any service calls."""
+    _check_preflight(abandoned, deadline)
+    if upload.pages > page_limit:
+        raise DocumentError(413)
+    try:
+        result = subprocess.run(  # noqa: S603 - fixed module and validated page bound
+            [
+                sys.executable,
+                "-I",
+                "-B",
+                "-m",
+                "agentgateway_extproc.lib.pdf_probe",
+                "text",
+                str(page_limit),
+            ],
+            input=upload.data,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env={},
+            timeout=min(30, max(0.001, deadline - time.monotonic())),
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        # subprocess.run kills and reaps before releasing the batch admission slot.
+        raise DocumentError(504) from None
+    except OSError:
+        raise DocumentError from None
+    _check_preflight(abandoned, deadline)
+    if result.returncode in {2, -signal.SIGKILL, -signal.SIGXCPU}:
+        raise DocumentError(413)
+    if result.returncode:
+        raise DocumentError(400)
+    if len(result.stdout) > 4 * MAX_TEXT:
+        raise DocumentError(413)
+    try:
+        text = result.stdout.decode("utf-8")
+    except UnicodeError:
+        raise DocumentError from None
+    if not text.strip():
+        raise DocumentError(422, reason="pdf_native_text_unavailable")
+    output = f"Document: {upload.filename}\n{NATIVE_PDF_NOTICE}\n{text}"
+    if "\x00" in output or len(output) > MAX_TEXT:
+        raise DocumentError(413)
+    return output
 
 
 def _filename(value: object) -> str:
