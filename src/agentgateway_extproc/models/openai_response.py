@@ -54,6 +54,7 @@ class Function(ResponseModel):
 class ToolCall(ResponseModel):
     """Only client function tools have qualified restoration."""
 
+    index: Annotated[int, Field(ge=0, le=127)] | None = None
     id: Identifier
     type: Literal["function"]
     function: Function

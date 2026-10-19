@@ -8,12 +8,14 @@ from unittest.mock import patch
 import grpc
 import httpx
 import pytest
+from pydantic import ValidationError
 
 from agentgateway_extproc.config.settings import EngineSettings
 from agentgateway_extproc.controllers.grpc_servicer import ExtProcServicer
 from agentgateway_extproc.gen import ext_proc_pb2
 from agentgateway_extproc.lib.engine.client import EngineClient
 from agentgateway_extproc.lib.pipeline.diagnostics import diagnostic_json
+from agentgateway_extproc.lib.pipeline.openai_response import validate_json_response
 from agentgateway_extproc.lib.pipeline.sse import SseDecoder
 from agentgateway_extproc.lib.pipeline.stream_handler import StreamHandler
 
@@ -53,6 +55,55 @@ async def collect(engine_client, messages, replies, context):
 
     async for reply in ExtProcServicer(engine_client).Process(requests(), context):
         replies.append(reply)
+
+
+@pytest.mark.parametrize("index", [None, 0, 127], ids=["absent", "zero", "upper-bound"])
+@pytest.mark.parametrize("pii", [False, True])
+async def test_buffered_chat_tool_index_preserves_restoration(
+    admission, reasoning_engine, index, pii
+):
+    engine_client, _ = reasoning_engine
+    admission["destination_policy"]["models"]["example-chat"] = pii
+    payload = response_payload("chat", tools=True)
+    tool = payload["choices"][0]["message"]["tool_calls"][0]
+    if index is not None:
+        tool["index"] = index
+    replies = []
+    await collect(
+        engine_client,
+        [
+            *request_messages(admission, "chat", stream=False),
+            response_headers("application/json", policy=admission),
+            response_body(json.dumps(payload).encode(), policy=admission),
+        ],
+        replies,
+        FakeAioContext(),
+    )
+    assert replies[-1].HasField("response_body")
+    value = json.loads(replies[-1].response_body.response.body_mutation.streamed_response.body)
+    actual = value["choices"][0]["message"]["tool_calls"][0]
+    assert {key: value for key, value in actual.items() if key != "function"} == {
+        key: value for key, value in tool.items() if key != "function"
+    }
+    assert actual["function"]["name"] == tool["function"]["name"]
+    assert json.loads(actual["function"]["arguments"]) == {
+        "person": "Jane Doe" if pii else REVERSIBLE_TOKEN,
+        "count": 1,
+    }
+
+
+def test_complete_chat_tool_index_accepts_null():
+    payload = response_payload("chat", tools=True)
+    payload["choices"][0]["message"]["tool_calls"][0]["index"] = None
+    validate_json_response("chat", payload)
+
+
+@pytest.mark.parametrize("index", ["0", True, 0.0, -1, 128, [], {}])
+def test_complete_chat_tool_index_rejects_invalid_values(index):
+    payload = response_payload("chat", tools=True)
+    payload["choices"][0]["message"]["tool_calls"][0]["index"] = index
+    with pytest.raises(ValidationError):
+        validate_json_response("chat", payload)
 
 
 async def test_buffered_chat_preserves_reasoning_values(admission, engine_client):
@@ -369,7 +420,14 @@ async def test_debug_failure_reports_exact_errors_and_full_payloads(
 
 
 @pytest.mark.parametrize(
-    "case", ["chat_nested_field", "chat_tool_field", "responses_part", "responses_reasoning"]
+    "case",
+    [
+        "chat_nested_field",
+        "chat_tool_field",
+        "chat_tool_index_extra",
+        "responses_part",
+        "responses_reasoning",
+    ],
 )
 async def test_v5_closes_nested_output_shapes(admission, engine_client, case):
     kind = "chat" if case.startswith("chat") else "responses"
@@ -379,6 +437,10 @@ async def test_v5_closes_nested_output_shapes(admission, engine_client, case):
     elif case == "chat_tool_field":
         payload["choices"][0]["message"]["tool_calls"][0]["function"]["unqualified_feature"] = (
             SENTINEL
+        )
+    elif case == "chat_tool_index_extra":
+        payload["choices"][0]["message"]["tool_calls"][0].update(
+            index=0, unqualified_feature=SENTINEL
         )
     elif case == "responses_part":
         payload["output"][0]["content"][0]["encrypted_content"] = SENTINEL
