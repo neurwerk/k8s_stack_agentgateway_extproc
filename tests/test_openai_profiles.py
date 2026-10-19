@@ -57,6 +57,105 @@ async def collect(engine_client, messages, replies, context):
         replies.append(reply)
 
 
+def allow_local_reroute(admission):
+    admission["request_context"]["provider_credential_source"] = "company"
+    admission["request_context"]["permissions"].extend(
+        ["provider:openai:company-use", "model:local:invoke"]
+    )
+    admission["model_bindings"]["example-chat"]["allowed_reroutes"] = ["local"]
+    admission["reroute_targets"] = {
+        "local": {
+            "binding_id": "local-binding",
+            "upstream_model": "local-provider-model",
+            "required_permissions": ["llm:invoke", "model:local:invoke"],
+            "content_tracing_enabled": False,
+        }
+    }
+
+
+@pytest.mark.parametrize("reroute", [False, True])
+async def test_local_reroute_stabilizes_chat_created_and_emits_notice(
+    admission, reasoning_engine, reroute
+):
+    engine_client, state = reasoning_engine
+    allow_local_reroute(admission)
+    state["reroute"] = reroute
+    events = stream_events("chat")
+    created = events[0]["created"]
+    for index, event in enumerate(events[1:-1], start=1):
+        event["created"] = created + index
+    messages = [
+        *request_messages(admission, "chat", stream=True),
+        response_headers("text/event-stream", policy=admission),
+        *(
+            response_body(event_bytes("chat", event), end_of_stream=False, policy=admission)
+            for event in events
+        ),
+        response_body(b"", policy=None),
+    ]
+    replies, context = [], FakeAioContext()
+    if not reroute:
+        with pytest.raises(StreamAbortedError):
+            await collect(engine_client, messages, replies, context)
+        assert context.code == grpc.StatusCode.INTERNAL
+        assert not any(
+            b"PII Engine Notice"
+            in reply.response_body.response.body_mutation.streamed_response.body
+            for reply in replies
+            if reply.HasField("response_body")
+        )
+        return
+    await collect(engine_client, messages, replies, context)
+    assert context.code is None
+    assert replies[-1].response_body.response.body_mutation.streamed_response.end_of_stream
+    emitted = b"".join(
+        reply.response_body.response.body_mutation.streamed_response.body
+        for reply in replies
+        if reply.HasField("response_body")
+    )
+    frames = SseDecoder().feed(emitted.decode(), final=True)
+    assert frames[-1].data == "[DONE]"
+    chunks = [json.loads(frame.data) for frame in frames[:-1]]
+    assert all(chunk["created"] == created for chunk in chunks)
+    assert chunks[-1]["usage"]["total_tokens"] == 30
+    text = "".join(
+        choice["delta"].get("content") or "" for chunk in chunks for choice in chunk["choices"]
+    )
+    assert "Jane Doe" in text
+    assert REVERSIBLE_TOKEN not in text
+    assert text.count("PII Engine Notice") == 1
+    assert "Effective route: `local`." in text
+
+
+@pytest.mark.parametrize(
+    ("field", "value"), [("id", "changed"), ("model", "changed"), ("created", "invalid")]
+)
+async def test_local_reroute_rejects_changed_identity_or_invalid_timestamp(
+    admission, reasoning_engine, field, value
+):
+    engine_client, state = reasoning_engine
+    allow_local_reroute(admission)
+    state["reroute"] = True
+    events = stream_events("chat")
+    events[1][field] = value
+    replies, context = [], FakeAioContext()
+    with pytest.raises(StreamAbortedError):
+        await collect(
+            engine_client,
+            [
+                *request_messages(admission, "chat", stream=True),
+                response_headers("text/event-stream", policy=admission),
+                response_body(
+                    b"".join(event_bytes("chat", event) for event in events), policy=admission
+                ),
+            ],
+            replies,
+            context,
+        )
+    assert context.code == grpc.StatusCode.INTERNAL
+    assert not any(reply.HasField("response_body") for reply in replies)
+
+
 @pytest.mark.parametrize("index", [None, 0, 127], ids=["absent", "zero", "upper-bound"])
 @pytest.mark.parametrize("pii", [False, True])
 async def test_buffered_chat_tool_index_preserves_restoration(

@@ -52,6 +52,25 @@ def _json_dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
 
 
+def _local_chat_dispatch(handler: StreamHandler) -> bool:
+    """Recognize only the approved local reroute selected during admission."""
+    admission = handler.admission
+    context = handler.request_context
+    if (
+        handler.response_api_kind != "chat"
+        or admission is None
+        or context is None
+        or context.target_credential_mode != "none"
+    ):
+        return False
+    target = admission.reroute_targets.get(context.dispatch_destination_id)
+    return (
+        target is not None
+        and context.dispatch_destination_id != context.destination_id
+        and context.dispatch_binding_id == target.binding_id
+    )
+
+
 def _record(
     handler: StreamHandler,
     hits: dict[str, int],
@@ -523,6 +542,7 @@ class SseResponseProcessor:
             OpenAIStreamValidator(
                 handler.response_api_kind,
                 openrouter=handler.admission.request_context.provider_id == "openrouter",
+                local_created_drift=_local_chat_dispatch(handler),
             )
             if handler.admission is not None
             else None
@@ -602,6 +622,13 @@ class SseResponseProcessor:
             self._handler.failed_response = {"event": event.event, "data": payload}
         if self._profile is not None:
             self._profile.accept(event, payload)
+            if (
+                self._profile.local_created_drift
+                and self._profile.identity is not None
+                and isinstance(payload, dict)
+            ):
+                # Ollama timestamps each chunk; expose one stable creation time to clients.
+                payload["created"] = self._profile.identity[2]
         if not isinstance(payload, dict):
             raise InvalidReversalError("SSE event data must be a JSON object")
         if self._handler.response_api_kind == "responses":
