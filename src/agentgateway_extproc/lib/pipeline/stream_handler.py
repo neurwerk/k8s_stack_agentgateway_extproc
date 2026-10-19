@@ -132,6 +132,7 @@ class StreamHandler:
         self.response_passthrough_chunks: list[bytes] = []
         self.notice_messages: list[str] = []
         self.safety_notice_messages: list[str] = []
+        self.document_notice_messages: list[str] = []
         self.response_notice_allowed = True
         self.response_structured_json = False
         self.presidio_code: str | None = None
@@ -179,6 +180,7 @@ class StreamHandler:
         self.request_body_chunks.clear()
         self.notice_messages.clear()
         self.safety_notice_messages.clear()
+        self.document_notice_messages.clear()
         self.request_stats = None
         self.restored_counts.clear()
         self.reversal_misses = 0

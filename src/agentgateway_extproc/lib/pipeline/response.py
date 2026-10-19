@@ -479,7 +479,7 @@ def _render_handler_notice(handler: StreamHandler) -> str:
     safety_messages = handler.safety_notice_messages
     if safety_messages and not _image_notice_visible(handler):
         safety_messages = []
-    return render_notice([*messages, *safety_messages], report)
+    return render_notice([*messages, *safety_messages, *handler.document_notice_messages], report)
 
 
 def _image_notice_visible(handler: StreamHandler) -> bool:

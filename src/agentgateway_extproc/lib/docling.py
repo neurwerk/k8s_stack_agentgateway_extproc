@@ -15,9 +15,11 @@ from agentgateway_extproc.config.settings import DoclingSettings
 from agentgateway_extproc.lib.documents import (
     _MIMES,
     MAX_TEXT,
+    NATIVE_PDF_NOTICE,
     DocumentError,
     ImageBatch,
     Upload,
+    extract_native_pdf,
     inspect_canonical_faces,
     preflight,
     project_document,
@@ -69,6 +71,8 @@ class DoclingClient:
         *,
         images: ImageBatch | None = None,
         inspect_images: set[int] | None = None,
+        native_pdf: bool = False,
+        pdf_notices: list[str] | None = None,
     ) -> list[str]:
         """Extract every attachment, preserving the legacy ordered result."""
         texts = await self.convert_selected(
@@ -76,6 +80,8 @@ class DoclingClient:
             set(range(len(parts))),
             images=images,
             inspect_images=inspect_images,
+            native_pdf=native_pdf,
+            pdf_notices=pdf_notices,
         )
         return list(texts.values())
 
@@ -86,6 +92,8 @@ class DoclingClient:
         *,
         images: ImageBatch | None = None,
         inspect_images: set[int] | None = None,
+        native_pdf: bool = False,
+        pdf_notices: list[str] | None = None,
     ) -> dict[int, str]:
         """Admit one batch; an empty selection normalizes images without Docling."""
         if (
@@ -100,7 +108,16 @@ class DoclingClient:
         self._active_stage = "extraction"
         deadline = time.monotonic() + self.settings.timeout
         task = asyncio.create_task(
-            self._batch(parts, selected, abandoned, deadline, images, inspect_images or set())
+            self._batch(
+                parts,
+                selected,
+                abandoned,
+                deadline,
+                images,
+                inspect_images or set(),
+                native_pdf,
+                pdf_notices,
+            )
         )
         self._task = task
         task.add_done_callback(self._finished)
@@ -142,6 +159,8 @@ class DoclingClient:
         deadline: float,
         images: ImageBatch | None = None,
         inspect_images: set[int] | None = None,
+        native_pdf: bool = False,
+        pdf_notices: list[str] | None = None,
     ) -> dict[int, str]:
         """Validate every part before extracting the selected uploads in order."""
         try:
@@ -165,6 +184,19 @@ class DoclingClient:
                 break
             if time.monotonic() >= deadline:
                 raise DocumentError(504, reason="extraction_timeout")
+            if native_pdf and upload.format == "pdf":
+                text = await asyncio.to_thread(
+                    extract_native_pdf, upload, self.settings.pages - pages, abandoned, deadline
+                )
+                upload.data = b""
+                pages += upload.pages
+                size += len(text)
+                if size > MAX_TEXT:
+                    raise DocumentError(413)
+                output[index] = text
+                if pdf_notices is not None and NATIVE_PDF_NOTICE not in pdf_notices:
+                    pdf_notices.append(NATIVE_PDF_NOTICE)
+                continue
             canonical_image = (
                 upload.data
                 if index in (inspect_images or set()) and upload.format == "img"
