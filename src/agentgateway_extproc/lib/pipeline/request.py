@@ -266,8 +266,17 @@ async def process_request(
         )
         attachments = _model_attachments(request)
         attachment_mode = policy.attachment_modes.get(model_id, "block")
+        native_pdf = not policy.local_models.get(model_id, False)
         if handler.admission is not None and attachments and attachment_mode == "passthrough":
             raise GatewayPolicyError("unsupported_feature")
+        if (
+            attachment_mode == "passthrough"
+            and native_pdf
+            and any(part.type in {"file", "input_file"} for part in attachments)
+        ):
+            _clear_request(handler)
+            error = DocumentError(403, reason="attachments_disabled")
+            return immediate_response(error.status, json.dumps({"error": error.message}))
         image_forwarding = policy.image_forwarding.get(model_id, "none")
         unchecked_without_documents = False
         if attachments and policy.contract_version in {4, "4.1"}:
@@ -323,6 +332,8 @@ async def process_request(
                         document_indexes,
                         images=images,
                         inspect_images=inspect_images,
+                        native_pdf=native_pdf,
+                        pdf_notices=handler.document_notice_messages,
                     )
                     _validate_image_inspections(images, inspect_images)
                     request, body, unchecked_image_locations = _converted_unchecked_request(
@@ -339,6 +350,8 @@ async def process_request(
                         attachments,
                         images=images,
                         inspect_images=inspect_images,
+                        native_pdf=native_pdf,
+                        pdf_notices=handler.document_notice_messages,
                     )
                     if images is not None:
                         _validate_image_inspections(images, inspect_images)
@@ -388,13 +401,22 @@ async def process_request(
                         and policy.protects_faces(model_id),
                         policy_version=cast(int, policy.contract_version),
                     )
-                    texts = await handler.docling.convert(attachments, images=images)
+                    texts = await handler.docling.convert(
+                        attachments,
+                        images=images,
+                        native_pdf=native_pdf,
+                        pdf_notices=handler.document_notice_messages,
+                    )
                     if isinstance(policy.contract_version, int) and policy.contract_version >= 3:
                         visual_findings = _visual_findings(attachments, images)
                     if image_forwarding != "none":
                         image_locations = _image_locations(payload, images)
                 else:
-                    texts = await handler.docling.convert(attachments)
+                    texts = await handler.docling.convert(
+                        attachments,
+                        native_pdf=native_pdf,
+                        pdf_notices=handler.document_notice_messages,
+                    )
                 request, body = _converted_request(payload, texts, controls=request._controls)
             except DocumentError as exc:
                 _clear_request(handler)
@@ -445,8 +467,19 @@ async def process_request(
                     _clear_request(handler)
                     return immediate_response(exc.status, json.dumps({"error": exc.message}))
             _clear_request(handler)
-            handler.response_processing_enabled = handler.admission is not None
-            handler.response_notice_allowed = handler.admission is None
+            handler.response_processing_enabled = handler.admission is not None or bool(
+                handler.document_notice_messages
+            )
+            structured = (
+                isinstance(request, EngineChatRequest) and _has_structured_chat_format(request)
+            ) or (
+                isinstance(request, EngineResponsesRequest)
+                and _has_structured_responses_format(request)
+            )
+            handler.response_structured_json = structured
+            handler.response_notice_allowed = not structured and (
+                handler.admission is None or bool(handler.document_notice_messages)
+            )
             body, alias_changed = _upstream_model_body(handler, body)
             handler.record_dispatch("model_bypass")
             return request_mutation(body, {}, converted or alias_changed)
