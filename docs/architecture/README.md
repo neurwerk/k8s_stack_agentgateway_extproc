@@ -21,7 +21,7 @@ The [engine client](../../src/agentgateway_extproc/lib/engine/client.py) calls `
 | OpenAI Codex Responses | `/v1/responses`; `/backend-api/codex/responses` in forward-proxy mode | The supported Responses subset. |
 | Anthropic Messages | `/v1/messages` | Native text, client function calls/results, tool descriptions, and schema prose. |
 | Google generateContent | `/v1beta/models/<model>:generateContent` or `:streamGenerateContent?alt=sse` | Native text, client function calls/results, tool descriptions, and schema prose. |
-| MCP Streamable HTTP | `/bindings/mcp-<destination-id>/mcp` | String leaves in `tools/call` arguments when PII processing is enabled. |
+| MCP Streamable HTTP | `/mcp/<canonical-server-id>` | String leaves in `tools/call` arguments when PII processing is enabled. |
 
 Model requests require POST, JSON, and no request compression. Unknown content features are rejected. Recognized web-profile identifiers do not imply implemented web inspection. Native Anthropic and Google profiles reject media, hosted tools, stored context, and opaque thinking/signature blocks. Responses background execution and stored-history continuation are unsupported. The [request-segment guide](../../packages/request_segments/README.md) defines extraction and reviewed scalar compatibility extensions.
 
