@@ -163,6 +163,55 @@ async def test_contextforge_account_and_destination_cannot_change_midstream(engi
     assert wrong_route is not None and wrong_route.immediate_response.status.code == 400
 
 
+@pytest.mark.parametrize("method", ["POST", "GET", "DELETE"])
+@pytest.mark.parametrize("destination_id", ["brave", "tools.example"])
+async def test_mcp_canonical_route_preserves_internal_binding(
+    engine_client, method, destination_id
+):
+    policy = mcp_policy() | {"destination_id": destination_id}
+    handler = StreamHandler(engine_client)
+    response = await handler.handle(
+        header_request(
+            mcp_headers(method=method, destination_id=destination_id),
+            end_of_stream=method != "POST",
+            policy=policy,
+        )
+    )
+    assert response is not None and response.HasField("request_headers")
+    assert handler.admission is not None
+    context = handler.admission.resolve_mcp()
+    assert context.destination_id == destination_id
+    assert context.binding_id == context.dispatch_binding_id == f"mcp-{destination_id}"
+
+
+@pytest.mark.parametrize("method", ["POST", "GET", "DELETE"])
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/bindings/mcp-brave/mcp",
+        "/mcp/other",
+        "/mcp/brave-extra",
+        "/mcp/brave/",
+        "/mcp/brave/extra",
+        "/mcp/brave?query=value",
+        "/mcp/brave?",
+        "/mcp/%62rave",
+        "/mcp/other/../brave",
+        "/mcp/./brave",
+        "/mcp//brave",
+    ],
+)
+async def test_mcp_route_rejects_aliases_and_normalization(engine_client, method, path):
+    response = await StreamHandler(engine_client).handle(
+        header_request(
+            mcp_headers(method=method) | {":path": path},
+            end_of_stream=method != "POST",
+            policy=mcp_policy(),
+        )
+    )
+    assert response is not None and response.immediate_response.status.code == 400
+
+
 async def test_missing_or_changing_metadata_is_a_platform_503(engine_client) -> None:
     servicer = ExtProcServicer(engine_client)
 

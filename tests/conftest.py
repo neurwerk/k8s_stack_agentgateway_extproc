@@ -275,7 +275,7 @@ def mcp_headers(
     """Build strict Streamable HTTP request headers for MCP tests."""
     headers = {
         ":method": method,
-        ":path": f"/bindings/mcp-{destination_id}/mcp",
+        ":path": f"/mcp/{destination_id}",
         "mcp-protocol-version": "2025-11-25",
     }
     if method == "POST":
