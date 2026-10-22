@@ -221,7 +221,7 @@ class ExtProcServicer(ext_proc_pb2_grpc.ExternalProcessorServicer):
         )
         if handler.debug_errors:
             detail = (
-                exception_diagnostic(error, handler, stack=True, input_data=input_data)
+                exception_diagnostic(error, handler, input_data=input_data)
                 if error is not None
                 else f"rejection code={code}; http.status={status}"
             )
@@ -446,7 +446,7 @@ async def _abort_stream(
     grpc_context = cast(AbortContext, context)
     detail = f"response processing failed closed; request_id={handler.correlation_id}"
     if handler.debug_errors:
-        detail += "; " + exception_diagnostic(exc, handler, stack=True, input_data=input_data)
+        detail += "; " + exception_diagnostic(exc, handler, input_data=input_data)
     await grpc_context.abort(grpc.StatusCode.INTERNAL, detail)
 
 

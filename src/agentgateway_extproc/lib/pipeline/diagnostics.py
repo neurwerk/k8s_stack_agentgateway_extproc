@@ -155,7 +155,7 @@ def validation_rejection_message(message: str, exc: Exception, handler: StreamHa
     _logger.error(
         "request validation failed request_id=%s diagnostics=%s", handler.correlation_id, details
     )
-    summary = details if handler.debug_errors else exception_summary(exc)
+    summary = exception_summary(exc)
     return str(json.loads(safe_diagnostic(f"{message}: {summary}", handler, exc)))
 
 
