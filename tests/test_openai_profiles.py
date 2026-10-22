@@ -455,7 +455,8 @@ async def test_debug_failure_reports_exact_errors_and_full_payloads(
                 await collect(engine_client, messages, replies, context)
             assert context.code == grpc.StatusCode.INTERNAL
             assert context.details.startswith("response processing failed closed; request_id=")
-            assert ("traceback" in context.details) is error_debug
+            for internal in ("traceback", '"file"', '"line"', '"function"', ".py"):
+                assert internal not in context.details
             assert not any(reply.HasField("immediate_response") for reply in replies)
         else:
             await collect(engine_client, messages, replies, context)

@@ -187,7 +187,8 @@ async def test_exception_chain_is_safe_at_error_level(engine_client, caplog, lev
     error = json.loads(immediate.body)["error"]
     assert immediate.status.code == 503 and error["code"] == "processing_failed"
     assert "ValidationError" in error["message"]
-    assert ("traceback" in error["message"]) is (level == "debug")
+    for internal in ("traceback", '"file"', '"line"', '"function"', ".py"):
+        assert internal not in error["message"]
     assert '"path": ["count"]' in caplog.text and "int_parsing" in caplog.text
     assert '"function": "fail"' in caplog.text
     assert "traceback" in caplog.text and error["request_id"] in caplog.text
@@ -196,13 +197,14 @@ async def test_exception_chain_is_safe_at_error_level(engine_client, caplog, lev
 
 
 @pytest.mark.parametrize("level", ["info", "debug"])
-async def test_request_validation_details_exclude_input(engine_client, caplog, level):
+@pytest.mark.parametrize("role", ["user", "string"])
+async def test_request_validation_details_exclude_input(engine_client, caplog, level, role):
     caplog.set_level(logging.ERROR)
     raw = {
         "model": "test",
         "messages": [
             {
-                "role": "user",
+                "role": role,
                 "content": {
                     "password": "validation-password-sentinel",
                     "private_text": "private-body-sentinel",
@@ -225,8 +227,18 @@ async def test_request_validation_details_exclude_input(engine_client, caplog, l
     error = json.loads(immediate.body)["error"]
     assert immediate.status.code == 400 and error["code"] == "invalid_request"
     assert "messages" in error["message"] and "content" in error["message"]
-    assert ("traceback" in error["message"]) is (level == "debug")
+    if role == "string":
+        assert "role" in error["message"] and "literal_error" in error["message"]
+        assert "literal_error" in caplog.text
+    assert error["request_id"] and error["request_id"] in caplog.text
+    assert any(
+        item.header.key == "x-request-id" and item.header.value == error["request_id"]
+        for item in immediate.headers.set_headers
+    )
+    for internal in ("traceback", '"file"', '"line"', '"function"', ".py"):
+        assert internal not in error["message"]
     assert "traceback" in caplog.text and "ValidationError" in caplog.text
+    assert '"function"' in caplog.text and '"path"' in caplog.text
     assert "validation-password-sentinel" not in immediate.body + caplog.text
     assert "private-body-sentinel" not in immediate.body + caplog.text
 
