@@ -802,7 +802,7 @@ async def test_v3_image_dispatch(  # noqa: C901
         else:
             assert error["error"]["message"].startswith("neurwerk:")
             assert error["error"]["code"] == error["pii_report"]["reason"]
-        assert "PII Engine Notice" not in error["error"]["message"]
+        assert "PII protection notice — powered by neurwerk" not in error["error"]["message"]
         assert "\n" not in error["error"]["message"]
         assert "|" not in error["error"]["message"]
         assert error["pii_report"]["decision"] == "block"
@@ -869,7 +869,9 @@ async def test_v3_image_dispatch(  # noqa: C901
         )
         assert "x-presidio-code" in headers.remove_headers
         assert not any(item.header.key == "x-presidio-code" for item in headers.set_headers)
-    assert ("PII Engine Notice" in response) is (not structured and not bypass)
+    assert ("PII protection notice — powered by neurwerk" in response) is (
+        not structured and not bypass
+    )
     if face_action and not structured:
         assert f"| Face | `{face_action}`: 3 detected" in response
         if not transformed:
