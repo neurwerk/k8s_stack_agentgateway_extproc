@@ -8,4 +8,8 @@ def render_notice(messages: list[str], report: str = "") -> str:
     sections = [message.strip() for message in messages if message.strip()]
     if rendered_report := report.strip():
         sections.append(rendered_report)
-    return "\n\n---\nPII Engine Notice\n" + "\n\n".join(sections) if sections else ""
+    return (
+        "\n\n---\nPII protection notice — powered by neurwerk\n" + "\n\n".join(sections)
+        if sections
+        else ""
+    )

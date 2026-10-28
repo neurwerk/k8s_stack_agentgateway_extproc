@@ -58,7 +58,7 @@ def test_invalid_human_placeholder_gets_a_history_safe_marker() -> None:
 def test_notice_rendering_omits_empty_messages() -> None:
     """Notice content remains bounded structural metadata until a format selects its target."""
     notice = render_notice(["Protected", "  "])
-    assert notice == "\n\n---\nPII Engine Notice\nProtected"
+    assert notice == "\n\n---\nPII protection notice — powered by neurwerk\nProtected"
 
 
 def test_stream_rewriter_keeps_only_an_incomplete_placeholder_suffix() -> None:

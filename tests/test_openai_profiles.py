@@ -99,7 +99,7 @@ async def test_local_reroute_stabilizes_chat_created_and_emits_notice(
             await collect(engine_client, messages, replies, context)
         assert context.code == grpc.StatusCode.INTERNAL
         assert not any(
-            b"PII Engine Notice"
+            b"PII protection notice"
             in reply.response_body.response.body_mutation.streamed_response.body
             for reply in replies
             if reply.HasField("response_body")
@@ -123,7 +123,7 @@ async def test_local_reroute_stabilizes_chat_created_and_emits_notice(
     )
     assert "Jane Doe" in text
     assert REVERSIBLE_TOKEN not in text
-    assert text.count("PII Engine Notice") == 1
+    assert text.count("PII protection notice — powered by neurwerk") == 1
     assert "Effective route: `local`." in text
 
 
