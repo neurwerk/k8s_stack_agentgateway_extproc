@@ -16,10 +16,14 @@ AgentGateway External Processor adapts gateway requests and responses for the PI
 
 ## Add-ons
 
+Optional products are packaged separately from Base. See each repository's documentation and release manifest for availability and prerequisites.
+
 | Repository | Purpose |
 | --- | --- |
 | [Dify](https://github.com/neurwerk/k8s_stack_addon_dify) | Dify deployment and API/web customizations. |
 | [LibreChat](https://github.com/neurwerk/k8s_stack_addon_librechat) | LibreChat deployment and platform integration. |
+| [Open WebUI](https://github.com/neurwerk/k8s_stack_addon_open_webui) | Open WebUI deployment and platform integration. |
+| [Pipecat](https://github.com/neurwerk/k8s_stack_addon_pipecat) | Self-hosted voice bots and browser UI with platform identity and AI gateway integration. |
 
 ## Examples
 

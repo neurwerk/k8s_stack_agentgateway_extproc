@@ -115,7 +115,7 @@ def test_clean_report_uses_existing_notice_message_without_an_empty_table() -> N
         render_report(report, _analysis(), {}, decision="pass", route_class="general"),
     )
 
-    assert notice.count("PII Engine Notice") == 1
+    assert notice.count("PII protection notice — powered by neurwerk") == 1
     assert "No sensitive data was detected." in notice
     assert "general" not in notice
     assert "| Entity |" not in notice
