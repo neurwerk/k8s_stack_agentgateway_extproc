@@ -30,6 +30,7 @@ REQUEST_HEADERS = {
     "x-api-key",
     "x-goog-api-key",
     "x-neurwerk-authorization",
+    "x-neurwerk-credential-mode",
     "api-key",
     "cookie",
     "x-agentgateway-auth-context",
