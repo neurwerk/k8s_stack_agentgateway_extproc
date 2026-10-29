@@ -89,6 +89,11 @@ class ChatEnvelope(MetadataEnvelope):
     system_fingerprint: Identifier | None = None
     service_tier: MetadataToken | None = None
     usage: UsageMetadata | None = None
+    # Ollama includes numeric generation timings on its final usage chunk.
+    timings: (
+        Annotated[dict[MetadataToken, Annotated[int | float, Field(ge=0)]], Field(max_length=64)]
+        | None
+    ) = None
     provider: Identifier | None = None
 
 

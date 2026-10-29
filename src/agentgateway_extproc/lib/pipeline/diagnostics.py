@@ -6,6 +6,7 @@ import json
 import logging
 import re
 import traceback
+from collections.abc import Mapping
 from contextlib import suppress
 from typing import TYPE_CHECKING
 
@@ -20,6 +21,40 @@ if TYPE_CHECKING:
 
 _logger = logging.getLogger(__name__)
 _CREDENTIAL = re.compile(r"authorization|api.?key|token|password|secret|cookie", re.I)
+_EXPECTED_TYPES = {
+    "int_type": "integer",
+    "float_type": "number",
+    "bool_type": "boolean",
+    "str_type": "string",
+    "dict_type": "object",
+    "list_type": "array",
+}
+
+
+def _type_mismatch(error: Mapping[str, object]) -> dict[str, str]:
+    """Report JSON type names only, never the rejected value or its contents."""
+    expected = _EXPECTED_TYPES.get(error.get("type"))
+    if expected is None or "input" not in error:
+        return {}
+    value = error["input"]
+    actual = (
+        "null"
+        if value is None
+        else "boolean"
+        if isinstance(value, bool)
+        else "integer"
+        if isinstance(value, int)
+        else "number"
+        if isinstance(value, float)
+        else "string"
+        if isinstance(value, str)
+        else "object"
+        if isinstance(value, dict)
+        else "array"
+        if isinstance(value, list)
+        else "unknown"
+    )
+    return {"expected_type": expected, "actual_type": actual}
 
 
 def safe_diagnostic(  # noqa: C901
@@ -115,8 +150,8 @@ def exception_diagnostic(
             # Validator messages and ctx may interpolate arbitrary request content.
             detail["validation"] = {
                 "errors": [
-                    {"path": list(error["loc"]), "code": error["type"]}
-                    for error in current.errors(include_input=False, include_url=False)
+                    {"path": list(error["loc"]), "code": error["type"], **_type_mismatch(error)}
+                    for error in current.errors(include_url=False)
                 ],
                 "count": current.error_count(),
             }
@@ -143,7 +178,12 @@ def exception_summary(exc: Exception) -> str:
         if isinstance(current, ValidationError):
             parts.extend(
                 f"{error['type']} at {'.'.join(map(str, error['loc']))}"
-                for error in current.errors(include_input=False, include_url=False)
+                + (
+                    f" (expected {types['expected_type']}, got {types['actual_type']})"
+                    if (types := _type_mismatch(error))
+                    else ""
+                )
+                for error in current.errors(include_url=False)
             )
         current = current.__cause__ or current.__context__
     return "; ".join(parts)

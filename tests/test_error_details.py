@@ -9,7 +9,11 @@ from agentgateway_extproc.config.settings import Settings
 from agentgateway_extproc.controllers.grpc_servicer import ExtProcServicer
 from agentgateway_extproc.lib.docling import DoclingClient
 from agentgateway_extproc.lib.documents import DocumentError
-from agentgateway_extproc.lib.pipeline.diagnostics import exception_diagnostic, policy_block_message
+from agentgateway_extproc.lib.pipeline.diagnostics import (
+    exception_diagnostic,
+    exception_summary,
+    policy_block_message,
+)
 from agentgateway_extproc.lib.pipeline.request import _image_policy_block
 from agentgateway_extproc.lib.pipeline.stream_handler import StreamHandler
 from agentgateway_extproc.models.engine import EngineReply
@@ -289,6 +293,20 @@ def test_short_input_does_not_corrupt_diagnostics(engine_client, engine_reply):
     detail = json.loads(exception_diagnostic(raised.value, handler))
     assert detail[0]["type"] == "ValidationError"
     assert detail[0]["validation"]["errors"] == [{"path": ["count"], "code": "int_parsing"}]
+
+    class Metadata(BaseModel):
+        timings: int | float | bool
+
+    with pytest.raises(ValidationError) as rejected:
+        Metadata.model_validate({"timings": {"private": "sensitive-value"}})
+    diagnostic = exception_diagnostic(rejected.value, handler)
+    errors = json.loads(diagnostic)[0]["validation"]["errors"]
+    assert {row["expected_type"] for row in errors} == {"integer", "number", "boolean"}
+    assert all(row["actual_type"] == "object" for row in errors)
+    assert "sensitive-value" not in diagnostic
+    summary = exception_summary(rejected.value)
+    assert "expected integer, got object" in summary
+    assert "sensitive-value" not in summary
     handler.request_headers["x-api-key"] = "a"
     # A true short credential is still redacted in a single pass.
     assert "[red[" not in exception_diagnostic(raised.value, handler)
