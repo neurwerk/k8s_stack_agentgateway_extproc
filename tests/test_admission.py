@@ -30,6 +30,8 @@ from .conftest import (
     add_policy,
     body_request,
     header_request,
+    mcp_headers,
+    mcp_policy,
     request_json,
     response_body,
     response_headers,
@@ -340,45 +342,118 @@ async def test_wrong_transport_or_credential_location_is_rejected_without_retent
     assert SECRET not in repr(vars(handler))
 
 
+@pytest.mark.parametrize("codex", [False, True])
 async def test_sensitive_headers_are_preserved_or_removed_without_value_copies(
-    admission, engine_client
+    admission, engine_client, caplog, codex
 ):
+    caplog.set_level("DEBUG")
+    if codex:
+        admission["request_context"]["protocol_profile"] = "openai-codex-responses-v1"
     original = headers(
         **{
             "x-neurwerk-authorization": f"Bearer {SECRET}",
             "proxy-authorization": SECRET,
             "x-agentgateway-auth-context": SECRET,
+            "X-Neurwerk-Credential-Mode": SECRET,
         }
     )
+    if codex:
+        original.update(
+            {":path": "/bindings/openai-api/v1/responses", "chatgpt-account-id": "account-1"}
+        )
     event = header_request(original, policy=admission)
     handler = StreamHandler(engine_client)
     reply = await handler.handle(event)
     assert reply is not None
     mutation = reply.request_headers.response.header_mutation
     upstream = {
-        name: value for name, value in original.items() if name not in mutation.remove_headers
+        name: value
+        for name, value in original.items()
+        if name.lower() not in mutation.remove_headers
     }
     assert upstream["authorization"] == original["authorization"]
+    if codex:
+        assert upstream["chatgpt-account-id"] == "account-1"
     assert set(mutation.remove_headers) == {
         "x-neurwerk-authorization",
         "proxy-authorization",
         "x-agentgateway-auth-context",
+        "x-neurwerk-credential-mode",
     }
     assert not mutation.set_headers
     assert SECRET not in repr(vars(handler)) + str(reply)
-    await handler.handle(body_request(body(stream=True), policy=admission))
+    with patch.object(
+        engine_client, "analyze_request", wraps=engine_client.analyze_request
+    ) as analyze:
+        reply = await handler.handle(
+            body_request(body(responses=codex, stream=True), policy=admission)
+        )
+        analyze.assert_awaited_once()
+        assert SECRET not in repr(analyze.call_args)
+    assert SECRET not in str(reply) + repr(vars(handler)) + caplog.text
     response = await handler.handle(
         response_headers(
             "text/event-stream",
-            extra_headers={"set-cookie": SECRET, "authorization": SECRET},
+            extra_headers={
+                "set-cookie": SECRET,
+                "authorization": SECRET,
+                "X-Neurwerk-Credential-Mode": SECRET,
+            },
             policy=admission,
         )
     )
     assert response is not None
-    assert {"set-cookie", "authorization"} <= set(
+    assert {"set-cookie", "authorization", "x-neurwerk-credential-mode"} <= set(
         response.response_headers.response.header_mutation.remove_headers
     )
-    assert SECRET not in repr(vars(handler)) + str(response)
+    assert SECRET not in repr(vars(handler)) + str(response) + caplog.text
+
+
+@pytest.mark.parametrize(
+    "source,selector", [("global", "override"), ("none", "global"), ("override", "global")]
+)
+async def test_selector_cannot_replace_trusted_credential_source(
+    admission, engine_client, source, selector
+):
+    context = admission["request_context"]
+    context["provider_credential_source"] = source
+    if source == "global":
+        context["permissions"].append("provider:openai:global-use")
+    admission["destination_policy"]["models"]["example-chat"] = False
+    original = headers(**{"x-neurwerk-credential-mode": selector})
+    del original["authorization"]
+    handler = StreamHandler(engine_client)
+    with patch.object(engine_client, "analyze_request", new_callable=AsyncMock) as analyze:
+        if source == "override":
+            with pytest.raises(GatewayPolicyError) as rejected:
+                await handler.handle(header_request(original, policy=admission))
+            assert rejected.value.code == "provider_credential_required"
+        else:
+            reply = await handler.handle(header_request(original, policy=admission))
+            assert reply is not None
+            assert "x-neurwerk-credential-mode" in (
+                reply.request_headers.response.header_mutation.remove_headers
+            )
+            result = await handler.handle(body_request(body(), policy=admission))
+            assert result is not None
+            resolved = MessageToDict(result.dynamic_metadata)["neurwerk.request_context"]
+            assert resolved["provider_credential_source"] == source
+            assert resolved["target_credential_mode"] == source
+        analyze.assert_not_awaited()
+
+
+async def test_mcp_selector_is_stripped_without_retention(engine_client, caplog):
+    caplog.set_level("DEBUG")
+    handler = StreamHandler(engine_client)
+    original = mcp_headers() | {"X-Neurwerk-Credential-Mode": SECRET}
+    reply = await handler.handle(header_request(original, policy=mcp_policy()))
+    assert reply is not None and reply.HasField("request_headers")
+    assert "x-neurwerk-credential-mode" in (
+        reply.request_headers.response.header_mutation.remove_headers
+    )
+    assert SECRET not in repr(vars(handler)) + str(reply) + caplog.text
+    assert handler.admission is not None
+    assert handler.admission.request_context.provider_credential_source == "none"
 
 
 @pytest.mark.parametrize("status", [401, 403, 429])
@@ -700,7 +775,12 @@ async def test_response_trailers_strip_credentials_and_empty_eos_keeps_compatibi
                 "trailers": {
                     "headers": [
                         {"key": name, "raw_value": SECRET.encode()}
-                        for name in ["set-cookie", "x-goog-api-key", "x-neurwerk-authorization"]
+                        for name in [
+                            "set-cookie",
+                            "x-goog-api-key",
+                            "x-neurwerk-authorization",
+                            "X-Neurwerk-Credential-Mode",
+                        ]
                     ]
                 }
             }
@@ -713,6 +793,7 @@ async def test_response_trailers_strip_credentials_and_empty_eos_keeps_compatibi
         "set-cookie",
         "x-goog-api-key",
         "x-neurwerk-authorization",
+        "x-neurwerk-credential-mode",
     }
     assert SECRET not in repr(vars(handler)) + str(result)
 
