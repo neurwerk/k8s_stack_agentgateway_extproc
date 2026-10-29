@@ -232,9 +232,9 @@ async def test_reasoning_survives_completed_exchange_and_verified_replay(
     client, state = reasoning_engine
     if reroute:
         state["reroute"] = True
-        admission["request_context"]["provider_credential_source"] = "company"
+        admission["request_context"]["provider_credential_source"] = "global"
         admission["request_context"]["permissions"].extend(
-            ["provider:openai:company-use", "model:local:invoke"]
+            ["provider:openai:global-use", "model:local:invoke"]
         )
         admission["model_bindings"]["example-chat"]["allowed_reroutes"] = ["local"]
         admission["reroute_targets"] = {
@@ -614,7 +614,7 @@ async def test_incomplete_reasoning_never_authorizes_replay(admission, reasoning
                         detail["id"] = "changed-identity"
     else:
         admission["request_context"]["provider_id"] = "openrouter"
-        admission["request_context"]["permissions"].append("provider:openrouter:company-use")
+        admission["request_context"]["permissions"].append("provider:openrouter:global-use")
         events[-2]["choices"] = [
             {"index": 0, "delta": {"reasoning": "after finish"}, "finish_reason": "tool_calls"}
         ]

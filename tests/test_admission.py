@@ -43,7 +43,7 @@ SECRET = "credential-sentinel"
 
 @pytest.fixture
 def admission():
-    return json.loads((Path(__file__).parent / "fixtures/admission-v5.json").read_text())
+    return json.loads((Path(__file__).parent / "fixtures/admission-v6.json").read_text())
 
 
 def headers(**changes):
@@ -126,10 +126,10 @@ async def test_one_resolution_drives_permissions_policy_and_final_provider_model
         assert metadata["billing_classification"] == "unknown"
         assert metadata["usage_completeness"] == "unknown"
         assert metadata["request_text_inspection"] == ("scanned" if pii else "disabled")
-        assert metadata["target_credential_mode"] == "caller_supplied"
+        assert metadata["target_credential_mode"] == "override"
         if not responses and requested != "provider-chat" and pii:
             expected = json.loads(
-                (Path(__file__).parent / "fixtures/resolved-context-v5.json").read_text()
+                (Path(__file__).parent / "fixtures/resolved-context-v6.json").read_text()
             )
             assert MessageToDict(result.dynamic_metadata) == expected
         assert (context.binding_id, context.provider_id) == ("openai-api", "openai")
@@ -220,7 +220,7 @@ async def test_invalid_admission_fails_before_engine(admission, engine_client, c
         ("provider_id", "other-provider"),
         ("permissions", ["llm:invoke"]),
         ("policy_revision", "other-revision"),
-        ("provider_credential_source", "company"),
+        ("provider_credential_source", "global"),
         ("api_path_prefix", "/openai/api"),
         ("api_path_prefix", None),
     ],
@@ -260,9 +260,15 @@ async def test_selection_outside_binding_or_grant_never_reaches_analysis(
 
 
 @pytest.mark.parametrize(
-    "source,grant,status", [("company", False, 403), ("company", True, None), ("none", False, None)]
+    "source,grant,status",
+    [
+        ("global", None, 403),
+        ("global", "company-use", 403),
+        ("global", "global-use", None),
+        ("none", None, None),
+    ],
 )
-async def test_company_use_requires_extra_permission_and_strips_credentials(
+async def test_global_use_requires_extra_permission_and_strips_credentials(
     admission, engine_client, source, grant, status
 ):
     context = admission["request_context"]
@@ -270,14 +276,14 @@ async def test_company_use_requires_extra_permission_and_strips_credentials(
     if source == "none":
         context["provider_id"] = None
     if grant:
-        context["permissions"].append("provider:openai:company-use")
+        context["permissions"].append(f"provider:openai:{grant}")
     original = headers()
     if source == "none":
         del original["authorization"]
     handler = StreamHandler(engine_client)
     reply = await handler.handle(header_request(original, policy=admission))
     assert reply is not None
-    if source == "company":
+    if source == "global":
         assert "authorization" in reply.request_headers.response.header_mutation.remove_headers
     assert SECRET not in repr(vars(handler))
     if status:
@@ -290,10 +296,25 @@ async def test_company_use_requires_extra_permission_and_strips_credentials(
         assert result.HasField("request_body")
         context = MessageToDict(result.dynamic_metadata)["neurwerk.request_context"]
         assert context["billing_classification"] == (
-            "company_api" if source == "company" else "unknown"
+            "global_api" if source == "global" else "unknown"
         )
         assert context["usage_completeness"] == "unknown"
         assert context["target_credential_mode"] == source
+
+
+@pytest.mark.parametrize("source", ["company", "caller_supplied"])
+async def test_legacy_sources_fail_before_analysis(admission, engine_client, source):
+    admission["request_context"]["provider_credential_source"] = source
+    with patch.object(engine_client, "analyze_request", new_callable=AsyncMock) as analyze:
+        replies = await exchange(engine_client, [header_request(headers(), policy=admission)])
+    analyze.assert_not_awaited()
+    assert replies[-1].immediate_response.status.code == 503
+
+
+def test_old_admission_version_is_rejected(admission):
+    admission["contract_version"] = 5
+    with pytest.raises(ValidationError):
+        AdmissionEnvelope.model_validate(admission)
 
 
 @pytest.mark.parametrize(
@@ -476,7 +497,7 @@ async def test_unqualified_features_stop_before_analysis(admission, engine_clien
 
 
 @pytest.mark.parametrize("cached", [False, True])
-async def test_reroute_requires_company_source_and_explicit_local_permission(
+async def test_reroute_requires_global_source_and_explicit_local_permission(
     engine_client, engine_reply, admission, cached
 ):
     engine_reply.update(
@@ -520,8 +541,8 @@ async def test_reroute_requires_company_source_and_explicit_local_permission(
             "content_tracing_enabled": True,
         }
     }
-    admission["request_context"]["provider_credential_source"] = "company"
-    admission["request_context"]["permissions"].append("provider:openai:company-use")
+    admission["request_context"]["provider_credential_source"] = "global"
+    admission["request_context"]["permissions"].append("provider:openai:global-use")
     for allowed in (False, True):
         if allowed:
             admission["request_context"]["permissions"].append("model:local:invoke")
@@ -539,7 +560,7 @@ async def test_reroute_requires_company_source_and_explicit_local_permission(
             assert context["dispatch_destination_id"] == "local"
             assert context["resolved_model"] == "local-provider-model"
             assert context["destination_id"] == "example-chat"
-            assert context["provider_credential_source"] == "company"
+            assert context["provider_credential_source"] == "global"
             assert context["target_credential_mode"] == "none"
             assert context["request_text_inspection"] == (
                 "cached_decision" if cached else "scanned"
