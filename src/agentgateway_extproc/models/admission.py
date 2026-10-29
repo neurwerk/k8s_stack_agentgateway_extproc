@@ -71,7 +71,7 @@ class AdmissionContext(AdmissionModel):
     ) = None
     protocol_profile: ProfileId
     operation_id: Identifier
-    provider_credential_source: Literal["caller_supplied", "company", "none"]
+    provider_credential_source: Literal["override", "global", "none"]
     policy_revision: Identifier
     permissions: tuple[Permission, ...] = Field(max_length=1024)
 
@@ -106,7 +106,7 @@ class AdmissionContext(AdmissionModel):
         if any(present) and not all(present):
             raise ValueError("credential fields must be paired")  # noqa: TRY003
         if self.provider_id is None and (
-            self.provider_credential_source == "company"
+            self.provider_credential_source == "global"
             or (self.destination_kind != "mcp" and self.provider_credential_source != "none")
         ):
             raise ValueError("credential mode requires a provider")  # noqa: TRY003
@@ -163,11 +163,11 @@ class RequestContext(AdmissionContext):
     resolved_model: ModelId
     dispatch_binding_id: Identifier
     dispatch_destination_id: ModelId
-    target_credential_mode: Literal["caller_supplied", "company", "none"]
+    target_credential_mode: Literal["override", "global", "none"]
     request_text_inspection: RequestTextInspection = "unknown"
     pii_policy: PiiPolicy
     content_tracing_enabled: bool
-    billing_classification: Literal["company_api", "personal_api", "subscription", "unknown"]
+    billing_classification: Literal["global_api", "override_api", "subscription", "unknown"]
     usage_completeness: Literal["known", "partial", "unknown"] = "unknown"
 
 
@@ -187,7 +187,7 @@ class McpRequestContext(AdmissionContext):
 class AdmissionEnvelope(AdmissionModel):
     """Lock a single upstream binding and its body-selectable model catalog."""
 
-    contract_version: Literal[5]
+    contract_version: Literal[6]
     request_context: AdmissionContext
     destination_policy: Annotated[DestinationPolicy, Field(discriminator="destination_kind")]
     model_bindings: FrozenMap[ModelId, ModelBinding] = Field(max_length=256)
@@ -260,8 +260,8 @@ class AdmissionEnvelope(AdmissionModel):
         binding = self.model_bindings[model]
         required = set(binding.required_permissions)
         context = self.request_context
-        if context.provider_credential_source == "company":
-            required.add(f"provider:{context.provider_id}:company-use")
+        if context.provider_credential_source == "global":
+            required.add(f"provider:{context.provider_id}:global-use")
         if not required <= set(context.permissions):
             raise GatewayPolicyError("permission_denied")
         return RequestContext(
@@ -275,14 +275,14 @@ class AdmissionEnvelope(AdmissionModel):
             pii_policy=PiiPolicy(enabled=policy.models[model]),
             content_tracing_enabled=binding.content_tracing_enabled,
             billing_classification=(
-                "company_api" if context.provider_credential_source == "company" else "unknown"
+                "global_api" if context.provider_credential_source == "global" else "unknown"
             ),
         )
 
     def resolve_reroute(self, context: RequestContext, target_id: str | None) -> RequestContext:
-        """Authorize one pre-dispatch local transition; personal credentials never move."""
+        """Authorize one pre-dispatch local transition; override credentials never move."""
         if (
-            context.provider_credential_source != "company"
+            context.provider_credential_source != "global"
             or target_id is None
             or target_id not in self.model_bindings[context.destination_id].allowed_reroutes
             or target_id not in self.reroute_targets
@@ -341,7 +341,7 @@ def metadata_from_request(
             ),
         )
         return AdmissionEnvelope.model_validate(
-            {**payload, "contract_version": 5} if payload.get("contract_version") == 5 else payload
+            {**payload, "contract_version": 6} if payload.get("contract_version") == 6 else payload
         )
     except TrustedMetadataError:
         raise

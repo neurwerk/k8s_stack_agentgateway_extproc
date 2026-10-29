@@ -32,7 +32,7 @@ CREDENTIAL = "provider-credential-sentinel"
 @pytest.fixture(params=["anthropic", "google"])
 def native(request):
     kind = request.param
-    admission = json.loads((FIXTURES / "admission-v5.json").read_text())
+    admission = json.loads((FIXTURES / "admission-v6.json").read_text())
     context = admission["request_context"]
     context.update(
         entry_mode="forward_proxy",
@@ -272,7 +272,7 @@ async def test_native_inspection_routing_and_metadata(native, native_engine, pii
     assert metadata["requested_model"] == model
     assert metadata["usage_completeness"] == metadata["billing_classification"] == "unknown"
     assert metadata["request_text_inspection"] == ("scanned" if pii else "disabled")
-    assert metadata["target_credential_mode"] == "caller_supplied"
+    assert metadata["target_credential_mode"] == "override"
     assert CREDENTIAL not in str(reply) + repr(vars(handler))
     assert not any(
         h.header.key == ":path" for h in reply.request_body.response.header_mutation.set_headers

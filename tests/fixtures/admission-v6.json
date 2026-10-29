@@ -1,5 +1,5 @@
 {
-  "contract_version": 5,
+  "contract_version": 6,
   "request_context": {
     "request_id": "example-request",
     "principal_id": "example-subject",
@@ -12,7 +12,7 @@
     "binding_id": "openai-api",
     "protocol_profile": "openai-chat-completions-v1",
     "operation_id": "create",
-    "provider_credential_source": "caller_supplied",
+    "provider_credential_source": "override",
     "policy_revision": "example-revision",
     "permissions": ["llm:invoke", "model:example-chat:invoke"]
   },

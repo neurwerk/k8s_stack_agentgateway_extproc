@@ -94,9 +94,9 @@ async def collect(engine_client, messages, replies, context):
 
 
 def allow_local_reroute(admission):
-    admission["request_context"]["provider_credential_source"] = "company"
+    admission["request_context"]["provider_credential_source"] = "global"
     admission["request_context"]["permissions"].extend(
-        ["provider:openai:company-use", "model:local:invoke"]
+        ["provider:openai:global-use", "model:local:invoke"]
     )
     admission["model_bindings"]["example-chat"]["allowed_reroutes"] = ["local"]
     admission["reroute_targets"] = {

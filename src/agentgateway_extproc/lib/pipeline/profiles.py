@@ -148,7 +148,7 @@ def request_headers(  # noqa: C901
     source = admission.request_context.provider_credential_source
     supplied = set(names) & PROVIDER_CREDENTIAL_HEADERS
     preserved: frozenset[str] = frozenset()
-    if source == "caller_supplied":
+    if source == "override":
         if not supplied:
             raise GatewayPolicyError("provider_credential_required")
         if supplied != profile.credential_headers:

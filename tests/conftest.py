@@ -122,7 +122,7 @@ def header_request(
                 ":path": f"/bindings/{binding}/v1/{operation}",
                 "content-type": "application/json",
             } | supplied
-            if policy.get("contract_version") != 5 and supplied[":path"].startswith("/v1/"):
+            if policy.get("contract_version") != 6 and supplied[":path"].startswith("/v1/"):
                 supplied[":path"] = "/bindings/test-binding" + supplied[":path"]
     values = [
         shared_envoy_pb2.HeaderValue(key=key, raw_value=value.encode())
@@ -205,7 +205,7 @@ def add_policy(
     """Attach the current admission envelope around the selected policy fixture."""
     if policy is not None:
         envelope = policy
-        if policy.get("contract_version") != 5 and policy.get("destination_kind") in {
+        if policy.get("contract_version") != 6 and policy.get("destination_kind") in {
             "model",
             "mcp",
         }:
@@ -217,7 +217,7 @@ def add_policy(
                 permissions.append(f"mcp:{policy.get('destination_id')}:invoke")
             else:
                 permissions.extend(f"model:{name}:invoke" for name in models)
-                permissions.extend(["provider:test:company-use", "model:local:invoke"])
+                permissions.extend(["provider:test:global-use", "model:local:invoke"])
             context = {
                 "request_id": "0123456789abcdef0123456789abcdef",
                 "principal_id": policy.get("principal_id"),
@@ -232,12 +232,12 @@ def add_policy(
                 if mcp
                 else "openai-chat-completions-v1",
                 "operation_id": "exchange" if mcp else "create",
-                "provider_credential_source": "none" if mcp else "company",
+                "provider_credential_source": "none" if mcp else "global",
                 "policy_revision": "test-policy",
                 "permissions": list(dict.fromkeys(permissions)),
             }
             envelope = {
-                "contract_version": 5,
+                "contract_version": 6,
                 "request_context": context,
                 "destination_policy": policy,
                 "model_bindings": {}
