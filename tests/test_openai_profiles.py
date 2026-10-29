@@ -18,6 +18,7 @@ from agentgateway_extproc.lib.pipeline.diagnostics import diagnostic_json
 from agentgateway_extproc.lib.pipeline.openai_response import validate_json_response
 from agentgateway_extproc.lib.pipeline.sse import SseDecoder
 from agentgateway_extproc.lib.pipeline.stream_handler import StreamHandler
+from agentgateway_extproc.models.openai_response import ChatChunk
 
 from .conftest import (
     REVERSIBLE_TOKEN,
@@ -34,6 +35,41 @@ from .test_fail_closed import FakeAioContext, StreamAbortedError
 from .test_reasoning import reasoning_engine as reasoning_engine
 
 SENTINEL = "synthetic-sentinel"
+
+
+def test_ollama_timings_are_numeric_metadata_only():
+    chunk = stream_events("chat")[-2]
+    chunk["timings"] = {"prompt_n": 509, "prompt_ms": 254, "predicted_per_second": 54.47}
+    assert ChatChunk.model_validate(chunk).timings == chunk["timings"]
+    for invalid in ({"prompt_ms": {"content": "private"}}, {"prompt_ms": "private"}):
+        chunk["timings"] = invalid
+        with pytest.raises(ValidationError):
+            ChatChunk.model_validate(chunk)
+
+
+async def test_ollama_final_timings_pass_through_stream(admission, reasoning_engine):
+    engine_client, _ = reasoning_engine
+    handler = StreamHandler(engine_client)
+    for message in request_messages(admission, "chat", stream=True):
+        await handler.handle(message)
+    handler.response_notice_allowed = False
+    await handler.handle(response_headers("text/event-stream", policy=admission))
+    events = stream_events("chat")
+    events[-2]["timings"] = {"prompt_n": 509, "prompt_ms": 254, "predicted_ms": 257}
+    emitted = b""
+    for event in events:
+        reply = await handler.handle(
+            response_body(event_bytes("chat", event), end_of_stream=False, policy=admission)
+        )
+        if reply is not None:
+            emitted += reply.response_body.response.body_mutation.streamed_response.body
+    reply = await handler.handle(response_body(b"", policy=None))
+    assert reply is not None
+    assert reply.response_body.response.body_mutation.streamed_response.end_of_stream
+    emitted += reply.response_body.response.body_mutation.streamed_response.body
+    frames = SseDecoder().feed(emitted.decode(), final=True)
+    assert json.loads(frames[-2].data)["timings"] == events[-2]["timings"]
+    assert frames[-1].data == "[DONE]"
 
 
 def request_messages(admission, kind, *, stream):
