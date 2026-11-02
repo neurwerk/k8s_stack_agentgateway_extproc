@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from typing import Literal, cast
@@ -10,6 +11,8 @@ from agentgateway_extproc.gen import ext_proc_pb2, shared_envoy_pb2
 from agentgateway_extproc.models.admission import AdmissionEnvelope
 from agentgateway_extproc.models.exceptions import GatewayPolicyError
 from agentgateway_extproc.models.types import PROVIDER_CREDENTIAL_HEADERS, REQUEST_HEADERS
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -100,11 +103,26 @@ def request_headers(  # noqa: C901
     """Validate transport while keeping credential values out of retained state."""
     items = request.request_headers.headers.headers
     names = [item.key.lower() for item in items]
-    if any(item.raw_value and item.value for item in items) or (
+    ambiguous = {name for name in names if name in REQUEST_HEADERS and names.count(name) > 1} | {
+        item.key.lower()
+        for item in items
+        if item.key.lower() in REQUEST_HEADERS and item.raw_value and item.value
+    }
+    if any(
+        item.raw_value and item.value and item.key.lower() not in REQUEST_HEADERS for item in items
+    ) or (
         admission.request_context.destination_kind == "model"
-        and any(names.count(name) > 1 for name in _RETAINED_HEADERS | REQUEST_HEADERS)
+        and any(names.count(name) > 1 for name in _RETAINED_HEADERS)
     ):
         raise GatewayPolicyError("invalid_request")
+    for name in sorted(
+        ambiguous
+        | (
+            set(names)
+            & {"authorization-neurwerk", "x-neurwerk-authorization", "x-neurwerk-credential-mode"}
+        )
+    ):
+        logger.warning("Ignoring header %s", name)
     headers: dict[str, str] = {
         item.key.lower(): header_value(item)
         for item in items
@@ -146,7 +164,11 @@ def request_headers(  # noqa: C901
     ):
         raise GatewayPolicyError("unsupported_feature")
     source = admission.request_context.provider_credential_source
-    supplied = set(names) & PROVIDER_CREDENTIAL_HEADERS
+    supplied = (set(names) & PROVIDER_CREDENTIAL_HEADERS) - ambiguous
+    ignored = supplied - (profile.credential_headers if source == "override" else set())
+    for name in sorted(ignored):
+        logger.warning("Ignoring header %s", name)
+    supplied -= ignored
     preserved: frozenset[str] = frozenset()
     if source == "override":
         if not supplied:
@@ -164,8 +186,7 @@ def request_headers(  # noqa: C901
                 )
                 is None
             ):
+                logger.warning("Ignoring header %s", item.key.lower())
                 raise GatewayPolicyError("invalid_provider_credential")
         preserved = profile.credential_headers
-    elif source == "none" and supplied:
-        raise GatewayPolicyError("invalid_provider_credential")
     return headers, [name for name in names if name in REQUEST_HEADERS and name not in preserved]

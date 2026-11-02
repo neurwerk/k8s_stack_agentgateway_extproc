@@ -26,6 +26,7 @@ CONTEXTFORGE_ACCOUNT_HEADER = "x-contextforge-account-email"
 REQUEST_HEADERS = {
     CONTEXTFORGE_ACCOUNT_HEADER,
     "authorization",
+    "authorization-neurwerk",
     "proxy-authorization",
     "x-api-key",
     "x-goog-api-key",

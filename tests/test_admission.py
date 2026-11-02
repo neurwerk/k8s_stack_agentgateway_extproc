@@ -336,6 +336,12 @@ async def test_wrong_transport_or_credential_location_is_rejected_without_retent
     admission, engine_client, field, value
 ):
     handler = StreamHandler(engine_client)
+    if field in {"x-api-key", "x-goog-api-key", "cookie"}:
+        reply = await handler.handle(header_request(headers(**{field: value}), policy=admission))
+        assert reply is not None
+        assert field in reply.request_headers.response.header_mutation.remove_headers
+        assert SECRET not in repr(vars(handler)) + str(reply)
+        return
     with pytest.raises(GatewayPolicyError):
         await handler.handle(header_request(headers(**{field: value}), policy=admission))
     assert handler.request_headers == {}
@@ -343,8 +349,9 @@ async def test_wrong_transport_or_credential_location_is_rejected_without_retent
 
 
 @pytest.mark.parametrize("codex", [False, True])
+@pytest.mark.parametrize("legacy_form", ["single", "duplicate", "combined"])
 async def test_sensitive_headers_are_preserved_or_removed_without_value_copies(
-    admission, engine_client, caplog, codex
+    admission, engine_client, caplog, codex, legacy_form
 ):
     caplog.set_level("DEBUG")
     if codex:
@@ -352,6 +359,7 @@ async def test_sensitive_headers_are_preserved_or_removed_without_value_copies(
     original = headers(
         **{
             "x-neurwerk-authorization": f"Bearer {SECRET}",
+            "Authorization-Neurwerk": f"Bearer {SECRET}",
             "proxy-authorization": SECRET,
             "x-agentgateway-auth-context": SECRET,
             "X-Neurwerk-Credential-Mode": SECRET,
@@ -362,6 +370,18 @@ async def test_sensitive_headers_are_preserved_or_removed_without_value_copies(
             {":path": "/bindings/openai-api/v1/responses", "chatgpt-account-id": "account-1"}
         )
     event = header_request(original, policy=admission)
+    for item in list(event.request_headers.headers.headers):
+        if item.key.lower() in {
+            "authorization-neurwerk",
+            "x-neurwerk-authorization",
+            "x-neurwerk-credential-mode",
+        }:
+            if legacy_form == "duplicate":
+                event.request_headers.headers.headers.add(
+                    key=item.key.swapcase(), raw_value=item.raw_value
+                )
+            elif legacy_form == "combined":
+                item.raw_value += b", " + item.raw_value
     handler = StreamHandler(engine_client)
     reply = await handler.handle(event)
     assert reply is not None
@@ -376,6 +396,7 @@ async def test_sensitive_headers_are_preserved_or_removed_without_value_copies(
         assert upstream["chatgpt-account-id"] == "account-1"
     assert set(mutation.remove_headers) == {
         "x-neurwerk-authorization",
+        "authorization-neurwerk",
         "proxy-authorization",
         "x-agentgateway-auth-context",
         "x-neurwerk-credential-mode",
@@ -397,15 +418,19 @@ async def test_sensitive_headers_are_preserved_or_removed_without_value_copies(
             extra_headers={
                 "set-cookie": SECRET,
                 "authorization": SECRET,
+                "Authorization-Neurwerk": SECRET,
                 "X-Neurwerk-Credential-Mode": SECRET,
             },
             policy=admission,
         )
     )
     assert response is not None
-    assert {"set-cookie", "authorization", "x-neurwerk-credential-mode"} <= set(
-        response.response_headers.response.header_mutation.remove_headers
-    )
+    assert {
+        "set-cookie",
+        "authorization",
+        "authorization-neurwerk",
+        "x-neurwerk-credential-mode",
+    } <= set(response.response_headers.response.header_mutation.remove_headers)
     assert SECRET not in repr(vars(handler)) + str(response) + caplog.text
 
 
@@ -832,7 +857,8 @@ async def test_in_band_provider_error_never_echoes_error_content(
 
 
 @pytest.mark.parametrize(
-    "invalid", ["missing", "duplicate", "conflicting_encodings", "no_credential_mode", "length"]
+    "invalid",
+    ["missing", "duplicate", "combined", "conflicting_encodings", "no_credential_mode", "length"],
 )
 async def test_ambiguous_or_missing_transport_is_rejected(admission, engine_client, invalid):
     event = header_request(headers(), policy=admission)
@@ -844,9 +870,16 @@ async def test_ambiguous_or_missing_transport_is_rejected(admission, engine_clie
         )
     elif invalid == "conflicting_encodings":
         event.request_headers.headers.headers[-1].value = "Bearer another-credential"
+    elif invalid == "combined":
+        event.request_headers.headers.headers[-1].raw_value += f", Bearer {SECRET}".encode()
     elif invalid == "no_credential_mode":
         admission["request_context"]["provider_credential_source"] = "none"
         event = header_request(headers(), policy=admission)
+        reply = await StreamHandler(engine_client).handle(event)
+        assert reply is not None
+        assert "authorization" in reply.request_headers.response.header_mutation.remove_headers
+        assert SECRET not in str(reply)
+        return
     else:
         event = header_request(headers(**{"content-length": "99999"}), policy=admission)
     with patch.object(engine_client, "analyze_request", new_callable=AsyncMock) as analyze:
