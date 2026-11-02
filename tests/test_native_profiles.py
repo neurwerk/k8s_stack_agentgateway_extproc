@@ -386,6 +386,11 @@ async def test_native_request_failures_precede_analysis(native, native_engine, f
     replies = [
         reply async for reply in ExtProcServicer(client, settings).Process(requests(), object())
     ]
+    if failure == "credential":
+        assert "authorization" in replies[0].request_headers.response.header_mutation.remove_headers
+        assert not replies[-1].HasField("immediate_response")
+        assert CREDENTIAL not in str(replies)
+        return
     assert replies[-1].HasField("immediate_response")
     assert replies[-1].immediate_response.status.code in {400, 403, 413}
     assert calls == []
