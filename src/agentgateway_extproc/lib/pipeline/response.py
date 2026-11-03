@@ -947,7 +947,8 @@ class SseResponseProcessor:
                         {"index": index, "delta": {"content": tail}, "finish_reason": None}
                     ],
                 }
-                chat_events.append(SseEvent(lines=[("data", _json_dumps(payload))]).render())
+                if not self._hold_chat_tail(index, payload):
+                    chat_events.append(SseEvent(lines=[("data", _json_dumps(payload))]).render())
             elif coordinates := self._responses_text_coordinates.get(key):
                 responses.append((coordinates, tail))
         if not responses:
@@ -972,6 +973,27 @@ class SseResponseProcessor:
         self._increment_held_sequences(len(responses))
         return [*chat_events, *response_events]
 
+    def _hold_chat_tail(self, index: int, tail_payload: dict[str, Any]) -> bool:
+        """Place an EOF marker after buffered text but before its choice finishes."""
+        for position, event in enumerate(self._held):
+            payload = _event_payload(event)
+            if payload is None:
+                continue
+            for choice in payload.get("choices", []):
+                if choice.get("index") != index or choice.get("finish_reason") is None:
+                    continue
+                # A finish may carry the last text itself. Move it ahead of the marker.
+                content = choice["delta"].get("content")
+                if isinstance(content, str) and content:
+                    tail_payload["choices"][0]["delta"]["content"] = (
+                        content + tail_payload["choices"][0]["delta"]["content"]
+                    )
+                    choice["delta"]["content"] = ""
+                    event.replace_data(_json_dumps(payload))
+                self._held.insert(position, SseEvent(lines=[("data", _json_dumps(tail_payload))]))
+                return True
+        return False
+
     def _first_held_sequence(self) -> int:
         for event in self._held:
             payload = _event_payload(event)
@@ -991,7 +1013,18 @@ class SseResponseProcessor:
         notice_event = self._chat_notice_event(notice)
         if notice_event is None:
             return [event.render() for event in self._held]
-        return [notice_event.render()] + [event.render() for event in self._held]
+        output = [event.render() for event in self._held]
+        position = next(
+            (
+                index
+                for index, event in enumerate(self._held)
+                if (payload := _event_payload(event)) is not None
+                and self._chat_finishes_notice_target(payload)
+            ),
+            0,
+        )
+        output.insert(position, notice_event.render())
+        return output
 
     def _chat_notice_event(self, notice: str) -> SseEvent | None:
         index = self._chat_notice_index

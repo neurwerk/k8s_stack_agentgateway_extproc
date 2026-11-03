@@ -185,6 +185,39 @@ async def test_chat_finish_without_done_does_not_emit_notice(admission, reasonin
     assert b"PII protection notice" not in emitted
 
 
+async def test_chat_held_choices_keep_detached_markers_after_text(admission, reasoning_engine):
+    engine_client, _ = reasoning_engine
+    handler = await notice_handler(admission, engine_client, "chat", stream=True)
+    events = stream_events("chat", text="First <REV_")
+    later = stream_events("chat", text="Last <REV_")[:-2]
+    for event in later:
+        event["choices"][0]["index"] = 1
+    # Also exercise a finish carrying the last fragment rather than an empty delta.
+    later[-1]["choices"][0]["delta"] = {"content": "Last <REV_"}
+    del later[1:3]
+    events[-2:-2] = later
+    emitted = b""
+    for event in events:
+        reply = await handler.handle(
+            response_body(event_bytes("chat", event), end_of_stream=False, policy=admission)
+        )
+        emitted += reply.response_body.response.body_mutation.streamed_response.body
+    reply = await handler.handle(response_body(b"", policy=None))
+    emitted += reply.response_body.response.body_mutation.streamed_response.body
+    frames = SseDecoder().feed(emitted.decode(), final=True)
+    choices = [choice for frame in frames[:-1] for choice in json.loads(frame.data)["choices"]]
+    for index, prefix in enumerate(("First ", "Last ")):
+        own = [choice for choice in choices if choice["index"] == index]
+        text = "".join(choice["delta"].get("content", "") for choice in own)
+        assert text.startswith(prefix + "<PII_INVALID_")
+        assert own[-1]["finish_reason"] == "stop"
+        assert "PII protection notice" not in own[-1]["delta"].get("content", "")
+        if index == 0:
+            assert text.index("<PII_INVALID_") < text.index("PII protection notice")
+        else:
+            assert "PII protection notice" not in text
+
+
 @pytest.mark.parametrize("tools", [False, True])
 async def test_responses_stream_notice_matches_snapshots(admission, reasoning_engine, tools):
     engine_client, _ = reasoning_engine
