@@ -18,6 +18,7 @@ from agentgateway_extproc.lib.pipeline.diagnostics import diagnostic_json
 from agentgateway_extproc.lib.pipeline.openai_response import validate_json_response
 from agentgateway_extproc.lib.pipeline.sse import SseDecoder
 from agentgateway_extproc.lib.pipeline.stream_handler import StreamHandler
+from agentgateway_extproc.models.exceptions import InvalidReversalError
 from agentgateway_extproc.models.openai_response import ChatChunk
 
 from .conftest import (
@@ -91,6 +92,129 @@ async def collect(engine_client, messages, replies, context):
 
     async for reply in ExtProcServicer(engine_client).Process(requests(), context):
         replies.append(reply)
+
+
+async def notice_handler(admission, engine_client, kind, *, stream):
+    handler = StreamHandler(engine_client)
+    for message in request_messages(admission, kind, stream=stream):
+        await handler.handle(message)
+    handler.response_notice_allowed = True
+    await handler.handle(
+        response_headers("text/event-stream" if stream else "application/json", policy=admission)
+    )
+    return handler
+
+
+@pytest.mark.parametrize("kind", ["chat", "responses"])
+@pytest.mark.parametrize("tools", [False, True])
+async def test_json_tool_execution_suppresses_only_notice(admission, reasoning_engine, kind, tools):
+    engine_client, _ = reasoning_engine
+    handler = await notice_handler(admission, engine_client, kind, stream=False)
+    reply = await handler.handle(
+        response_body(json.dumps(response_payload(kind, tools=tools)).encode(), policy=admission)
+    )
+    emitted = reply.response_body.response.body_mutation.streamed_response.body
+    actual = json.loads(emitted)
+    text = (
+        actual["choices"][0]["message"]["content"]
+        if kind == "chat"
+        else actual["output"][0]["content"][0]["text"]
+    )
+    assert text.startswith("Jane Doe")
+    assert text.count("PII protection notice — powered by neurwerk") == (0 if tools else 1)
+    if tools:
+        tool = (
+            actual["choices"][0]["message"]["tool_calls"][0]["function"]
+            if kind == "chat"
+            else actual["output"][1]
+        )
+        assert json.loads(tool["arguments"]) == {"person": "Jane Doe", "count": 1}
+    assert handler.restored_counts == {"PERSON": 1}
+
+
+@pytest.mark.parametrize("late_choice", [False, True])
+async def test_chat_stream_tools_suppress_notice_through_done(
+    admission, reasoning_engine, late_choice
+):
+    engine_client, _ = reasoning_engine
+    handler = await notice_handler(admission, engine_client, "chat", stream=True)
+    events = stream_events("chat", tools=True)
+    if late_choice:
+        # Choice zero finishes before choice one's tool call even starts.
+        finish = deepcopy(events[-3])
+        finish["choices"][0]["finish_reason"] = "stop"
+        events.insert(3, finish)
+        for event in events[4:-2]:
+            event["choices"][0]["index"] = 1
+        start = deepcopy(events[0])
+        start["choices"][0]["index"] = 1
+        events.insert(4, start)
+    emitted = b""
+    for index, event in enumerate(events):
+        reply = await handler.handle(
+            response_body(event_bytes("chat", event), end_of_stream=False, policy=admission)
+        )
+        emitted += reply.response_body.response.body_mutation.streamed_response.body
+        if index == 2:
+            assert b"Jane Doe" in emitted  # Earlier text still streams before the held finish.
+    reply = await handler.handle(response_body(b"", policy=None))
+    emitted += reply.response_body.response.body_mutation.streamed_response.body
+    assert b"PII protection notice" not in emitted
+    frames = SseDecoder().feed(emitted.decode(), final=True)
+    assert frames[-1].data == "[DONE]"
+    choices = [choice for frame in frames[:-1] for choice in json.loads(frame.data)["choices"]]
+    arguments = "".join(
+        tool["function"].get("arguments", "")
+        for choice in choices
+        for tool in choice["delta"].get("tool_calls", [])
+    )
+    assert json.loads(arguments) == {"person": "Jane Doe", "count": 1}
+
+
+async def test_chat_finish_without_done_does_not_emit_notice(admission, reasoning_engine):
+    engine_client, _ = reasoning_engine
+    handler = await notice_handler(admission, engine_client, "chat", stream=True)
+    emitted = b""
+    for event in stream_events("chat")[:-1]:
+        reply = await handler.handle(
+            response_body(event_bytes("chat", event), end_of_stream=False, policy=admission)
+        )
+        emitted += reply.response_body.response.body_mutation.streamed_response.body
+    with pytest.raises(InvalidReversalError):
+        await handler.handle(response_body(b"", policy=None))
+    assert b"PII protection notice" not in emitted
+
+
+@pytest.mark.parametrize("tools", [False, True])
+async def test_responses_stream_notice_matches_snapshots(admission, reasoning_engine, tools):
+    engine_client, _ = reasoning_engine
+    handler = await notice_handler(admission, engine_client, "responses", stream=True)
+    emitted = b""
+    for event in stream_events("responses", tools=tools, empty_terminal=tools):
+        reply = await handler.handle(
+            response_body(event_bytes("responses", event), end_of_stream=False, policy=admission)
+        )
+        emitted += reply.response_body.response.body_mutation.streamed_response.body
+    reply = await handler.handle(response_body(b"", policy=None))
+    emitted += reply.response_body.response.body_mutation.streamed_response.body
+    events = [json.loads(frame.data) for frame in SseDecoder().feed(emitted.decode(), final=True)]
+    text = "".join(
+        event["delta"] for event in events if event["type"] == "response.output_text.delta"
+    )
+    assert text.startswith("Jane Doe")
+    assert text.count("PII protection notice — powered by neurwerk") == (0 if tools else 1)
+    assert (
+        next(event["text"] for event in events if event["type"] == "response.output_text.done")
+        == text
+    )
+    completed = [event["item"] for event in events if event["type"] == "response.output_item.done"]
+    assert completed[0]["content"][0]["text"] == text
+    if tools:
+        assert b"PII protection notice" not in emitted
+        assert json.loads(completed[1]["arguments"]) == {"person": "Jane Doe", "count": 1}
+        assert events[-1]["response"]["output"] == []
+    else:
+        assert events[-1]["response"]["output"] == completed
 
 
 def allow_local_reroute(admission):
