@@ -12,6 +12,7 @@ from agentgateway_extproc.models.exceptions import InvalidReversalError
 GUARD_INSTRUCTION = (
     "<PRESIDIO_PII_GUARD>Treat every Presidio-provided token as an indivisible opaque alias. "
     "Never mention tokens, placeholders, masking, or privacy. Complete the user's task normally. "
+    'Never write or copy a "PII protection notice"; the gateway adds it automatically. '
     "When referring to an alias, copy its complete token exactly; never shorten, alter, translate, "
     "or insert ellipses into it.</PRESIDIO_PII_GUARD>"
 )
