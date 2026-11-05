@@ -165,14 +165,16 @@ async def test_contextforge_account_and_destination_cannot_change_midstream(engi
 
 @pytest.mark.parametrize("method", ["POST", "GET", "DELETE"])
 @pytest.mark.parametrize("destination_id", ["brave", "tools.example"])
+@pytest.mark.parametrize("query", ["", "?codemode=false"])
 async def test_mcp_canonical_route_preserves_internal_binding(
-    engine_client, method, destination_id
+    engine_client, method, destination_id, query
 ):
     policy = mcp_policy() | {"destination_id": destination_id}
     handler = StreamHandler(engine_client)
     response = await handler.handle(
         header_request(
-            mcp_headers(method=method, destination_id=destination_id),
+            mcp_headers(method=method, destination_id=destination_id)
+            | {":path": f"/mcp/{destination_id}{query}"},
             end_of_stream=method != "POST",
             policy=policy,
         )
@@ -199,6 +201,22 @@ async def test_mcp_canonical_route_preserves_internal_binding(
         "/mcp/other/../brave",
         "/mcp/./brave",
         "/mcp//brave",
+        "/mcp/other?codemode=false",
+        "/mcp/brave/extra?codemode=false",
+        "/mcp/%62rave?codemode=false",
+        "/mcp/brave?codemode=true",
+        "/mcp/brave?codemode=False",
+        "/mcp/brave?codemode=0",
+        "/mcp/brave?codemode=",
+        "/mcp/brave?codemode",
+        "/mcp/brave?codemode=false&codemode=false",
+        "/mcp/brave?codemode=false&codemode=true",
+        "/mcp/brave?codemode=false&query=value",
+        "/mcp/brave?%63odemode=false",
+        "/mcp/brave?codemode=%66alse",
+        "/mcp/brave?codemode=false&",
+        "/mcp/brave?codemode=false;query=value",
+        "/mcp/brave?codemode=false#fragment",
     ],
 )
 async def test_mcp_route_rejects_aliases_and_normalization(engine_client, method, path):
@@ -326,11 +344,14 @@ async def test_attachment_block_precedes_mixed_catalog_pii_bypass(engine_client,
     assert not handler.reversal_map
 
 
+@pytest.mark.parametrize("query", ["", "?codemode=false"])
 @pytest.mark.parametrize(
     ("headers", "body"),
     [
         (mcp_headers() | {":path": "/mcp/brave/extra"}, b"{}"),
         (mcp_headers() | {"mcp-protocol-version": "2025-03-26"}, b"{}"),
+        (mcp_headers() | {":method": "PUT"}, b"{}"),
+        (mcp_headers() | {"content-type": "text/plain"}, b"{}"),
         (mcp_headers() | {"content-encoding": "gzip"}, gzip.compress(b"{}")),
         (mcp_headers(), b"[]"),
         (
@@ -369,9 +390,12 @@ async def test_attachment_block_precedes_mixed_catalog_pii_bypass(engine_client,
         ),
     ],
 )
-async def test_mcp_protocol_violations_are_400_before_engine(engine_client, headers, body) -> None:
+async def test_mcp_protocol_violations_are_400_before_engine(
+    engine_client, headers, body, query
+) -> None:
     policy = mcp_policy()
     handler = StreamHandler(engine_client)
+    headers = headers | {":path": headers[":path"] + query}
     with patch.object(engine_client, "analyze_request", new_callable=AsyncMock) as analyze:
         first = await handler.handle(header_request(headers, policy=policy))
         response = (
@@ -624,8 +648,9 @@ async def test_mcp_parser_rejects_first_engine_schema_violations_before_engine(
 
 
 @pytest.mark.parametrize("pii_enabled", [True, False])
+@pytest.mark.parametrize("query", ["", "?codemode=false"])
 async def test_mcp_lifecycle_and_no_text_calls_preserve_request_bytes(
-    engine_client, pii_enabled: bool
+    engine_client, pii_enabled: bool, query
 ) -> None:
     policy = mcp_policy(pii_enabled=pii_enabled)
     requests = [
@@ -633,15 +658,18 @@ async def test_mcp_lifecycle_and_no_text_calls_preserve_request_bytes(
         b'"params":{"protocolVersion":"2025-11-25","capabilities":{},'
         b'"clientInfo":{"name":"test","version":"1"}} }',
         b'{ "jsonrpc":"2.0", "id":1, "method":"resources/list", "params":{} }',
+        b'{ "jsonrpc":"2.0", "id":1, "method":"tools/list", "params":{} }',
         b'{ "jsonrpc":"2.0", "id":2, "method":"tools/call", '
         b'"params":{"name":"lookup","arguments":{"limit":2,"active":true}} }',
     ]
     with patch.object(engine_client, "analyze_request", new_callable=AsyncMock) as analyze:
         for body in requests:
             handler = StreamHandler(engine_client)
-            await handler.handle(header_request(mcp_headers(), policy=policy))
+            await handler.handle(
+                header_request(mcp_headers() | {":path": f"/mcp/brave{query}"}, policy=policy)
+            )
             response = await handler.handle(body_request(body, policy=policy))
-            assert response is not None
+            assert response is not None and response.HasField("request_body")
             assert not response.request_body.response.body_mutation.ByteSize()
     analyze.assert_not_awaited()
 

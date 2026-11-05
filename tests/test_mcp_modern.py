@@ -141,8 +141,9 @@ async def test_mirrored_parameter_headers_cannot_bypass_pii(engine_client, pii_e
 
 
 @pytest.mark.parametrize("sse", [False, True])
+@pytest.mark.parametrize("query", ["", "?codemode=false"])
 async def test_modern_tool_call_masks_arguments_and_reverses_result(
-    engine_client, engine_reply, sse
+    engine_client, engine_reply, sse, query
 ):
     payload = modern_request(name="search", arguments={"query": "Jane Doe"})
     engine_reply["request"] = {
@@ -152,7 +153,9 @@ async def test_modern_tool_call_masks_arguments_and_reverses_result(
     engine_reply["notices"] = {"request": [], "response": []}
     policy = mcp_policy()
     handler = StreamHandler(engine_client)
-    await handler.handle(header_request(modern_headers(), policy=policy))
+    await handler.handle(
+        header_request(modern_headers() | {":path": f"/mcp/brave{query}"}, policy=policy)
+    )
     response = await handler.handle(body_request(json.dumps(payload).encode(), policy=policy))
     assert response is not None
     forwarded = json.loads(response.request_body.response.body_mutation.body)
