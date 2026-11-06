@@ -1103,14 +1103,12 @@ def request_mutation(
         if value
     ]
     header_mutation = {"set_headers": set_headers}
-    body_mutation: dict[str, bytes] | None = None
     if mutate_body:
-        body_mutation = {"body": body}
         header_mutation["set_headers"].append(
             {"header": {"key": "content-length", "value": str(len(body))}, "append_action": 2}
         )
     common = ext_proc_pb2.CommonResponse(header_mutation=header_mutation)
-    if body_mutation is not None:
+    if mutate_body:
         common.body_mutation.CopyFrom(ext_proc_pb2.BodyMutation(body=body))
     response = ext_proc_pb2.ProcessingResponse(
         request_body=ext_proc_pb2.BodyResponse(response=common)

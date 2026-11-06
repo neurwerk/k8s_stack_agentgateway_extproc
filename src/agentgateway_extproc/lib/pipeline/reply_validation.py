@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import re
 from typing import cast
 
 from neurwerk_request_segments.models import EngineChatRequest, EngineResponsesRequest
@@ -82,25 +81,20 @@ def _restore_reversal_leaves(
     seen: set[str] = set()
     restored_by_entity: dict[str, int] = {}
     consumed: dict[tuple[tuple[PathPart, ...], str], int] = {}
-    current_path: tuple[PathPart, ...] = ()
-
-    def restore(match: re.Match[str]) -> str:
-        placeholder = match.group(0)
-        plaintext = reversal.get(placeholder)
-        if plaintext is None:
-            raise InvalidEngineReplyError(  # noqa: TRY003
-                "transformed request and reversal entries differ"
-            )
-        seen.add(placeholder)
-        entity_type = entities_by_placeholder[placeholder]
-        restored_by_entity[entity_type] = restored_by_entity.get(entity_type, 0) + 1
-        key = (current_path, plaintext)
-        consumed[key] = consumed.get(key, 0) + 1
-        return plaintext
 
     for path, transformed_text in transformed_leaves.items():
-        current_path = path
-        REVERSIBLE_CANDIDATE_RE.sub(restore, transformed_text)
+        for match in REVERSIBLE_CANDIDATE_RE.finditer(transformed_text):
+            placeholder = match.group(0)
+            plaintext = reversal.get(placeholder)
+            if plaintext is None:
+                raise InvalidEngineReplyError(  # noqa: TRY003
+                    "transformed request and reversal entries differ"
+                )
+            seen.add(placeholder)
+            entity_type = entities_by_placeholder[placeholder]
+            restored_by_entity[entity_type] = restored_by_entity.get(entity_type, 0) + 1
+            key = (path, plaintext)
+            consumed[key] = consumed.get(key, 0) + 1
     for (path, plaintext), count in consumed.items():
         if original_leaves.get(path, "").count(plaintext) < count:
             raise InvalidEngineReplyError(  # noqa: TRY003
