@@ -1041,14 +1041,7 @@ class SseResponseProcessor:
         coordinates = self._responses_coordinates
         if coordinates is None:
             return [event.render() for event in self._held]
-        sequence = 0
-        for event in self._held:
-            if event.data == "[DONE]":
-                continue
-            payload = strict_json_loads(event.data)
-            if isinstance(payload, dict) and isinstance(payload.get("sequence_number"), int):
-                sequence = payload["sequence_number"]
-                break
+        sequence = self._first_held_sequence()
         delta = {
             "type": "response.output_text.delta",
             "item_id": coordinates[0],
