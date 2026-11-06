@@ -23,6 +23,7 @@ dependencies = [
     "pypdf>=6.0,<7",
     "pillow==12.2.0",
     "pi-heif==1.4.0",
+    "numpy>=2",
     "opencv-python-headless==4.13.0.92",
     "uvicorn[standard]>=0.30",
 ]
