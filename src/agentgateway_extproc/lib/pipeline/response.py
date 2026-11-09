@@ -27,6 +27,7 @@ from agentgateway_extproc.lib.pipeline.openai_response import (
 from agentgateway_extproc.lib.pipeline.reasoning import response_receipts
 from agentgateway_extproc.lib.pipeline.sse import SseDecoder, SseEvent
 from agentgateway_extproc.metrics import invalid_placeholder_total
+from agentgateway_extproc.models.destination import ModelDestinationPolicy
 from agentgateway_extproc.models.exceptions import InvalidReversalError
 from agentgateway_extproc.models.types import RESERVED_PLACEHOLDER_PREFIX_RE
 
@@ -53,7 +54,7 @@ def _json_dumps(value: Any) -> str:
 
 
 def _local_chat_dispatch(handler: StreamHandler) -> bool:
-    """Recognize only the approved local reroute selected during admission."""
+    """Select timestamp compatibility from the actual trusted local Chat target."""
     admission = handler.admission
     context = handler.request_context
     if (
@@ -63,11 +64,21 @@ def _local_chat_dispatch(handler: StreamHandler) -> bool:
         or context.target_credential_mode != "none"
     ):
         return False
+    if context.dispatch_destination_id == context.destination_id:
+        policy = admission.destination_policy
+        model = admission.model_bindings.get(context.destination_id)
+        return (
+            context.dispatch_binding_id == admission.request_context.binding_id
+            and isinstance(policy, ModelDestinationPolicy)
+            and policy.local_models.get(context.destination_id, False)
+            and model is not None
+            and model.normalize_stream_created
+        )
     target = admission.reroute_targets.get(context.dispatch_destination_id)
     return (
         target is not None
-        and context.dispatch_destination_id != context.destination_id
         and context.dispatch_binding_id == target.binding_id
+        and target.normalize_stream_created
     )
 
 
@@ -647,7 +658,7 @@ class SseResponseProcessor:
                 and self._profile.identity is not None
                 and isinstance(payload, dict)
             ):
-                # Ollama timestamps each chunk; expose one stable creation time to clients.
+                # Configured local runtimes may timestamp each chunk independently.
                 payload["created"] = self._profile.identity[2]
         if not isinstance(payload, dict):
             raise InvalidReversalError("SSE event data must be a JSON object")

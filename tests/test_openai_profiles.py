@@ -266,12 +266,17 @@ def allow_local_reroute(admission):
     }
 
 
-@pytest.mark.parametrize("reroute", [False, True])
+@pytest.mark.parametrize(
+    "reroute, normalize", [(False, True), (True, None), (True, True), (True, False)]
+)
 async def test_local_reroute_stabilizes_chat_created_and_emits_notice(
-    admission, reasoning_engine, reroute
+    admission, reasoning_engine, reroute, normalize
 ):
     engine_client, state = reasoning_engine
     allow_local_reroute(admission)
+    admission["model_bindings"]["example-chat"]["normalize_stream_created"] = not normalize
+    if normalize is not None:
+        admission["reroute_targets"]["local"]["normalize_stream_created"] = normalize
     state["reroute"] = reroute
     events = stream_events("chat")
     created = events[0]["created"]
@@ -287,7 +292,7 @@ async def test_local_reroute_stabilizes_chat_created_and_emits_notice(
         response_body(b"", policy=None),
     ]
     replies, context = [], FakeAioContext()
-    if not reroute:
+    if not reroute or normalize is False:
         with pytest.raises(StreamAbortedError):
             await collect(engine_client, messages, replies, context)
         assert context.code == grpc.StatusCode.INTERNAL
@@ -320,8 +325,56 @@ async def test_local_reroute_stabilizes_chat_created_and_emits_notice(
     assert "Effective route: `local`." in text
 
 
+@pytest.mark.parametrize("normalize", [None, False, True])
+@pytest.mark.parametrize("pii", [False, True])
+async def test_direct_local_stream_created_setting(admission, reasoning_engine, normalize, pii):
+    engine_client, _ = reasoning_engine
+    admission["request_context"]["provider_credential_source"] = "none"
+    admission["destination_policy"]["local_models"]["example-chat"] = True
+    admission["destination_policy"]["models"]["example-chat"] = pii
+    if normalize is not None:
+        admission["model_bindings"]["example-chat"]["normalize_stream_created"] = normalize
+    events = stream_events("chat")
+    created = events[0]["created"]
+    for index, event in enumerate(events[1:-1], start=1):
+        event["created"] = created + index
+    messages = [
+        *request_messages(admission, "chat", stream=True),
+        response_headers("text/event-stream", policy=admission),
+        *(
+            response_body(event_bytes("chat", event), end_of_stream=False, policy=admission)
+            for event in events
+        ),
+        response_body(b"", policy=None),
+    ]
+    replies, context = [], FakeAioContext()
+    if not normalize:
+        with pytest.raises(StreamAbortedError):
+            await collect(engine_client, messages, replies, context)
+    else:
+        await collect(engine_client, messages, replies, context)
+    emitted = b"".join(
+        reply.response_body.response.body_mutation.streamed_response.body
+        for reply in replies
+        if reply.HasField("response_body")
+    )
+    frames = SseDecoder().feed(emitted.decode(), final=True)
+    if not normalize:
+        assert context.code == grpc.StatusCode.INTERNAL
+        assert all(frame.data != "[DONE]" for frame in frames)
+        return
+    assert context.code is None
+    assert frames[-1].data == "[DONE]"
+    chunks = [json.loads(frame.data) for frame in frames[:-1]]
+    assert all(chunk["created"] == created for chunk in chunks)
+    if pii:
+        assert b"Jane Doe" in emitted
+        assert REVERSIBLE_TOKEN.encode() not in emitted
+
+
 @pytest.mark.parametrize(
-    ("field", "value"), [("id", "changed"), ("model", "changed"), ("created", "invalid")]
+    ("field", "value"),
+    [("id", "changed"), ("model", "changed"), ("created", "invalid"), ("created", True)],
 )
 async def test_local_reroute_rejects_changed_identity_or_invalid_timestamp(
     admission, reasoning_engine, field, value
@@ -347,6 +400,46 @@ async def test_local_reroute_rejects_changed_identity_or_invalid_timestamp(
         )
     assert context.code == grpc.StatusCode.INTERNAL
     assert not any(reply.HasField("response_body") for reply in replies)
+
+
+@pytest.mark.parametrize("failure", ["late_timestamp", "missing_done"])
+async def test_normalized_stream_requires_valid_late_chunks_and_completion(
+    admission, reasoning_engine, failure
+):
+    engine_client, state = reasoning_engine
+    allow_local_reroute(admission)
+    state["reroute"] = True
+    admission["reroute_targets"]["local"]["normalize_stream_created"] = True
+    events = stream_events("chat")
+    if failure == "late_timestamp":
+        events[-2]["created"] = True
+    else:
+        events.pop()
+    replies, context = [], FakeAioContext()
+    with pytest.raises(StreamAbortedError):
+        await collect(
+            engine_client,
+            [
+                *request_messages(admission, "chat", stream=True),
+                response_headers("text/event-stream", policy=admission),
+                *(
+                    response_body(event_bytes("chat", event), end_of_stream=False, policy=admission)
+                    for event in events
+                ),
+                response_body(b"", policy=None),
+            ],
+            replies,
+            context,
+        )
+    emitted = b"".join(
+        reply.response_body.response.body_mutation.streamed_response.body
+        for reply in replies
+        if reply.HasField("response_body")
+    )
+    assert emitted
+    assert b"[DONE]" not in emitted
+    assert b"PII protection notice" not in emitted
+    assert context.code == grpc.StatusCode.INTERNAL
 
 
 @pytest.mark.parametrize("index", [None, 0, 127], ids=["absent", "zero", "upper-bound"])

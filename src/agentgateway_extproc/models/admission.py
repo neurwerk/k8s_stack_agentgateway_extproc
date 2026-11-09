@@ -120,6 +120,7 @@ class ModelBinding(AdmissionModel):
     required_permissions: tuple[Permission, ...] = Field(min_length=2, max_length=64)
     content_tracing_enabled: bool
     allowed_reroutes: tuple[ModelId, ...] = Field(default=(), max_length=32)
+    normalize_stream_created: bool = False
 
     @field_validator("allowed_reroutes", mode="before")
     @classmethod
@@ -147,6 +148,8 @@ class LocalDispatchTarget(AdmissionModel):
     upstream_model: ModelId
     required_permissions: tuple[Permission, ...] = Field(min_length=2, max_length=64)
     content_tracing_enabled: bool
+    # Older admission metadata already enabled normalization for local reroutes.
+    normalize_stream_created: bool = True
 
     @field_validator("required_permissions", mode="before")
     @classmethod
