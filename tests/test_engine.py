@@ -126,7 +126,9 @@ async def test_source_only_reply_keeps_policy_separate_from_text_scans(engine_re
                 )
 
 
-@pytest.mark.parametrize("case", ["cached", "current-text-row", "mutated", "reversal", "scan"])
+@pytest.mark.parametrize(
+    "case", ["cached", "conflict-block", "current-text-row", "mutated", "reversal", "scan"]
+)
 async def test_source_only_cached_reroute_preserves_historical_text_evidence(engine_reply, case):
     source = "MCP_TOOL_SALESFORCE"
     original = _chat("current business text")
@@ -155,7 +157,20 @@ async def test_source_only_cached_reroute_preserves_historical_text_evidence(eng
         duration_ms=None,
         cached_decision_applied=True,
     )
-    if case == "current-text-row":
+    if case == "conflict-block":
+        engine_reply.update(
+            decision="block",
+            route_class=None,
+            applied_actions=["block"],
+            request=None,
+            report={
+                "rows": [
+                    {**row, "entity_type": "IBAN_CODE", "action": "block"},
+                    {**row, "action": "block"},
+                ]
+            },
+        )
+    elif case == "current-text-row":
         engine_reply["report"]["rows"].insert(
             0, {**row, "entity_type": "IBAN_CODE", "action": "reroute"}
         )
@@ -167,12 +182,13 @@ async def test_source_only_cached_reroute_preserves_historical_text_evidence(eng
         engine_reply["analysis"].update(scan_performed=True, duration_ms=1)
     client = _client_returning(200, json.dumps(segment_reply(engine_reply)).encode())
     try:
-        if case == "cached":
+        if case in {"cached", "conflict-block"}:
             reply = await client.analyze_request(
                 original, "a" * 64, text_pii_enabled=False, mcp_sources=[source]
             )
-            assert reply.decision == "reroute" and reply.route_class == "local"
-            assert reply.request == original
+            assert reply.decision == ("block" if case == "conflict-block" else "reroute")
+            assert reply.route_class == (None if case == "conflict-block" else "local")
+            assert reply.request == (None if case == "conflict-block" else original)
             assert reply.entities == ["IBAN_CODE", source]
         else:
             with pytest.raises(InvalidEngineReplyError):

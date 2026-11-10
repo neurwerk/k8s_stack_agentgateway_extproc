@@ -311,10 +311,10 @@ def _validate_source_reply(
             raise InvalidEngineReplyError
     current_entities = set(reply.entities)
     if reply.analysis.cached_decision_applied:
-        # Combined replies retain historical entities; only current report rows are findings.
+        # Cached conflict blocks also merge historical report rows, but forward no content.
         current_entities = (
             {row.entity_type for row in reply.report.rows}
-            if reply.analysis.source == "current_request"
+            if reply.analysis.source == "current_request" and reply.decision != "block"
             else set()
         )
     if not text_pii_enabled and (
