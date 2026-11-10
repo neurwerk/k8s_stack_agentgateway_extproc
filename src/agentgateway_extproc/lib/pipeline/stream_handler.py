@@ -141,6 +141,7 @@ class StreamHandler:
         self.sse_processor: SseResponseProcessor | McpSseResponseProcessor | None = None
         self.native_sse_processor: NativeSseProcessor | None = None
         self.guard_injected = False
+        self.mcp_sources: list[str] = []
         self.request_processed = False
         self.max_request_bytes = limits.max_request_bytes
         self.max_reasoning_fingerprints = limits.max_reasoning_fingerprints
@@ -192,6 +193,7 @@ class StreamHandler:
         self.sse_processor = None
         self.native_sse_processor = None
         self.guard_injected = False
+        self.mcp_sources.clear()
         self.gzip_decompressor = None
         self.response_decoder = _utf8_decoder()
         self.destination_policy = None
@@ -767,6 +769,7 @@ class StreamHandler:
         return (
             isinstance(policy, McpDestinationPolicy)
             and not policy.pii_enabled
+            and (self.mcp_context is None or self.mcp_context.method != "tools/call")
             and not self._modern_protocol_error()
         )
 

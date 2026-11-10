@@ -12,6 +12,8 @@ from neurwerk_request_segments import extract_request, parse_request
 from agentgateway_extproc.config.settings import EngineSettings, Settings
 from agentgateway_extproc.controllers.grpc_servicer import ExtProcServicer
 from agentgateway_extproc.lib.engine.client import EngineClient
+from agentgateway_extproc.lib.pipeline.guard import GUARD_INSTRUCTION
+from agentgateway_extproc.lib.pipeline.mcp_sources import source_marker
 from agentgateway_extproc.lib.pipeline.sse import SseDecoder
 from agentgateway_extproc.lib.pipeline.stream_handler import StreamHandler
 from agentgateway_extproc.models.exceptions import GatewayPolicyError, TrustedMetadataError
@@ -218,6 +220,73 @@ def sse_bytes(kind, events):
         + f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
         for event in events
     ).encode()
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_native_source_history_labels_early_text_with_pii_disabled(
+    native, source_engine, streaming
+):
+    kind, admission, headers, payload = native
+    client, calls = source_engine
+    admission["destination_policy"]["models"]["example-chat"] = False
+    marker = source_marker(["MCP_TOOL_SALESFORCE"])
+    if kind == "anthropic":
+        payload["messages"][0]["content"] = marker + "business"
+        payload["stream"] = streaming
+    else:
+        payload["contents"][0]["parts"][0]["text"] = marker + "business"
+        if not streaming:
+            admission["request_context"]["operation_id"] = "generateContent"
+            headers[":path"] = "/v1beta/models/provider-chat:generateContent"
+    handler = StreamHandler(client)
+    await handler.handle(header_request(headers, policy=admission))
+    await handler.handle(body_request(encoded(payload), policy=admission))
+    assert calls[0]["mcp_sources"] == ["MCP_TOOL_SALESFORCE"]
+    assert calls[0]["text_pii_enabled"] is False
+    await handler.handle(
+        response_headers("text/event-stream" if streaming else "application/json", policy=admission)
+    )
+    text = GUARD_INSTRUCTION + "Summary"
+    if not streaming:
+        reply = await handler.handle(
+            response_body(encoded(json_response(kind, text)), policy=admission)
+        )
+        assert reply is not None
+        result = json.loads(reply.response_body.response.body_mutation.streamed_response.body)
+        actual = (
+            result["content"][0]["text"]
+            if kind == "anthropic"
+            else result["candidates"][0]["content"]["parts"][0]["text"]
+        )
+        assert actual == marker + "Summary"
+        return
+    early = ""
+    for event in stream_events(kind, text):
+        reply = await handler.handle(
+            response_body(sse_bytes(kind, [event]), end_of_stream=False, policy=admission)
+        )
+        if reply is not None:
+            early += reply.response_body.response.body_mutation.streamed_response.body.decode()
+        if "Summary" in early:
+            assert "NEURWERK_MCP_SOURCES" in early
+    reply = await handler.handle(response_body(b"", policy=None))
+    assert reply is not None
+    frames = [json.loads(frame.data) for frame in SseDecoder().feed(early, final=True)]
+    if kind == "anthropic":
+        actual = "".join(
+            frame["delta"]["text"]
+            for frame in frames
+            if frame["type"] == "content_block_delta" and frame["delta"]["type"] == "text_delta"
+        )
+    else:
+        actual = "".join(
+            part["text"]
+            for frame in frames
+            for candidate in frame.get("candidates", [])
+            for part in candidate.get("content", {}).get("parts", [])
+            if "text" in part
+        )
+    assert actual == marker + "Summary"
 
 
 def test_native_segments_roundtrip_and_controls(native):

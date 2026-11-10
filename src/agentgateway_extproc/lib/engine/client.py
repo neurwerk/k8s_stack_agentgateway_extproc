@@ -14,6 +14,7 @@ from neurwerk_request_segments import ExtractedRequest, TextSegment
 
 from agentgateway_extproc.config.settings import EngineSettings
 from agentgateway_extproc.lib.json_limits import JsonBudgetError, strict_json_loads
+from agentgateway_extproc.lib.pipeline.mcp_sources import SOURCE_PATTERN, source_union
 from agentgateway_extproc.lib.request_segments import extract_request
 from agentgateway_extproc.metrics import engine_request_latency_seconds, engine_requests_total
 from agentgateway_extproc.models.engine import (
@@ -142,6 +143,7 @@ class EngineClient:
         document: bool = False,
         text_pii_enabled: bool = True,
         visual_findings: VisualFindings | None = None,
+        mcp_sources: list[str] | None = None,
         correlation_id: str | None = None,
     ) -> EngineReply:
         """Send only opaque segments and rebuild the validated reply locally."""
@@ -149,6 +151,7 @@ class EngineClient:
         outcome = "error"
         correlation_id = _correlation_id(correlation_id)
         extracted = extract_request(request)
+        sources = _request_sources(mcp_sources, extracted.request_kind)
         wire: dict[str, object] = {
             "api_version": "v2",
             "request_kind": extracted.request_kind,
@@ -157,12 +160,7 @@ class EngineClient:
             "text_pii_enabled": text_pii_enabled,
             "attachments_present": extracted.attachments_present,
         }
-        if (visual_findings is not None and not document) or (
-            visual_findings is None and not text_pii_enabled
-        ):
-            raise ValueError("visual controls require the document envelope")  # noqa: TRY003
-        if visual_findings is not None:
-            wire["visual_findings"] = visual_findings.model_dump()
+        wire.update(_analysis_controls(document, text_pii_enabled, visual_findings, sources))
         try:
             async with (
                 asyncio.timeout(self._settings.timeout),
@@ -180,8 +178,9 @@ class EngineClient:
                 )
             try:
                 payload = _parse_reply_json(content)
-                reply = _rebuild_reply(payload, extracted)
+                reply = _rebuild_reply(payload, extracted, sources, text_pii_enabled)
                 _validate_visual_reply(reply, request, visual_findings, text_pii_enabled)
+                _validate_source_reply(reply, request, sources, text_pii_enabled)
             except InvalidEngineReplyError:
                 raise
             except (KeyError, TypeError, ValueError) as exc:
@@ -206,7 +205,33 @@ class EngineClient:
             )
 
 
-def _rebuild_reply(payload: object, extracted: ExtractedRequest) -> EngineReply:
+def _analysis_controls(
+    document: bool, text_pii_enabled: bool, findings: VisualFindings | None, sources: list[str]
+) -> dict[str, object]:
+    if (findings is not None and not document) or (
+        findings is None and not text_pii_enabled and not sources
+    ):
+        raise ValueError("visual controls require the document envelope")  # noqa: TRY003
+    controls: dict[str, object] = {}
+    if sources:
+        controls["mcp_sources"] = sources
+    if findings is not None:
+        controls["visual_findings"] = findings.model_dump()
+    return controls
+
+
+def _request_sources(sources: list[str] | None, kind: str) -> list[str]:
+    sources = source_union(sources or [])
+    if any(len(source) > 64 or re.fullmatch(SOURCE_PATTERN, source) is None for source in sources):
+        raise ValueError("invalid MCP source classification")  # noqa: TRY003
+    if sources and kind == "mcp":
+        raise ValueError("MCP sources require a model request")  # noqa: TRY003
+    return sources
+
+
+def _rebuild_reply(
+    payload: object, extracted: ExtractedRequest, sources: list[str], text_pii_enabled: bool
+) -> EngineReply:
     """Validate the v2 shape and preserve every local provider control."""
     if not isinstance(payload, dict) or payload.get("api_version") != "v2" or "request" in payload:
         raise InvalidEngineReplyError
@@ -223,7 +248,9 @@ def _rebuild_reply(payload: object, extracted: ExtractedRequest) -> EngineReply:
         )
     # The request-bearing object is an internal pipeline convenience only.
     reply = EngineReply.model_validate(
-        {**payload, "api_version": "v1", "request": rebuilt}, strict=True
+        {**payload, "api_version": "v1", "request": rebuilt},
+        strict=True,
+        context={"mcp_sources": sources, "text_pii_enabled": text_pii_enabled},
     )
     if (
         rebuilt is not None
@@ -259,8 +286,33 @@ def _validate_visual_reply(
             raise InvalidEngineReplyError
     elif (
         reply.analysis.scan_performed
-        or set(reply.entities) - {"FACE"}
+        or any(entity != "FACE" and not entity.startswith("MCP_TOOL_") for entity in reply.entities)
         or reply.reversal
+        or (reply.request is not None and reply.request != request)
+        or set(reply.applied_actions) - {"pass", "block", "text-only", "reroute"}
+    ):
+        raise InvalidEngineReplyError
+
+
+def _validate_source_reply(
+    reply: EngineReply, request: EngineRequest, sources: list[str], text_pii_enabled: bool
+) -> None:
+    """Keep source policy facts separate from text scans and transformations."""
+    if reply.decision != "block" and not set(sources) <= set(reply.entities):
+        raise InvalidEngineReplyError
+    for row in reply.report.rows:
+        if row.entity_type.startswith("MCP_TOOL_") and (
+            row.action not in {"pass", "block", "reroute"}
+            or row.detected_count != 1
+            or row.transformed_count
+            or row.unique_transformed_count
+            or (not reply.analysis.cached_decision_applied and row.entity_type not in sources)
+        ):
+            raise InvalidEngineReplyError
+    if not text_pii_enabled and (
+        reply.analysis.scan_performed
+        or reply.reversal
+        or any(entity != "FACE" and not entity.startswith("MCP_TOOL_") for entity in reply.entities)
         or (reply.request is not None and reply.request != request)
         or set(reply.applied_actions) - {"pass", "block", "text-only", "reroute"}
     ):

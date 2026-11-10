@@ -14,6 +14,7 @@ from agentgateway_extproc.gen import ext_proc_pb2
 from agentgateway_extproc.lib.masking.reversal import placeholder_entity_prefixes
 from agentgateway_extproc.lib.pipeline.diagnostics import policy_block_message
 from agentgateway_extproc.lib.pipeline.guard import GUARD_INSTRUCTION
+from agentgateway_extproc.lib.pipeline.mcp_sources import collect_sources
 from agentgateway_extproc.lib.pipeline.profiles import (
     google_model_path,
     model_profile,
@@ -81,10 +82,15 @@ async def process_native_request(  # noqa: C901
         and request.generationConfig.responseMimeType == "application/json"
     )
     # Extraction limits apply even to PII-disabled native requests.
-    extract_request(request)
+    handler.mcp_sources = collect_sources(
+        segment.text for segment in extract_request(request).segments
+    )
     handler.request_body_chunks.clear()
-    if context.pii_policy.enabled:
-        request = cast(AnthropicRequest | GoogleRequest, _literalize_request_placeholders(request))
+    if context.pii_policy.enabled or handler.mcp_sources:
+        if handler.text_pii_enabled:
+            request = cast(
+                AnthropicRequest | GoogleRequest, _literalize_request_placeholders(request)
+            )
         conversation = handler.request_headers.get("x-session-id") or handler.request_headers.get(
             "x-conversation-id"
         )
@@ -96,10 +102,15 @@ async def process_native_request(  # noqa: C901
             request_nonce=handler.request_nonce,
         )
         reply = await handler.client.analyze_request(
-            request, key, correlation_id=handler.correlation_id
+            request,
+            key,
+            text_pii_enabled=handler.text_pii_enabled,
+            mcp_sources=handler.mcp_sources,
+            correlation_id=handler.correlation_id,
         )
         validate_request_mutation(request, reply)
-        validate_reversal(request, reply)
+        if handler.text_pii_enabled:
+            validate_reversal(request, reply)
         # Nonterminal replies also carry content classification in route_class.
         if reply.decision == "reroute":
             handler.request_context = admission.resolve_reroute(context, reply.route_class)

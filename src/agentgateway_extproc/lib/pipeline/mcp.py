@@ -20,6 +20,11 @@ from mcp_types.methods import validate_client_request, validate_server_result
 
 from agentgateway_extproc.lib.json_limits import strict_json_loads
 from agentgateway_extproc.lib.masking.reversal import reverse_placeholders
+from agentgateway_extproc.lib.pipeline.mcp_sources import (
+    collect_sources,
+    prefix_sources,
+    source_union,
+)
 from agentgateway_extproc.lib.pipeline.sse import SseDecoder
 from agentgateway_extproc.models.destination import McpDestinationPolicy
 from agentgateway_extproc.models.engine import EngineMcpRequest, JsonValue
@@ -464,10 +469,35 @@ def _process_mcp_response_payload(handler: StreamHandler, payload: Any, text: st
         if _mcp_pii_enabled(handler):
             _reject_candidates(payload)
         return text
-    if not _mcp_pii_enabled(handler):
-        return text
-    transformed = _reverse_tool_response(handler, payload)
+    transformed = _reverse_tool_response(handler, payload) if _mcp_pii_enabled(handler) else payload
+    transformed = _stamp_tool_response(handler, transformed)
     return text if transformed == payload else _json_dumps(transformed)
+
+
+def _stamp_tool_response(handler: StreamHandler, payload: dict[str, Any]) -> dict[str, Any]:
+    """Label only tools/call text, keeping structured and protocol fields unchanged."""
+    from copy import deepcopy
+
+    policy = handler.destination_policy
+    if not isinstance(policy, McpDestinationPolicy):
+        raise McpProtocolError("MCP response has no destination policy")
+    transformed = deepcopy(payload)
+    result = transformed.get("result")
+    content = result.get("content") if isinstance(result, dict) else None
+    if isinstance(content, list):
+        blocks = [
+            block
+            for block in content
+            if isinstance(block, dict)
+            and block.get("type") == "text"
+            and isinstance(block.get("text"), str)
+        ]
+        sources = source_union(
+            [policy.source_class], collect_sources(block["text"] for block in blocks)
+        )
+        for block in blocks:
+            block["text"] = prefix_sources(block["text"], sources)
+    return transformed
 
 
 def _safe_modern_error(payload: dict[str, Any], status: int, requested: str) -> str:

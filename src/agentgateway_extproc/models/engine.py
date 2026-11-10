@@ -94,7 +94,7 @@ from neurwerk_request_segments.models import (
 from neurwerk_request_segments.models import (
     McpRequestId as McpRequestId,
 )
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
 from agentgateway_extproc.models.exceptions import (
     MAX_ENGINE_ERROR_MESSAGE_LENGTH,
@@ -314,12 +314,15 @@ class EngineReply(EngineModel):
             raise ValueError("FACE report action must be applied")  # noqa: TRY003
         if faces.scan_status == "failed" and self.decision != "block":
             raise ValueError("failed visual scans must block")  # noqa: TRY003
-        if not self.analysis.scan_performed and (set(self.entities) - {"FACE"} or self.reversal):
+        if not self.analysis.scan_performed and (
+            any(entity != "FACE" and not entity.startswith("MCP_TOOL_") for entity in self.entities)
+            or self.reversal
+        ):
             raise ValueError("unscanned text cannot report text findings or reversal")  # noqa: TRY003
         return self
 
     @model_validator(mode="after")
-    def validate_decision_shape(self) -> EngineReply:  # noqa: C901
+    def validate_decision_shape(self, info: ValidationInfo) -> EngineReply:  # noqa: C901
         """Require mutations and routing flags to agree with the decision."""
         actions = set(self.applied_actions)
         if len(self.entities) != len(set(self.entities)):
@@ -346,7 +349,12 @@ class EngineReply(EngineModel):
             and not self.analysis.scan_performed
             and self.decision != "block"
         )
-        if unscanned_current_success and self.visual_findings is None:
+        source_only = bool(
+            info.context
+            and info.context.get("mcp_sources")
+            and info.context.get("text_pii_enabled") is False
+        )
+        if unscanned_current_success and self.visual_findings is None and not source_only:
             if not _is_no_text_mcp_request(self.request):
                 raise ValueError(  # noqa: TRY003
                     "unscanned current success requires a no-text MCP request"

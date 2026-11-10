@@ -15,6 +15,8 @@ from agentgateway_extproc.controllers.grpc_servicer import ExtProcServicer
 from agentgateway_extproc.gen import ext_proc_pb2
 from agentgateway_extproc.lib.engine.client import EngineClient
 from agentgateway_extproc.lib.pipeline.diagnostics import diagnostic_json
+from agentgateway_extproc.lib.pipeline.guard import GUARD_INSTRUCTION
+from agentgateway_extproc.lib.pipeline.mcp_sources import source_marker
 from agentgateway_extproc.lib.pipeline.openai_response import validate_json_response
 from agentgateway_extproc.lib.pipeline.sse import SseDecoder
 from agentgateway_extproc.lib.pipeline.stream_handler import StreamHandler
@@ -36,6 +38,140 @@ from .test_fail_closed import FakeAioContext, StreamAbortedError
 from .test_reasoning import reasoning_engine as reasoning_engine
 
 SENTINEL = "synthetic-sentinel"
+
+
+@pytest.mark.parametrize("kind", ["chat", "responses"])
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("structured", [False, True])
+async def test_source_history_enforced_and_labels_precede_text_without_notices(
+    admission, source_engine, kind, streaming, structured
+):
+    client, calls = source_engine
+    admission["destination_policy"]["models"]["example-chat"] = False
+    messages = request_messages(admission, kind, stream=streaming)
+    old = source_marker(["MCP_TOOL_SALESFORCE"]) + "business"
+    tool = source_marker(["MCP_TOOL_BRAVE"]) + "lookup"
+    payload = json.loads(messages[1].request_body.body)
+    if kind == "chat":
+        payload["messages"] = [
+            {"role": "assistant", "content": old},
+            {"role": "tool", "tool_call_id": "call-1", "content": tool},
+            {"role": "user", "content": "Summarize the full history"},
+        ]
+        if structured:
+            payload["response_format"] = {"type": "json_object"}
+    else:
+        payload["input"] = [
+            {"type": "message", "role": "assistant", "content": old},
+            {"type": "function_call_output", "call_id": "call-1", "output": tool},
+            {"type": "reasoning", "summary": [{"type": "summary_text", "text": old}]},
+            {"type": "message", "role": "user", "content": "Summarize the full history"},
+        ]
+        if structured:
+            payload["text"] = {"format": {"type": "json_object"}}
+    handler = StreamHandler(client)
+    await handler.handle(messages[0])
+    request = await handler.handle(body_request(json.dumps(payload).encode(), policy=admission))
+    assert request is not None
+    assert calls[0]["mcp_sources"] == ["MCP_TOOL_BRAVE", "MCP_TOOL_SALESFORCE"]
+    assert calls[0]["text_pii_enabled"] is False
+    forwarded = json.loads(request.request_body.response.body_mutation.body)
+    assert (
+        forwarded["messages"][0]["content"] if kind == "chat" else forwarded["instructions"]
+    ) == GUARD_INSTRUCTION
+    handler.response_notice_allowed = False
+    await handler.handle(
+        response_headers("text/event-stream" if streaming else "application/json", policy=admission)
+    )
+    marker = source_marker(["MCP_TOOL_BRAVE", "MCP_TOOL_SALESFORCE"])
+    text = '{"summary":"business"}' if structured else GUARD_INSTRUCTION + marker + "Summary"
+    expected = text if structured else marker + marker + "Summary"
+    if not streaming:
+        reply = await handler.handle(
+            response_body(json.dumps(response_payload(kind, text=text)).encode(), policy=admission)
+        )
+        assert reply is not None
+        result = json.loads(reply.response_body.response.body_mutation.streamed_response.body)
+        actual = (
+            result["choices"][0]["message"]["content"]
+            if kind == "chat"
+            else result["output"][0]["content"][0]["text"]
+        )
+        assert actual == expected
+        return
+    emitted = ""
+    early = ""
+    for event in stream_events(kind, text=text):
+        reply = await handler.handle(
+            response_body(event_bytes(kind, event), end_of_stream=False, policy=admission)
+        )
+        if reply is not None:
+            fragment = reply.response_body.response.body_mutation.streamed_response.body.decode()
+            emitted += fragment
+            if isinstance(event, dict) and (
+                event.get("type") == "response.output_text.delta"
+                or (
+                    kind == "chat"
+                    and event.get("choices")
+                    and "content" in event["choices"][0]["delta"]
+                )
+            ):
+                early += fragment
+    reply = await handler.handle(response_body(b"", policy=None))
+    assert reply is not None
+    emitted += reply.response_body.response.body_mutation.streamed_response.body.decode()
+    frames = [
+        json.loads(frame.data)
+        for frame in SseDecoder().feed(emitted, final=True)
+        if frame.data != "[DONE]"
+    ]
+    if kind == "chat":
+        actual = "".join(
+            choice["delta"].get("content", "")
+            for frame in frames
+            for choice in frame.get("choices", [])
+        )
+    else:
+        actual = "".join(
+            frame["delta"] for frame in frames if frame["type"] == "response.output_text.delta"
+        )
+        assert (
+            next(frame["text"] for frame in frames if frame["type"] == "response.output_text.done")
+            == expected
+        )
+        assert frames[-1]["response"]["output"][0]["content"][0]["text"] == expected
+    assert actual == expected
+    assert ("NEURWERK_MCP_SOURCES" in early) is not structured
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_source_labels_do_not_create_text_in_tool_only_output(
+    admission, source_engine, streaming
+):
+    client, _ = source_engine
+    admission["destination_policy"]["models"]["example-chat"] = False
+    messages = request_messages(admission, "chat", stream=streaming)
+    payload = json.loads(messages[1].request_body.body)
+    payload["messages"][0]["content"] = source_marker(["MCP_TOOL_SALESFORCE"]) + "business"
+    handler = StreamHandler(client)
+    await handler.handle(messages[0])
+    await handler.handle(body_request(json.dumps(payload).encode(), policy=admission))
+    handler.response_notice_allowed = False
+    await handler.handle(
+        response_headers("text/event-stream" if streaming else "application/json", policy=admission)
+    )
+    if streaming:
+        events = stream_events("chat", text="", tools=True)
+        wire = b"".join(event_bytes("chat", event) for event in events)
+    else:
+        output = response_payload("chat", text="", tools=True)
+        output["choices"][0]["message"]["content"] = None
+        wire = json.dumps(output).encode()
+    reply = await handler.handle(response_body(wire, policy=admission))
+    assert reply is not None
+    emitted = reply.response_body.response.body_mutation.streamed_response.body
+    assert b"NEURWERK_MCP_SOURCES" not in emitted
+    assert b"tool_calls" in emitted
 
 
 def test_ollama_timings_are_numeric_metadata_only():

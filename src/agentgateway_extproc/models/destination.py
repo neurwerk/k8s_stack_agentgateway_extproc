@@ -251,6 +251,9 @@ class McpDestinationPolicy(DestinationModel):
     pii_enabled: bool
     content_tracing_enabled: bool = False
     contextforge: bool = False
+    source_class: str = Field(
+        default="MCP_TOOL_DEFAULT", max_length=64, pattern=r"^MCP_TOOL_[A-Z0-9_]+$"
+    )
 
     @field_validator("principal_id")
     @classmethod
