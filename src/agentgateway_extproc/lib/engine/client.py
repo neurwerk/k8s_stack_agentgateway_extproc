@@ -309,10 +309,20 @@ def _validate_source_reply(
             or (not reply.analysis.cached_decision_applied and row.entity_type not in sources)
         ):
             raise InvalidEngineReplyError
+    current_entities = set(reply.entities)
+    if reply.analysis.cached_decision_applied:
+        # Combined replies retain historical entities; only current report rows are findings.
+        current_entities = (
+            {row.entity_type for row in reply.report.rows}
+            if reply.analysis.source == "current_request"
+            else set()
+        )
     if not text_pii_enabled and (
         reply.analysis.scan_performed
         or reply.reversal
-        or any(entity != "FACE" and not entity.startswith("MCP_TOOL_") for entity in reply.entities)
+        or any(
+            entity != "FACE" and not entity.startswith("MCP_TOOL_") for entity in current_entities
+        )
         or (reply.request is not None and reply.request != request)
         or set(reply.applied_actions) - {"pass", "block", "text-only", "reroute"}
     ):

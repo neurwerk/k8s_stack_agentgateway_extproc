@@ -1022,6 +1022,9 @@ class SseResponseProcessor:
         chat_events: list[str] = []
         responses: list[tuple[tuple[str, int, int], str]] = []
         for key, tail in detached:
+            carrier = {"text": tail}
+            self._prefix_stream_sources(carrier, "text", key)
+            tail = carrier["text"]
             if key.startswith("chat:") and key.endswith(":content"):
                 index = int(key.split(":", 2)[1])
                 payload = {

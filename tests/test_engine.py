@@ -126,6 +126,63 @@ async def test_source_only_reply_keeps_policy_separate_from_text_scans(engine_re
                 )
 
 
+@pytest.mark.parametrize("case", ["cached", "current-text-row", "mutated", "reversal", "scan"])
+async def test_source_only_cached_reroute_preserves_historical_text_evidence(engine_reply, case):
+    source = "MCP_TOOL_SALESFORCE"
+    original = _chat("current business text")
+    row = {
+        "entity_type": source,
+        "action": "pass",
+        "detected_count": 1,
+        "transformed_count": 0,
+        "unique_transformed_count": 0,
+    }
+    # The combined reply keeps historical IBAN entities, but reports only current sources.
+    engine_reply.update(
+        decision="reroute",
+        remote_allowed=False,
+        route_class="local",
+        entities=["IBAN_CODE", source],
+        entity_counts={"IBAN_CODE": 1, source: 1},
+        applied_actions=["pass", "reroute"],
+        request=original.model_dump(exclude_unset=True),
+        reversal={},
+        report={"rows": [row]},
+    )
+    engine_reply["analysis"].update(
+        source="current_request",
+        scan_performed=False,
+        duration_ms=None,
+        cached_decision_applied=True,
+    )
+    if case == "current-text-row":
+        engine_reply["report"]["rows"].insert(
+            0, {**row, "entity_type": "IBAN_CODE", "action": "reroute"}
+        )
+    elif case == "mutated":
+        engine_reply["request"]["messages"][0]["content"] = "changed"
+    elif case == "reversal":
+        engine_reply["reversal"] = {"<REV_PERSON_0123456789abcdef_fedcba9876543210>": "Jane Doe"}
+    elif case == "scan":
+        engine_reply["analysis"].update(scan_performed=True, duration_ms=1)
+    client = _client_returning(200, json.dumps(segment_reply(engine_reply)).encode())
+    try:
+        if case == "cached":
+            reply = await client.analyze_request(
+                original, "a" * 64, text_pii_enabled=False, mcp_sources=[source]
+            )
+            assert reply.decision == "reroute" and reply.route_class == "local"
+            assert reply.request == original
+            assert reply.entities == ["IBAN_CODE", source]
+        else:
+            with pytest.raises(InvalidEngineReplyError):
+                await client.analyze_request(
+                    original, "a" * 64, text_pii_enabled=False, mcp_sources=[source]
+                )
+    finally:
+        await client._client.aclose()
+
+
 class ChunkedResponseStream(httpx.AsyncByteStream):
     """Yield controlled decoded HTTP response chunks without Content-Length."""
 

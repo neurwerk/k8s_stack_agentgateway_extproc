@@ -321,15 +321,22 @@ async def test_chat_finish_without_done_does_not_emit_notice(admission, reasonin
     assert b"PII protection notice" not in emitted
 
 
-async def test_chat_held_choices_keep_detached_markers_after_text(admission, reasoning_engine):
+@pytest.mark.parametrize("labeled", [False, True])
+@pytest.mark.parametrize("tail_only", [False, True])
+async def test_chat_held_choices_keep_detached_markers_after_text(
+    admission, reasoning_engine, labeled, tail_only
+):
     engine_client, _ = reasoning_engine
     handler = await notice_handler(admission, engine_client, "chat", stream=True)
-    events = stream_events("chat", text="First <REV_")
-    later = stream_events("chat", text="Last <REV_")[:-2]
+    handler.mcp_sources = ["MCP_TOOL_SALESFORCE"] if labeled else []
+    marker = source_marker(handler.mcp_sources)
+    prefixes = ("", "") if tail_only else ("First ", "Last ")
+    events = stream_events("chat", text=prefixes[0] + "<REV_PERSON")
+    later = stream_events("chat", text=prefixes[1] + "<REV_PERSON")[:-2]
     for event in later:
         event["choices"][0]["index"] = 1
     # Also exercise a finish carrying the last fragment rather than an empty delta.
-    later[-1]["choices"][0]["delta"] = {"content": "Last <REV_"}
+    later[-1]["choices"][0]["delta"] = {"content": prefixes[1] + "<REV_PERSON"}
     del later[1:3]
     events[-2:-2] = later
     emitted = b""
@@ -342,10 +349,11 @@ async def test_chat_held_choices_keep_detached_markers_after_text(admission, rea
     emitted += reply.response_body.response.body_mutation.streamed_response.body
     frames = SseDecoder().feed(emitted.decode(), final=True)
     choices = [choice for frame in frames[:-1] for choice in json.loads(frame.data)["choices"]]
-    for index, prefix in enumerate(("First ", "Last ")):
+    for index, prefix in enumerate(prefixes):
         own = [choice for choice in choices if choice["index"] == index]
         text = "".join(choice["delta"].get("content", "") for choice in own)
-        assert text.startswith(prefix + "<PII_INVALID_")
+        assert text.startswith(marker + prefix + "<PII_INVALID_")
+        assert text.count("<NEURWERK_MCP_SOURCES>") == int(labeled)
         assert own[-1]["finish_reason"] == "stop"
         assert "PII protection notice" not in own[-1]["delta"].get("content", "")
         if index == 0:
@@ -354,12 +362,20 @@ async def test_chat_held_choices_keep_detached_markers_after_text(admission, rea
             assert "PII protection notice" not in text
 
 
-@pytest.mark.parametrize("tools", [False, True])
-async def test_responses_stream_notice_matches_snapshots(admission, reasoning_engine, tools):
+@pytest.mark.parametrize("tools,source_tail", [(False, False), (True, False), (False, True)])
+async def test_responses_stream_notice_matches_snapshots(
+    admission, reasoning_engine, tools, source_tail
+):
     engine_client, _ = reasoning_engine
     handler = await notice_handler(admission, engine_client, "responses", stream=True)
+    handler.mcp_sources = ["MCP_TOOL_SALESFORCE"] if source_tail else []
     emitted = b""
-    for event in stream_events("responses", tools=tools, empty_terminal=tools):
+    for event in stream_events(
+        "responses",
+        text="<REV_PERSON" if source_tail else REVERSIBLE_TOKEN,
+        tools=tools,
+        empty_terminal=tools,
+    ):
         reply = await handler.handle(
             response_body(event_bytes("responses", event), end_of_stream=False, policy=admission)
         )
@@ -370,7 +386,9 @@ async def test_responses_stream_notice_matches_snapshots(admission, reasoning_en
     text = "".join(
         event["delta"] for event in events if event["type"] == "response.output_text.delta"
     )
-    assert text.startswith("Jane Doe")
+    assert text.startswith(
+        source_marker(handler.mcp_sources) + "<PII_INVALID_" if source_tail else "Jane Doe"
+    )
     assert text.count("PII protection notice — powered by neurwerk") == (0 if tools else 1)
     assert (
         next(event["text"] for event in events if event["type"] == "response.output_text.done")
