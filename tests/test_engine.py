@@ -35,6 +35,170 @@ def _chat(text: str = "hello") -> EngineChatRequest:
     )
 
 
+@pytest.mark.parametrize(
+    "case",
+    [
+        "pass",
+        "block",
+        "reroute",
+        "face",
+        "fake-pii",
+        "transform",
+        "count",
+        "scan",
+        "mutate",
+        "omitted",
+    ],
+)
+async def test_source_only_reply_keeps_policy_separate_from_text_scans(engine_reply, case):
+    source = "MCP_TOOL_SALESFORCE"
+    original = _chat("business text")
+    row = {
+        "entity_type": source,
+        "action": "pass",
+        "detected_count": 2 if case == "count" else 1,
+        "transformed_count": 0,
+        "unique_transformed_count": 0,
+    }
+    engine_reply.update(
+        decision="pass",
+        entities=[] if case == "omitted" else [source],
+        entity_counts={} if case == "omitted" else {source: row["detected_count"]},
+        applied_actions=["pass"],
+        request=original.model_dump(exclude_unset=True),
+        reversal={},
+        notices={"request": [], "response": []},
+        report={"rows": [] if case == "omitted" else [row]},
+    )
+    engine_reply["analysis"].update(scan_performed=False, duration_ms=None)
+    findings = None
+    if case in {"block", "reroute"}:
+        row["action"] = case
+        engine_reply.update(decision=case, applied_actions=[case], remote_allowed=False)
+        if case == "block":
+            engine_reply["request"] = None
+        else:
+            engine_reply["route_class"] = "local"
+    elif case == "face":
+        findings = VisualFindings.model_validate({"faces": {"scan_status": "complete", "count": 1}})
+        engine_reply.update(
+            decision="apply_actions",
+            applied_actions=["text-only"],
+            entities=["FACE", source],
+            entity_counts={"FACE": 1, source: 1},
+            visual_findings=findings.model_dump(),
+        )
+        engine_reply["report"]["rows"].insert(
+            0, {**row, "entity_type": "FACE", "action": "text-only"}
+        )
+    elif case == "fake-pii":
+        row["entity_type"] = "PERSON"
+        engine_reply.update(entities=["PERSON"], entity_counts={"PERSON": 1})
+    elif case == "transform":
+        row.update(action="mask", transformed_count=1, unique_transformed_count=1)
+        engine_reply.update(decision="apply_actions", applied_actions=["mask"])
+    elif case == "scan":
+        engine_reply["analysis"].update(scan_performed=True, duration_ms=1)
+    elif case == "mutate":
+        engine_reply["request"]["messages"][0]["content"] = "changed"
+
+    def analyze(request):
+        wire = json.loads(request.content)
+        assert wire["text_pii_enabled"] is False and wire["mcp_sources"] == [source]
+        return httpx.Response(200, json=segment_reply(engine_reply))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(analyze)) as http:
+        client = EngineClient(EngineSettings(base_url="https://engine.example.test"), http)
+        if case in {"pass", "block", "reroute", "face"}:
+            reply = await client.analyze_request(
+                original,
+                "a" * 64,
+                text_pii_enabled=False,
+                mcp_sources=[source, source],
+                document=findings is not None,
+                visual_findings=findings,
+            )
+            assert reply.decision == ("apply_actions" if case == "face" else case)
+        else:
+            with pytest.raises(InvalidEngineReplyError):
+                await client.analyze_request(
+                    original, "a" * 64, text_pii_enabled=False, mcp_sources=[source]
+                )
+
+
+@pytest.mark.parametrize(
+    "case", ["cached", "conflict-block", "current-text-row", "mutated", "reversal", "scan"]
+)
+async def test_source_only_cached_reroute_preserves_historical_text_evidence(engine_reply, case):
+    source = "MCP_TOOL_SALESFORCE"
+    original = _chat("current business text")
+    row = {
+        "entity_type": source,
+        "action": "pass",
+        "detected_count": 1,
+        "transformed_count": 0,
+        "unique_transformed_count": 0,
+    }
+    # The combined reply keeps historical IBAN entities, but reports only current sources.
+    engine_reply.update(
+        decision="reroute",
+        remote_allowed=False,
+        route_class="local",
+        entities=["IBAN_CODE", source],
+        entity_counts={"IBAN_CODE": 1, source: 1},
+        applied_actions=["pass", "reroute"],
+        request=original.model_dump(exclude_unset=True),
+        reversal={},
+        report={"rows": [row]},
+    )
+    engine_reply["analysis"].update(
+        source="current_request",
+        scan_performed=False,
+        duration_ms=None,
+        cached_decision_applied=True,
+    )
+    if case == "conflict-block":
+        engine_reply.update(
+            decision="block",
+            route_class=None,
+            applied_actions=["block"],
+            request=None,
+            report={
+                "rows": [
+                    {**row, "entity_type": "IBAN_CODE", "action": "block"},
+                    {**row, "action": "block"},
+                ]
+            },
+        )
+    elif case == "current-text-row":
+        engine_reply["report"]["rows"].insert(
+            0, {**row, "entity_type": "IBAN_CODE", "action": "reroute"}
+        )
+    elif case == "mutated":
+        engine_reply["request"]["messages"][0]["content"] = "changed"
+    elif case == "reversal":
+        engine_reply["reversal"] = {"<REV_PERSON_0123456789abcdef_fedcba9876543210>": "Jane Doe"}
+    elif case == "scan":
+        engine_reply["analysis"].update(scan_performed=True, duration_ms=1)
+    client = _client_returning(200, json.dumps(segment_reply(engine_reply)).encode())
+    try:
+        if case in {"cached", "conflict-block"}:
+            reply = await client.analyze_request(
+                original, "a" * 64, text_pii_enabled=False, mcp_sources=[source]
+            )
+            assert reply.decision == ("block" if case == "conflict-block" else "reroute")
+            assert reply.route_class == (None if case == "conflict-block" else "local")
+            assert reply.request == (None if case == "conflict-block" else original)
+            assert reply.entities == ["IBAN_CODE", source]
+        else:
+            with pytest.raises(InvalidEngineReplyError):
+                await client.analyze_request(
+                    original, "a" * 64, text_pii_enabled=False, mcp_sources=[source]
+                )
+    finally:
+        await client._client.aclose()
+
+
 class ChunkedResponseStream(httpx.AsyncByteStream):
     """Yield controlled decoded HTTP response chunks without Content-Length."""
 

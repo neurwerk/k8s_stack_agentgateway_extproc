@@ -19,6 +19,7 @@ from pydantic import Field, TypeAdapter
 from agentgateway_extproc.lib.json_limits import strict_json_loads
 from agentgateway_extproc.lib.masking.reversal import PlaceholderStreamRewriter
 from agentgateway_extproc.lib.pipeline.guard import GuardStreamStripper
+from agentgateway_extproc.lib.pipeline.mcp_sources import source_marker
 from agentgateway_extproc.lib.pipeline.sse import SseDecoder, SseEvent
 from agentgateway_extproc.models.exceptions import InvalidReversalError
 from agentgateway_extproc.models.types import RESERVED_PLACEHOLDER_PREFIX_RE
@@ -278,6 +279,8 @@ def process_native_json(handler: StreamHandler, text: str) -> str:
         _control(data)
         for block in blocks:
             _block(handler, block)
+            if block["type"] == "text" and block["text"] and not handler.response_structured_json:
+                block["text"] = source_marker(handler.mcp_sources) + block["text"]
         data["content"] = blocks
     else:
         response = GoogleResponse.model_validate(raw)
@@ -293,6 +296,8 @@ def process_native_json(handler: StreamHandler, text: str) -> str:
                         if handler.response_structured_json
                         else _reverse_complete(handler, value, allow_invalid=True)
                     )
+                    if part["text"] and not handler.response_structured_json:
+                        part["text"] = source_marker(handler.mcp_sources) + part["text"]
                 else:
                     call = part["functionCall"]
                     args = call.pop("args")
@@ -351,6 +356,7 @@ class NativeSseProcessor:
         self.candidates: set[int] = set()
         self.finished: set[int] = set()
         self.function_calls: set[tuple[int, int]] = set()
+        self.source_channels: set[tuple[int, int]] = set()
 
     def feed(self, text: str, *, final: bool) -> str:
         """Validate every frame before emitting it; EOF cannot complete a truncated message."""
@@ -380,8 +386,22 @@ class NativeSseProcessor:
     def _text(self, key: tuple[int, int], value: str, *, final: bool = False) -> str:
         from agentgateway_extproc.lib.pipeline.response import _record
 
+        if self.handler.guard_injected:
+            value = self.guards.setdefault(key, GuardStreamStripper()).feed(value, final=final)
+        prefix = ""
+        if (
+            self.handler.mcp_sources
+            and not self.handler.response_structured_json
+            and key not in self.source_channels
+            and bool(value)
+            and not final
+        ):
+            prefix = source_marker(self.handler.mcp_sources)
+            self.source_channels.add(key)
         if not self.handler.text_pii_enabled:
-            return value
+            if final:
+                self.guards.pop(key, None)
+            return prefix + value
         rewriter = self.rewriters.setdefault(
             key,
             PlaceholderStreamRewriter(
@@ -391,14 +411,12 @@ class NativeSseProcessor:
                 json_string_fragment=self.handler.response_structured_json,
             ),
         )
-        if self.handler.guard_injected:
-            value = self.guards.setdefault(key, GuardStreamStripper()).feed(value, final=final)
         value, hits, misses = rewriter.feed(value, final=final)
         _record(self.handler, hits, misses, allow_invalid=not self.handler.response_structured_json)
         if final:
             self.rewriters.pop(key, None)
             self.guards.pop(key, None)
-        return value
+        return prefix + value
 
     def _anthropic(self, event: SseEvent, raw: object) -> list[str]:  # noqa: C901
         parsed = _ANTHROPIC_EVENT.validate_python(raw)
@@ -506,7 +524,7 @@ class NativeSseProcessor:
                     call["args"] = _restore_values(self.handler, call["args"])
             if candidate.finishReason is not None:
                 self.finished.add(index)
-                for key in list(self.rewriters):
+                for key in set(self.rewriters) | set(self.guards):
                     if key[0] == index:
                         tail = self._text(key, "", final=True)
                         if tail:

@@ -31,6 +31,7 @@ from agentgateway_extproc.lib.pipeline.mcp import (
     McpUnsupportedFeatureError,
     parse_mcp_message,
 )
+from agentgateway_extproc.lib.pipeline.mcp_sources import collect_sources, source_union
 from agentgateway_extproc.lib.pipeline.profiles import model_profile
 from agentgateway_extproc.lib.pipeline.reasoning import verify_reasoning
 from agentgateway_extproc.lib.pipeline.reply_validation import (
@@ -264,6 +265,9 @@ async def process_request(
             if handler.request_context is not None
             else policy.models[model_id]
         )
+        handler.mcp_sources = collect_sources(
+            segment.text for segment in extract_request(request).segments
+        )
         attachments = _model_attachments(request)
         attachment_mode = policy.attachment_modes.get(model_id, "block")
         if handler.admission is not None and attachments and attachment_mode == "passthrough":
@@ -405,8 +409,13 @@ async def process_request(
             handler.request_body_chunks.clear()
             attachments.clear()
             payload = None
-        if unchecked_without_documents or (
-            not handler.text_pii_enabled and not (images and images.protect_faces)
+        handler.mcp_sources = source_union(
+            handler.mcp_sources,
+            collect_sources(segment.text for segment in extract_request(request).segments),
+        )
+        if not handler.mcp_sources and (
+            unchecked_without_documents
+            or (not handler.text_pii_enabled and not (images and images.protect_faces))
         ):
             await verify_reasoning(handler, request)
             if (
@@ -466,7 +475,8 @@ async def process_request(
             request_nonce=handler.request_nonce,
         )
         handler.record_dispatch("model_analyzed")
-    request = _literalize_request_placeholders(request)
+    if handler.text_pii_enabled or not handler.mcp_sources:
+        request = _literalize_request_placeholders(request)
     try:
         if converted:
             _clear_request(handler)
@@ -476,16 +486,26 @@ async def process_request(
                     session_key,
                     document=True,
                     text_pii_enabled=handler.text_pii_enabled,
+                    mcp_sources=handler.mcp_sources,
                     visual_findings=visual_findings,
                     correlation_id=handler.correlation_id,
                 )
             else:
                 reply = await client.analyze_request(
-                    request, session_key, document=True, correlation_id=handler.correlation_id
+                    request,
+                    session_key,
+                    document=True,
+                    text_pii_enabled=handler.text_pii_enabled,
+                    mcp_sources=handler.mcp_sources,
+                    correlation_id=handler.correlation_id,
                 )
         else:
             reply = await client.analyze_request(
-                request, session_key, correlation_id=handler.correlation_id
+                request,
+                session_key,
+                text_pii_enabled=handler.text_pii_enabled,
+                mcp_sources=handler.mcp_sources,
+                correlation_id=handler.correlation_id,
             )
         validate_request_mutation(request, reply)
         if handler.text_pii_enabled:
@@ -624,7 +644,9 @@ async def process_request(
         except DocumentError as exc:
             return _image_policy_block(handler, exc)
     transformed = reply.request
-    if handler.text_pii_enabled and isinstance(request, EngineChatRequest | EngineResponsesRequest):
+    if (handler.text_pii_enabled or handler.mcp_sources) and isinstance(
+        request, EngineChatRequest | EngineResponsesRequest
+    ):
         transformed = inject_guard_instruction(
             cast(EngineChatRequest | EngineResponsesRequest, transformed)
         )

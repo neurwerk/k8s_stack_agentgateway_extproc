@@ -101,6 +101,52 @@ def engine_client(engine_reply: dict[str, object]) -> EngineClient:
     )
 
 
+@pytest.fixture
+async def source_engine(engine_reply):
+    """Return unchanged source-only policy replies over the real segment boundary."""
+    calls = []
+
+    def analyze(request):
+        wire = json.loads(request.content)
+        calls.append(wire)
+        sources = wire["mcp_sources"]
+        reply = {key: value for key, value in engine_reply.items() if key != "request"}
+        reply.update(
+            api_version="v2",
+            decision="pass",
+            entities=sources,
+            entity_counts=dict.fromkeys(sources, 1),
+            applied_actions=["pass"],
+            reversal={},
+            notices={"request": [], "response": []},
+            segments=wire["segments"],
+            report={
+                "rows": [
+                    {
+                        "entity_type": source,
+                        "action": "pass",
+                        "detected_count": 1,
+                        "transformed_count": 0,
+                        "unique_transformed_count": 0,
+                    }
+                    for source in sources
+                ]
+            },
+        )
+        reply["analysis"] = {
+            **reply["analysis"],
+            "scan_performed": False,
+            "duration_ms": None,
+            "text_leaf_count": len(wire["segments"]),
+        }
+        if "visual_findings" in wire:
+            reply["visual_findings"] = wire["visual_findings"]
+        return httpx.Response(200, json=reply)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(analyze)) as http:
+        yield EngineClient(EngineSettings(base_url="https://engine.example.test"), http), calls
+
+
 def header_request(
     headers: dict[str, str] | None = None,
     end_of_stream: bool = False,

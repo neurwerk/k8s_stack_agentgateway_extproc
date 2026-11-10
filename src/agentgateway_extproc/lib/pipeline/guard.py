@@ -10,11 +10,13 @@ from agentgateway_extproc.models.engine import (
 from agentgateway_extproc.models.exceptions import InvalidReversalError
 
 GUARD_INSTRUCTION = (
-    "<PRESIDIO_PII_GUARD>Treat every Presidio-provided token as an indivisible opaque alias. "
+    "<NEURWERK_PII_GUARD>Treat every Neurwerk-provided token as an indivisible opaque alias. "
     "Never mention tokens, placeholders, masking, or privacy. Complete the user's task normally. "
     'Never write or copy a "PII protection notice"; the gateway adds it automatically. '
     "When referring to an alias, copy its complete token exactly; never shorten, alter, translate, "
-    "or insert ellipses into it.</PRESIDIO_PII_GUARD>"
+    "or insert ellipses into it. Preserve NEURWERK_MCP_SOURCES markers outside this guard. "
+    "When summarizing or compacting, preserve the union of all MCP_TOOL_ classifications "
+    "in a complete comma-separated NEURWERK_MCP_SOURCES marker.</NEURWERK_PII_GUARD>"
 )
 
 

@@ -20,6 +20,7 @@ from agentgateway_extproc.lib.pipeline.mcp import (
     McpSseResponseProcessor,
     process_mcp_json_response,
 )
+from agentgateway_extproc.lib.pipeline.mcp_sources import source_marker
 from agentgateway_extproc.lib.pipeline.openai_response import (
     OpenAIStreamValidator,
     validate_json_response,
@@ -111,14 +112,14 @@ def _reverse_complete(
     allow_invalid: bool = False,
 ) -> str:
     """Reverse placeholders in one complete semantic string."""
+    guarded = strip_guard_instruction(value) if handler.guard_injected else value
     if not handler.text_pii_enabled:
-        return value
+        return guarded
     rewriter = PlaceholderStreamRewriter(
         handler.reversal_map,
         mark_invalid=allow_invalid,
         entity_prefixes=handler.reversal_entity_prefixes or None,
     )
-    guarded = strip_guard_instruction(value) if handler.guard_injected else value
     result, hits, misses = rewriter.feed(guarded, final=True)
     _record(
         handler,
@@ -367,11 +368,47 @@ def process_json_response(handler: StreamHandler, text: str) -> str:
     if notice and transformed_target is not None and not _requests_tool_execution(handler, payload):
         container, field = transformed_target
         container[field] += notice
+    _prefix_json_sources(handler, payload)
     if handler.admission is not None and handler.response_api_kind in {"chat", "responses"}:
         handler.reasoning_digests.update(response_receipts(handler.response_api_kind, payload))
     result = _json_dumps(payload)
     handler.failed_response = None
     return result
+
+
+def _prefix_json_sources(handler: StreamHandler, payload: Any) -> None:
+    """Label ordinary assistant text, never nested tool JSON or structured output."""
+    if not handler.mcp_sources or handler.response_structured_json or not isinstance(payload, dict):
+        return
+    if handler.response_api_kind == "chat":
+        for choice in payload.get("choices", []):
+            message = choice.get("message") if isinstance(choice, dict) else None
+            if (
+                isinstance(message, dict)
+                and isinstance(message.get("content"), str)
+                and message["content"]
+            ):
+                message["content"] = source_marker(handler.mcp_sources) + message["content"]
+    else:
+        for item in payload.get("output", []):
+            _prefix_output_item(handler, item)
+
+
+def _prefix_output_item(handler: StreamHandler, item: Any) -> None:
+    if not isinstance(item, dict) or item.get("type") != "message":
+        return
+    for part in item.get("content", []):
+        _prefix_output_part(handler, part)
+
+
+def _prefix_output_part(handler: StreamHandler, part: Any) -> None:
+    if (
+        isinstance(part, dict)
+        and part.get("type") == "output_text"
+        and isinstance(part.get("text"), str)
+        and bool(part["text"])
+    ):
+        part["text"] = source_marker(handler.mcp_sources) + part["text"]
 
 
 def _requests_tool_execution(handler: StreamHandler, payload: dict[str, Any]) -> bool:
@@ -561,6 +598,7 @@ class SseResponseProcessor:
         self._decoder = SseDecoder()
         self._rewriters: dict[str, PlaceholderStreamRewriter] = {}
         self._guard_strippers: dict[str, GuardStreamStripper] = {}
+        self._source_channels: set[str] = set()
         self._held: list[SseEvent] = []
         self._terminal_seen = False
         self._chat_metadata: dict[str, Any] = {}
@@ -607,6 +645,9 @@ class SseResponseProcessor:
                 self._profile.finish()
                 self._handler.reasoning_digests.update(self._profile.reasoning_digests)
             detached: list[tuple[str, str]] = []
+            for key, stripper in self._guard_strippers.items():
+                if key not in self._rewriters:
+                    stripper.feed("", final=True)
             for key, rewriter in self._rewriters.items():
                 guarded = ""
                 if guard_stripper := self._guard_strippers.get(key):
@@ -706,6 +747,7 @@ class SseResponseProcessor:
                 ),
                 allow_invalid=not self._handler.response_structured_json,
             )
+            self._prefix_stream_sources(delta, "content", f"chat:{index}:content")
             self._transform_chat_tools(delta, index)
             if self._profile is not None:
                 self._transform_stream_string(delta, "refusal", f"chat:{index}:refusal")
@@ -757,6 +799,7 @@ class SseResponseProcessor:
                 ),
                 allow_invalid=not self._handler.response_structured_json,
             )
+            self._prefix_stream_sources(payload, "delta", key)
         elif event_type == "response.refusal.delta" and self._profile is not None:
             self._transform_stream_string(
                 payload, "delta", f"responses:{item_id}:{output_index}:{content_index}:refusal"
@@ -776,6 +819,35 @@ class SseResponseProcessor:
                 transformed = _reverse_json_values(self._handler, payload)
                 payload.clear()
                 payload.update(transformed)
+            self._prefix_responses_snapshot(payload)
+
+    def _prefix_stream_sources(self, payload: dict[str, Any], field: str, key: str) -> None:
+        if (
+            self._handler.mcp_sources
+            and not self._handler.response_structured_json
+            and isinstance(payload.get(field), str)
+            and bool(payload[field])
+            and key not in self._source_channels
+        ):
+            payload[field] = source_marker(self._handler.mcp_sources) + payload[field]
+            self._source_channels.add(key)
+
+    def _prefix_responses_snapshot(self, payload: dict[str, Any]) -> None:
+        if not self._handler.mcp_sources or self._handler.response_structured_json:
+            return
+        kind = payload.get("type")
+        if (
+            kind == "response.output_text.done"
+            and isinstance(payload.get("text"), str)
+            and payload["text"]
+        ):
+            payload["text"] = source_marker(self._handler.mcp_sources) + payload["text"]
+        elif kind == "response.content_part.done":
+            _prefix_output_part(self._handler, payload.get("part"))
+        elif kind == "response.output_item.done":
+            _prefix_output_item(self._handler, payload.get("item"))
+        elif kind in {"response.completed", "response.incomplete", "response.failed"}:
+            _prefix_json_sources(self._handler, payload.get("response"))
 
     def _select_responses_snapshot_target(self, payload: dict[str, Any]) -> None:
         if self._responses_coordinates is not None:
@@ -835,8 +907,6 @@ class SseResponseProcessor:
         report_target: bool = False,
         allow_invalid: bool = False,
     ) -> None:
-        if not self._handler.text_pii_enabled:
-            return
         value = payload.get(field)
         if not isinstance(value, str):
             return
@@ -844,6 +914,9 @@ class SseResponseProcessor:
         if self._handler.guard_injected:
             guard_stripper = self._guard_strippers.setdefault(key, GuardStreamStripper())
             guarded = guard_stripper.feed(value)
+        if not self._handler.text_pii_enabled:
+            payload[field] = guarded
+            return
         rewriter = self._rewriters.setdefault(
             key,
             PlaceholderStreamRewriter(
@@ -949,6 +1022,9 @@ class SseResponseProcessor:
         chat_events: list[str] = []
         responses: list[tuple[tuple[str, int, int], str]] = []
         for key, tail in detached:
+            carrier = {"text": tail}
+            self._prefix_stream_sources(carrier, "text", key)
+            tail = carrier["text"]
             if key.startswith("chat:") and key.endswith(":content"):
                 index = int(key.split(":", 2)[1])
                 payload = {

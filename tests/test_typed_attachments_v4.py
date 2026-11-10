@@ -17,6 +17,7 @@ from agentgateway_extproc.lib.documents import DocumentError, ImageBatch, prefli
 from agentgateway_extproc.lib.image_inspection import ImageInspectionResult
 from agentgateway_extproc.lib.image_policy import image_output
 from agentgateway_extproc.lib.image_probe import COUNT_HEADER, normalize
+from agentgateway_extproc.lib.pipeline.mcp_sources import source_marker
 from agentgateway_extproc.lib.pipeline.stream_handler import StreamHandler
 from agentgateway_extproc.models.destination import ModelDestinationPolicy
 from agentgateway_extproc.models.engine import EngineAttachmentPart, EngineReply
@@ -220,7 +221,11 @@ def test_v4_rejects_incoherent_image_policy(extra):
         )
 
 
-async def test_v4_unchecked_image_is_ocr_face_and_pii_free(engine_client):
+@pytest.mark.parametrize("labeled", [False, True])
+async def test_v4_unchecked_image_is_ocr_face_and_pii_free(engine_client, source_engine, labeled):
+    source_client, source_calls = source_engine
+    if labeled:
+        engine_client = source_client
     source_part = image_part()
     original = {
         "model": "test",
@@ -228,7 +233,11 @@ async def test_v4_unchecked_image_is_ocr_face_and_pii_free(engine_client):
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": "before"},
+                    {
+                        "type": "text",
+                        "text": (source_marker(["MCP_TOOL_SALESFORCE"]) if labeled else "")
+                        + "before",
+                    },
                     source_part,
                     {"type": "text", "text": "after"},
                 ],
@@ -250,7 +259,9 @@ async def test_v4_unchecked_image_is_ocr_face_and_pii_free(engine_client):
 
     with (
         patch.object(docling, "_http", new_callable=AsyncMock) as http,
-        patch.object(engine_client, "analyze_request", new_callable=AsyncMock) as analyze,
+        patch.object(
+            engine_client, "analyze_request", wraps=engine_client.analyze_request
+        ) as analyze,
         patch(
             "agentgateway_extproc.lib.documents.subprocess.run", side_effect=normalization_only
         ) as run,
@@ -264,16 +275,52 @@ async def test_v4_unchecked_image_is_ocr_face_and_pii_free(engine_client):
             await docling.close()
 
     http.assert_not_awaited()
-    analyze.assert_not_awaited()
+    if labeled:
+        analyze.assert_awaited_once()
+        assert source_calls[0]["mcp_sources"] == ["MCP_TOOL_SALESFORCE"]
+        assert source_calls[0]["text_pii_enabled"] is False
+    else:
+        analyze.assert_not_awaited()
     run.assert_called_once()
     assert response is not None and response.HasField("request_body")
-    content = json.loads(response.request_body.response.body_mutation.body)["messages"][0][
-        "content"
-    ]
+    content = json.loads(response.request_body.response.body_mutation.body)["messages"][
+        int(labeled)
+    ]["content"]
     assert [part["type"] for part in content] == ["text", "image_url", "text"]
     uri = content[1]["image_url"]["url"]
     assert uri.startswith("data:image/png;base64,")
     assert b"DO-NOT-FORWARD" not in base64.b64decode(uri.partition(",")[2])
+
+
+async def test_pii_disabled_document_extraction_enforces_sources(source_engine):
+    client, calls = source_engine
+    marker = source_marker(["MCP_TOOL_SALESFORCE"])
+    docling = AsyncMock()
+    docling.convert.return_value = [marker + "document business text"]
+    policy = _typed_policy(
+        models={"test": False},
+        document_modes={"test": "extract-text"},
+        face_protection={"test": True},
+    )
+    handler = StreamHandler(client, Settings(), docling)
+    original = {
+        "model": "test",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Summarize"},
+                    {"type": "file", "file": _upload()},
+                ],
+            }
+        ],
+    }
+    await handler.handle(header_request(policy=policy))
+    result = await handler.handle(body_request(json.dumps(original).encode(), policy=policy))
+    assert result is not None and result.HasField("request_body")
+    assert calls[0]["scope"] == "request"
+    assert calls[0]["text_pii_enabled"] is False
+    assert calls[0]["mcp_sources"] == ["MCP_TOOL_SALESFORCE"]
 
 
 async def test_v4_blocked_part_rejects_whole_batch_before_side_effects(engine_client):

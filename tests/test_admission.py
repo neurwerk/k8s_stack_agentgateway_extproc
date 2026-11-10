@@ -597,8 +597,9 @@ async def test_unqualified_features_stop_before_analysis(admission, engine_clien
 
 
 @pytest.mark.parametrize("cached", [False, True])
+@pytest.mark.parametrize("source_only", [False, True])
 async def test_reroute_requires_global_source_and_explicit_local_permission(
-    engine_client, engine_reply, admission, cached
+    engine_client, engine_reply, admission, cached, source_only
 ):
     engine_reply.update(
         decision="reroute",
@@ -619,6 +620,17 @@ async def test_reroute_requires_global_source_and_explicit_local_permission(
             ]
         },
     )
+    request_body = body()
+    if source_only:
+        marker = "<NEURWERK_MCP_SOURCES>MCP_TOOL_SALESFORCE</NEURWERK_MCP_SOURCES>"
+        request_body = request_body.replace(b"Jane Doe", marker.encode())
+        engine_reply["request"]["messages"][0]["content"] = marker
+        engine_reply.update(
+            entities=["MCP_TOOL_SALESFORCE"], entity_counts={"MCP_TOOL_SALESFORCE": 1}
+        )
+        engine_reply["report"]["rows"][0]["entity_type"] = "MCP_TOOL_SALESFORCE"
+        engine_reply["analysis"].update(scan_performed=False, duration_ms=None)
+        admission["destination_policy"]["models"]["example-chat"] = False
     if cached:
         engine_reply["analysis"].update(
             source="cached_decision",
@@ -628,7 +640,7 @@ async def test_reroute_requires_global_source_and_explicit_local_permission(
         )
     replies = await exchange(
         engine_client,
-        [header_request(headers(), policy=admission), body_request(body(), policy=admission)],
+        [header_request(headers(), policy=admission), body_request(request_body, policy=admission)],
     )
     assert replies[-1].immediate_response.status.code == 403
     assert "unsupported_reroute" in replies[-1].immediate_response.body
@@ -648,7 +660,10 @@ async def test_reroute_requires_global_source_and_explicit_local_permission(
             admission["request_context"]["permissions"].append("model:local:invoke")
         replies = await exchange(
             engine_client,
-            [header_request(headers(), policy=admission), body_request(body(), policy=admission)],
+            [
+                header_request(headers(), policy=admission),
+                body_request(request_body, policy=admission),
+            ],
         )
         if not allowed:
             assert replies[-1].immediate_response.status.code == 403
@@ -663,7 +678,7 @@ async def test_reroute_requires_global_source_and_explicit_local_permission(
             assert context["provider_credential_source"] == "global"
             assert context["target_credential_mode"] == "none"
             assert context["request_text_inspection"] == (
-                "cached_decision" if cached else "scanned"
+                "disabled" if source_only else "cached_decision" if cached else "scanned"
             )
             assert context["content_tracing_enabled"] is False
             assert context["billing_classification"] == "unknown"
