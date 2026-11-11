@@ -50,6 +50,15 @@ class ModelDestinationPolicy(DestinationModel):
     document_modes: FrozenMap[ModelId, Literal["block", "extract-text"]] = Field(
         default_factory=dict, max_length=256
     )
+    pdf_modes: FrozenMap[
+        ModelId, Literal["block", "extract-text", "render-images", "native-first"]
+    ] = Field(default_factory=dict, max_length=256, exclude_if=lambda value: not value)
+    pdf_fallbacks: FrozenMap[ModelId, Literal["extract-text", "render-images"]] = Field(
+        default_factory=dict, max_length=256, exclude_if=lambda value: not value
+    )
+    pdf_max_rendered_pages: FrozenMap[ModelId, Annotated[int, Field(strict=True, ge=1, le=20)]] = (
+        Field(default_factory=dict, max_length=256, exclude_if=lambda value: not value)
+    )
     image_modes: FrozenMap[ModelId, Literal["block", "extract-text", "forward-normalized"]] = Field(
         default_factory=dict, max_length=256
     )
@@ -71,10 +80,14 @@ class ModelDestinationPolicy(DestinationModel):
 
     @model_validator(mode="before")
     @classmethod
-    def validate_version_fields(cls, value: object) -> object:
+    def validate_version_fields(cls, value: object) -> object:  # noqa: C901
         """Keep older versions strict, including explicitly empty new maps."""
         if not isinstance(value, dict):
             return value
+        if {"pdf_modes", "pdf_fallbacks", "pdf_max_rendered_pages"} & value.keys() and value.get(
+            "contract_version"
+        ) != "4.1":
+            raise ValueError("PDF overrides require contract version 4.1")  # noqa: TRY003
         if value.get("contract_version") in {1, 2} and (
             {"image_models", "image_reroutes"} & value.keys()
         ):
@@ -154,6 +167,9 @@ class ModelDestinationPolicy(DestinationModel):
             for mapping in (
                 self.attachment_modes,
                 self.document_modes,
+                self.pdf_modes,
+                self.pdf_fallbacks,
+                self.pdf_max_rendered_pages,
                 self.image_modes,
                 self.image_forwarding,
                 self.face_protection,
@@ -178,6 +194,22 @@ class ModelDestinationPolicy(DestinationModel):
         ):
             raise ValueError("version four policy maps must cover every model")  # noqa: TRY003
         for model, pii in self.models.items():
+            pdf_mode = self.pdf_modes.get(model)
+            fallback = self.pdf_fallbacks.get(model)
+            if (pdf_mode == "native-first") != (fallback is not None):
+                raise ValueError("native-first PDF mode requires an explicit fallback")  # noqa: TRY003
+            renders_pdf = pdf_mode == "render-images" or fallback == "render-images"
+            if model in self.pdf_max_rendered_pages and not renders_pdf:
+                raise ValueError("PDF page budgets require image rendering")  # noqa: TRY003
+            if renders_pdf and (
+                self.document_mode(model) != "extract-text"
+                or not self.local_models.get(model, False)
+                or not self.image_models.get(model, False)
+                or pii
+                or self.image_mode(model) != "forward-normalized"
+                or self.image_forwarding.get(model) != "pii-unchecked"
+            ):
+                raise ValueError("PDF rendering requires local unchecked image forwarding")  # noqa: TRY003
             mode = self.attachment_modes.get(model, "block")
             forwarding = self.image_forwarding.get(model, "none")
             face = self.protects_faces(model)
@@ -276,6 +308,12 @@ def destination_policy_from_payload(payload: dict[str, object]) -> DestinationPo
         # google.protobuf.Struct represents every JSON number as a double.
         if type(version) is float and version in {1.0, 2.0, 3.0, 4.0}:
             payload["contract_version"] = int(version)
+        budgets = payload.get("pdf_max_rendered_pages")
+        if isinstance(budgets, dict):
+            payload["pdf_max_rendered_pages"] = {
+                model: int(value) if type(value) is float and value in range(1, 21) else value
+                for model, value in budgets.items()
+            }
         if payload.get("destination_kind") == "mcp" and payload.get("contextforge") is True:
             email = payload.get("account_email")
             if (
