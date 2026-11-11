@@ -96,6 +96,8 @@ class DocumentError(Exception):
                 "extraction_unavailable": "text extraction service unavailable.",
                 "extraction_failed": "text extraction could not be completed.",
                 "extraction_timeout": "text extraction timed out.",
+                "pdf_render_failed": "PDF page rendering could not be completed.",
+                "pdf_render_timeout": "PDF page rendering timed out.",
                 "image_analysis_failed": "required image safety analysis could not be completed.",
                 "image_inspection_failed": "required image inspection could not be completed.",
                 "image_inspection_timeout": "image inspection timed out. Please retry.",
@@ -169,6 +171,7 @@ class ImageBatch:
     protect_faces: bool = True
     defer_face_inspection: bool = False
     images: dict[int, str] = dataclass_field(default_factory=dict)
+    pdf_images: dict[int, list[str]] = dataclass_field(default_factory=dict)
     policy_version: int = 2
     face_count: int = 0
     scan_status: str = "not_scanned"
@@ -176,27 +179,46 @@ class ImageBatch:
     inspections: dict[int, ImageInspectionResult] = dataclass_field(default_factory=dict)
 
 
-def preflight(  # noqa: C901 - publish scan provenance only after the complete batch passes
+def preflight(
     parts: list[EngineAttachmentPart],
     settings: DoclingSettings,
     images: ImageBatch | None = None,
     abandoned: threading.Event | None = None,
     deadline: float = float("inf"),
 ) -> list[Upload]:
+    """Release any decoded bytes if validation of the complete batch fails."""
+    uploads: list[Upload] = []
+    try:
+        return _preflight(parts, settings, images, abandoned, deadline, uploads)
+    except BaseException:
+        for upload in uploads:
+            upload.data = b""
+        raise
+
+
+def _preflight(  # noqa: C901 - publish provenance only after the complete batch passes
+    parts: list[EngineAttachmentPart],
+    settings: DoclingSettings,
+    images: ImageBatch | None,
+    abandoned: threading.Event | None,
+    deadline: float,
+    uploads: list[Upload],
+) -> list[Upload]:
     """Validate every file before the first network call, under batch admission."""
     if len(parts) > settings.count:
         raise DocumentError(413)
-    uploads: list[Upload] = []
     total = pages = 0
     for index, part in enumerate(parts):
         _check_preflight(abandoned, deadline)
         if part.type in {"image_url", "input_image"} and images is not None:
             upload = _decode_image(part, settings, images, abandoned, deadline)
+            uploads.append(upload)
             images.images[index] = "data:image/png;base64," + base64.b64encode(upload.data).decode()
             if sum(len(value) for value in images.images.values()) > MAX_IMAGE_BYTES:
                 raise DocumentError(413)
         else:
             upload = _decode_upload(part, settings.file_bytes)
+            uploads.append(upload)
         total += max(len(upload.data), upload.source_bytes)
         if total > settings.total_bytes:
             raise DocumentError(413)
@@ -209,7 +231,6 @@ def preflight(  # noqa: C901 - publish scan provenance only after the complete b
         pages += upload.pages
         if pages > settings.pages:
             raise DocumentError(413)
-        uploads.append(upload)
     _check_preflight(abandoned, deadline)
     if images is not None:
         images.scan_status = "complete" if images.protect_faces and images.images else "not_scanned"
@@ -654,7 +675,12 @@ def _list(value: object) -> list[object]:
 
 
 def project_document(
-    value: object, upload: Upload, page_limit: int, *, allow_empty_image: bool = False
+    value: object,
+    upload: Upload,
+    page_limit: int,
+    *,
+    allow_empty_image: bool = False,
+    allow_empty_native: bool = False,
 ) -> tuple[str, int]:
     """Project a complete supported tree, never source metadata or raw copies."""
     doc = _object(value)
@@ -691,7 +717,9 @@ def project_document(
     projection = _Projection(nodes)
     output = "\n".join(projection.walk({"$ref": f"#/{root}"}, 0) for root in ("body", "furniture"))
     empty_image = allow_empty_image and upload.format == "img" and not projection.has_text
-    if projection.seen != set(nodes) or (not output.strip() and not empty_image):
+    if projection.seen != set(nodes) or (
+        not output.strip() and not empty_image and not allow_empty_native
+    ):
         raise DocumentError(
             diagnostic="projection_incomplete",
             node_count=len(nodes),
@@ -702,6 +730,58 @@ def project_document(
     if len(output) > MAX_TEXT:
         raise DocumentError(413, diagnostic="text_limit")
     return output, pages
+
+
+def native_pdf_covered(value: object, pages: int) -> bool:
+    """Accept only canonical native text with unambiguous coverage and no pictures.
+
+    Call only after complete structural projection. Even logos require fallback.
+    """
+    doc = _object(value)
+    if doc.get("pictures") or doc.get("tables"):
+        return False
+    covered: set[int] = set()
+    for raw in _list(doc.get("texts")):
+        node = _object(raw)
+        text = node.get("text")
+        if not isinstance(text, str) or not text.strip():
+            continue
+        item_pages = _native_text_pages(text, node.get("prov"), pages)
+        if item_pages is None:
+            return False
+        covered.update(item_pages)
+    return covered == set(range(1, pages + 1))
+
+
+def _native_text_pages(text: str, provenance: object, pages: int) -> set[int] | None:
+    """Require exact, non-overlapping provenance for the entire canonical text."""
+    if not isinstance(provenance, list) or not provenance:
+        return None
+    covered: set[int] = set()
+    spans: list[tuple[int, int]] = []
+    for item in provenance:
+        if not isinstance(item, dict):
+            return None
+        page = item.get("page_no")
+        span = item.get("charspan")
+        if (
+            type(page) is not int
+            or not 1 <= page <= pages
+            or not isinstance(span, list)
+            or len(span) != 2
+            or any(type(offset) is not int for offset in span)
+            or not 0 <= span[0] < span[1] <= len(text)
+        ):
+            return None
+        if text[span[0] : span[1]].strip():
+            covered.add(page)
+        spans.append((span[0], span[1]))
+    end = 0
+    for start, stop in sorted(spans):
+        if start != end:
+            return None
+        end = stop
+    return covered if end == len(text) else None
 
 
 def _page_count(value: object, expected: int, limit: int) -> int:
