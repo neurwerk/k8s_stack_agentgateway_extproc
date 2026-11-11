@@ -19,7 +19,6 @@ from pydantic import Field, TypeAdapter
 from agentgateway_extproc.lib.json_limits import strict_json_loads
 from agentgateway_extproc.lib.masking.reversal import PlaceholderStreamRewriter
 from agentgateway_extproc.lib.pipeline.guard import GuardStreamStripper
-from agentgateway_extproc.lib.pipeline.mcp_sources import source_marker
 from agentgateway_extproc.lib.pipeline.sse import SseDecoder, SseEvent
 from agentgateway_extproc.models.exceptions import InvalidReversalError
 from agentgateway_extproc.models.types import RESERVED_PLACEHOLDER_PREFIX_RE
@@ -279,8 +278,6 @@ def process_native_json(handler: StreamHandler, text: str) -> str:
         _control(data)
         for block in blocks:
             _block(handler, block)
-            if block["type"] == "text" and block["text"] and not handler.response_structured_json:
-                block["text"] = source_marker(handler.mcp_sources) + block["text"]
         data["content"] = blocks
     else:
         response = GoogleResponse.model_validate(raw)
@@ -296,8 +293,6 @@ def process_native_json(handler: StreamHandler, text: str) -> str:
                         if handler.response_structured_json
                         else _reverse_complete(handler, value, allow_invalid=True)
                     )
-                    if part["text"] and not handler.response_structured_json:
-                        part["text"] = source_marker(handler.mcp_sources) + part["text"]
                 else:
                     call = part["functionCall"]
                     args = call.pop("args")
@@ -356,7 +351,6 @@ class NativeSseProcessor:
         self.candidates: set[int] = set()
         self.finished: set[int] = set()
         self.function_calls: set[tuple[int, int]] = set()
-        self.source_channels: set[tuple[int, int]] = set()
 
     def feed(self, text: str, *, final: bool) -> str:
         """Validate every frame before emitting it; EOF cannot complete a truncated message."""
@@ -388,20 +382,10 @@ class NativeSseProcessor:
 
         if self.handler.guard_injected:
             value = self.guards.setdefault(key, GuardStreamStripper()).feed(value, final=final)
-        prefix = ""
-        if (
-            self.handler.mcp_sources
-            and not self.handler.response_structured_json
-            and key not in self.source_channels
-            and bool(value)
-            and not final
-        ):
-            prefix = source_marker(self.handler.mcp_sources)
-            self.source_channels.add(key)
         if not self.handler.text_pii_enabled:
             if final:
                 self.guards.pop(key, None)
-            return prefix + value
+            return value
         rewriter = self.rewriters.setdefault(
             key,
             PlaceholderStreamRewriter(
@@ -416,7 +400,7 @@ class NativeSseProcessor:
         if final:
             self.rewriters.pop(key, None)
             self.guards.pop(key, None)
-        return prefix + value
+        return value
 
     def _anthropic(self, event: SseEvent, raw: object) -> list[str]:  # noqa: C901
         parsed = _ANTHROPIC_EVENT.validate_python(raw)

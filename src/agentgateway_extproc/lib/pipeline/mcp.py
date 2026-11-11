@@ -22,7 +22,7 @@ from agentgateway_extproc.lib.json_limits import strict_json_loads
 from agentgateway_extproc.lib.masking.reversal import reverse_placeholders
 from agentgateway_extproc.lib.pipeline.mcp_sources import (
     collect_sources,
-    prefix_sources,
+    source_marker,
     source_union,
 )
 from agentgateway_extproc.lib.pipeline.sse import SseDecoder
@@ -475,7 +475,7 @@ def _process_mcp_response_payload(handler: StreamHandler, payload: Any, text: st
 
 
 def _stamp_tool_response(handler: StreamHandler, payload: dict[str, Any]) -> dict[str, Any]:
-    """Label only tools/call text, keeping structured and protocol fields unchanged."""
+    """Add one source text block without rewriting the tool's original content."""
     from copy import deepcopy
 
     policy = handler.destination_policy
@@ -483,21 +483,45 @@ def _stamp_tool_response(handler: StreamHandler, payload: dict[str, Any]) -> dic
         raise McpProtocolError("MCP response has no destination policy")
     transformed = deepcopy(payload)
     result = transformed.get("result")
-    content = result.get("content") if isinstance(result, dict) else None
-    if isinstance(content, list):
-        blocks = [
-            block
-            for block in content
-            if isinstance(block, dict)
-            and block.get("type") == "text"
-            and isinstance(block.get("text"), str)
-        ]
-        sources = source_union(
-            [policy.source_class], collect_sources(block["text"] for block in blocks)
-        )
-        for block in blocks:
-            block["text"] = prefix_sources(block["text"], sources)
+    if not isinstance(result, dict):
+        return transformed
+    content = result.get("content", [])
+    if not isinstance(content, list):
+        raise McpProtocolError("MCP tool content must be an array")
+    sources = source_union([policy.source_class], collect_sources(_source_texts(result)))
+    blocks = [{"type": "text", "text": source_marker(sources)}, *content]
+    if not content and "structuredContent" in result:
+        blocks.append({"type": "text", "text": _json_dumps(result["structuredContent"])})
+    result["content"] = blocks
     return transformed
+
+
+def _source_texts(result: dict[str, Any]) -> list[str]:
+    """Collect source carriers in tool data, not protocol metadata."""
+    texts: list[str] = []
+    for block in result.get("content", []):
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "text" and isinstance(block.get("text"), str):
+            texts.append(block["text"])
+        resource = block.get("resource")
+        if (
+            block.get("type") == "resource"
+            and isinstance(resource, dict)
+            and isinstance(resource.get("text"), str)
+        ):
+            texts.append(resource["text"])
+    if "structuredContent" in result:
+        pending = [result["structuredContent"]]
+        while pending:
+            value = pending.pop()
+            if isinstance(value, str):
+                texts.append(value)
+            elif isinstance(value, dict):
+                pending.extend(value.values())
+            elif isinstance(value, list):
+                pending.extend(value)
+    return texts
 
 
 def _safe_modern_error(payload: dict[str, Any], status: int, requested: str) -> str:

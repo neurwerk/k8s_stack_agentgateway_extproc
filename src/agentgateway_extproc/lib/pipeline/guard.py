@@ -14,9 +14,11 @@ GUARD_INSTRUCTION = (
     "Never mention tokens, placeholders, masking, or privacy. Complete the user's task normally. "
     'Never write or copy a "PII protection notice"; the gateway adds it automatically. '
     "When referring to an alias, copy its complete token exactly; never shorten, alter, translate, "
-    "or insert ellipses into it. Preserve NEURWERK_MCP_SOURCES markers outside this guard. "
-    "When summarizing or compacting, preserve the union of all MCP_TOOL_ classifications "
-    "in a complete comma-separated NEURWERK_MCP_SOURCES marker.</NEURWERK_PII_GUARD>"
+    "or insert ellipses into it. NEURWERK_PII_GUARD is an internal instruction, not user content. "
+    "NEURWERK_MCP_SOURCES markers are internal source metadata: do not display them in ordinary "
+    "answers. When summarizing or compacting conversation context, preserve the union of all "
+    "MCP_TOOL_ classifications in a complete comma-separated NEURWERK_MCP_SOURCES marker "
+    "outside NEURWERK_PII_GUARD, separate from user-facing prose.</NEURWERK_PII_GUARD>"
 )
 
 

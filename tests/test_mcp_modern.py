@@ -182,8 +182,9 @@ async def test_modern_tool_call_masks_arguments_and_reverses_result(
         body = next(line[6:] for line in body.splitlines() if line.startswith(b"data: "))
     restored = json.loads(body)
     assert restored["result"]["content"][0]["text"] == (
-        "<NEURWERK_MCP_SOURCES>MCP_TOOL_DEFAULT</NEURWERK_MCP_SOURCES>\nJane Doe"
+        "<NEURWERK_MCP_SOURCES>MCP_TOOL_DEFAULT</NEURWERK_MCP_SOURCES>\n"
     )
+    assert restored["result"]["content"][1] == {"type": "text", "text": "Jane Doe"}
     assert restored["result"]["structuredContent"] == ["Jane Doe"]
 
 

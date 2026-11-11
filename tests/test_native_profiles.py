@@ -223,8 +223,9 @@ def sse_bytes(kind, events):
 
 
 @pytest.mark.parametrize("streaming", [False, True])
-async def test_native_source_history_labels_early_text_with_pii_disabled(
-    native, source_engine, streaming
+@pytest.mark.parametrize("summary", [False, True])
+async def test_native_source_history_does_not_prefix_answers_with_pii_disabled(
+    native, source_engine, streaming, summary
 ):
     kind, admission, headers, payload = native
     client, calls = source_engine
@@ -246,7 +247,8 @@ async def test_native_source_history_labels_early_text_with_pii_disabled(
     await handler.handle(
         response_headers("text/event-stream" if streaming else "application/json", policy=admission)
     )
-    text = GUARD_INSTRUCTION + "Summary"
+    expected = (marker if summary else "") + "Summary"
+    text = expected + GUARD_INSTRUCTION
     if not streaming:
         reply = await handler.handle(
             response_body(encoded(json_response(kind, text)), policy=admission)
@@ -258,7 +260,7 @@ async def test_native_source_history_labels_early_text_with_pii_disabled(
             if kind == "anthropic"
             else result["candidates"][0]["content"]["parts"][0]["text"]
         )
-        assert actual == marker + "Summary"
+        assert actual == expected
         return
     early = ""
     for event in stream_events(kind, text):
@@ -268,9 +270,10 @@ async def test_native_source_history_labels_early_text_with_pii_disabled(
         if reply is not None:
             early += reply.response_body.response.body_mutation.streamed_response.body.decode()
         if "Summary" in early:
-            assert "NEURWERK_MCP_SOURCES" in early
+            assert ("NEURWERK_MCP_SOURCES" in early) is summary
     reply = await handler.handle(response_body(b"", policy=None))
     assert reply is not None
+    early += reply.response_body.response.body_mutation.streamed_response.body.decode()
     frames = [json.loads(frame.data) for frame in SseDecoder().feed(early, final=True)]
     if kind == "anthropic":
         actual = "".join(
@@ -286,7 +289,7 @@ async def test_native_source_history_labels_early_text_with_pii_disabled(
             for part in candidate.get("content", {}).get("parts", [])
             if "text" in part
         )
-    assert actual == marker + "Summary"
+    assert actual == expected
 
 
 def test_native_segments_roundtrip_and_controls(native):
