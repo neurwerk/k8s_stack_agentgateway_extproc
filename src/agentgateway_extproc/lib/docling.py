@@ -184,6 +184,13 @@ class DoclingClient:
                 self.settings.pages - pages,
                 allow_empty_image=images is not None and images.policy_version >= 3,
             )
+            if upload.extraction_incomplete:
+                if not text.strip():
+                    raise DocumentError(diagnostic="projection_incomplete", has_text=False)
+                text = (
+                    "Warning: document extraction is incomplete. Acknowledge that content is "
+                    "missing and do not infer the missing content.\n\n" + text
+                )
             if images is not None and upload.format == "img":
                 if index in (inspect_images or set()):
                     if canonical_image is None:
@@ -265,7 +272,7 @@ class DoclingClient:
                 # A lost POST reply or status does not prove native capacity is free.
                 self._poisoned = True
                 _logger.warning("Docling admission disabled: native job completion is unknown")
-        if status != "success":
+        if status not in {"success", "partial_success"}:
             raise DocumentError(
                 diagnostic="task_unsuccessful", task_id=task_id, native_status=status
             )
@@ -276,8 +283,17 @@ class DoclingClient:
         )
         if (
             not isinstance(value, dict)
-            or value.get("status") != "success"
-            or value.get("errors") != []
+            or value.get("status") not in ("success", "partial_success")
+            or not isinstance(value.get("errors"), list)
+            or any(
+                not isinstance(error, dict)
+                or any(
+                    not isinstance(error.get(field), str)
+                    for field in ("component_type", "module_name", "error_message")
+                )
+                for error in value["errors"]
+            )
+            or (value["status"] == "success" and value["errors"] != [])
             or not isinstance(value.get("document"), dict)
         ):
             result = value if isinstance(value, dict) else {}
@@ -290,6 +306,9 @@ class DoclingClient:
                 errors_present=isinstance(errors, list),
                 document_present=isinstance(result.get("document"), dict),
             )
+        upload.extraction_incomplete = (
+            status == "partial_success" or value["status"] == "partial_success"
+        )
         return value["document"].get("json_content")
 
     async def _http(

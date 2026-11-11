@@ -149,6 +149,7 @@ class Upload:
     data: bytes
     pages: int = 0
     source_bytes: int = 0
+    extraction_incomplete: bool = False
 
 
 @dataclass
