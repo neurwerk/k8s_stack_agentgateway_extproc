@@ -94,7 +94,7 @@ class DoclingClient:
             or self._poisoned
             or self._task is not None
         ):
-            raise DocumentError(reason="extraction_unavailable")
+            raise DocumentError(reason="extraction_unavailable", diagnostic="admission_unavailable")
         abandoned = threading.Event()
         self._abandoned = abandoned
         self._active_stage = "extraction"
@@ -114,7 +114,7 @@ class DoclingClient:
                 if self._active_stage == "image_inspection"
                 else "extraction_timeout"
             )
-            raise DocumentError(504, reason=reason) from None
+            raise DocumentError(504, reason=reason, diagnostic="batch_timeout") from None
         except asyncio.CancelledError:
             abandoned.set()
             raise
@@ -122,7 +122,9 @@ class DoclingClient:
     def _finished(self, task: asyncio.Task[dict[int, str]]) -> None:
         # Retrieve errors even after the requesting stream has gone away.
         if not task.cancelled():
-            task.exception()
+            error = task.exception()
+            if self._abandoned.is_set() and isinstance(error, DocumentError):
+                error.log()
         self._task = None
 
     async def close(self) -> None:
@@ -152,7 +154,7 @@ class DoclingClient:
             raise
         except Exception:  # noqa: BLE001
             # Third-party parsers have multiple malformed-input exception types.
-            raise DocumentError(400) from None
+            raise DocumentError(400, diagnostic="preflight_failed") from None
         del parts
         # The retained task owns the thread and native job, not the caller timeout.
         output: dict[int, str] = {}
@@ -164,7 +166,7 @@ class DoclingClient:
             if abandoned.is_set():
                 break
             if time.monotonic() >= deadline:
-                raise DocumentError(504, reason="extraction_timeout")
+                raise DocumentError(504, reason="extraction_timeout", diagnostic="batch_timeout")
             canonical_image = (
                 upload.data
                 if index in (inspect_images or set()) and upload.format == "img"
@@ -213,7 +215,7 @@ class DoclingClient:
             pages += count
             size += len(text)
             if size > MAX_TEXT:
-                raise DocumentError(413)
+                raise DocumentError(413, diagnostic="batch_text_limit")
             output[index] = text
         return output
 
@@ -264,7 +266,9 @@ class DoclingClient:
                 self._poisoned = True
                 _logger.warning("Docling admission disabled: native job completion is unknown")
         if status != "success":
-            raise DocumentError
+            raise DocumentError(
+                diagnostic="task_unsuccessful", task_id=task_id, native_status=status
+            )
         if abandoned.is_set():
             return None
         value = await self._http(
@@ -276,7 +280,16 @@ class DoclingClient:
             or value.get("errors") != []
             or not isinstance(value.get("document"), dict)
         ):
-            raise DocumentError
+            result = value if isinstance(value, dict) else {}
+            errors = result.get("errors")
+            raise DocumentError(
+                diagnostic="result_rejected",
+                task_id=task_id,
+                native_status=result.get("status"),
+                error_count=len(errors) if isinstance(errors, list) else None,
+                errors_present=isinstance(errors, list),
+                document_present=isinstance(result.get("document"), dict),
+            )
         return value["document"].get("json_content")
 
     async def _http(
@@ -285,7 +298,7 @@ class DoclingClient:
         client = self._client
         key = self.settings.api_key
         if client is None or key is None:
-            raise DocumentError(reason="extraction_unavailable")
+            raise DocumentError(reason="extraction_unavailable", diagnostic="transport_unavailable")
         files = None
         options = None
         if upload is not None:
@@ -307,21 +320,25 @@ class DoclingClient:
                 ) as response,
             ):
                 if not response.is_success:
-                    raise DocumentError(reason="extraction_unavailable")
+                    raise DocumentError(
+                        reason="extraction_unavailable",
+                        diagnostic="http_status_rejected",
+                        http_status=response.status_code,
+                    )
                 if response.headers.get("content-encoding", "identity") != "identity":
-                    raise DocumentError
+                    raise DocumentError(diagnostic="http_encoding_rejected")
                 content = bytearray()
                 async for chunk in response.aiter_bytes():
                     if len(content) + len(chunk) > limit:
-                        raise DocumentError
+                        raise DocumentError(diagnostic="http_response_limit", response_limit=limit)
                     content.extend(chunk)
                 return strict_json_loads(content.decode("utf-8"))
         except (TimeoutError, httpx.TimeoutException):
-            raise DocumentError(504) from None
+            raise DocumentError(504, diagnostic="http_timeout") from None
         except httpx.HTTPError:
-            raise DocumentError(reason="extraction_unavailable") from None
+            raise DocumentError(reason="extraction_unavailable", diagnostic="http_failed") from None
         except ValueError:
-            raise DocumentError from None
+            raise DocumentError(diagnostic="http_json_invalid") from None
 
     def _options(self, source_format: str) -> dict[str, str]:
         options = {
@@ -354,7 +371,7 @@ class DoclingClient:
 
 def _task_status(value: object, expected_id: str | None = None) -> tuple[str, str]:
     if not isinstance(value, dict):
-        raise DocumentError
+        raise DocumentError(diagnostic="task_envelope_invalid")
     task_id, status = value.get("task_id"), value.get("task_status")
     if (
         not isinstance(task_id, str)
@@ -364,5 +381,5 @@ def _task_status(value: object, expected_id: str | None = None) -> tuple[str, st
         or not isinstance(status, str)
         or status not in _STATUSES
     ):
-        raise DocumentError
+        raise DocumentError(diagnostic="task_envelope_invalid")
     return task_id, status

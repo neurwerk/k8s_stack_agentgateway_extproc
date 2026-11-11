@@ -351,6 +351,7 @@ async def process_request(
                             image_locations = _image_locations(payload, images)
                     request, body = _converted_request(payload, texts, controls=request._controls)
             except DocumentError as exc:
+                exc.log(handler.correlation_id)
                 if policy.contract_version == "4.1" and exc.reason.startswith(
                     ("extraction_", "image_analysis_", "image_inspection_")
                 ):
@@ -403,6 +404,7 @@ async def process_request(
             except DocumentError as exc:
                 _clear_request(handler)
                 handler.record_dispatch("transport_failure")
+                exc.log(handler.correlation_id)
                 return immediate_response(exc.status, json.dumps({"error": exc.message}))
             converted = True
             # Discard base64 and wire buffers before the potentially long PII call.

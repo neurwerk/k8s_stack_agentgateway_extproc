@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, cast
 from xml.parsers import expat
 
 from agentgateway_extproc.config.settings import MEBIBYTE, DoclingSettings
+from agentgateway_extproc.lib.extraction_diagnostics import EXPLANATIONS, log_failure, safe_metadata
 from agentgateway_extproc.lib.image_probe import (
     COUNT_HEADER,
     MAX_FACES,
@@ -54,8 +55,17 @@ _OFFICE_PARTS = {
 class DocumentError(Exception):
     """Expose only fixed, content-free errors at the caller boundary."""
 
-    def __init__(self, status: int = 503, *, reason: str | None = None) -> None:
+    def __init__(
+        self,
+        status: int = 503,
+        *,
+        reason: str | None = None,
+        diagnostic: str = "document_rejected",
+        **metadata: object,
+    ) -> None:
         """Select a fixed public error without retaining upstream exception text."""
+        self.diagnostic = diagnostic if diagnostic in EXPLANATIONS else "document_rejected"
+        self.metadata = safe_metadata(metadata)
         self.status = status
         self.reason = (
             reason
@@ -115,6 +125,10 @@ class DocumentError(Exception):
             }[self.reason]
         )
         super().__init__(self.message)
+
+    def log(self, request_id: str | None = None) -> None:
+        """Record internal diagnostics without changing the public rejection message."""
+        log_failure(self.diagnostic, self.metadata, request_id)
 
     @property
     def no_text(self) -> bool:
@@ -618,13 +632,13 @@ class _ChartBudget:
 
 def _object(value: object) -> dict[str, object]:
     if not isinstance(value, dict):
-        raise DocumentError
+        raise DocumentError(diagnostic="object_required")
     return cast(dict[str, object], value)
 
 
 def _list(value: object) -> list[object]:
     if not isinstance(value, list):
-        raise DocumentError
+        raise DocumentError(diagnostic="list_required")
     return cast(list[object], value)
 
 
@@ -634,7 +648,11 @@ def project_document(
     """Project a complete supported tree, never source metadata or raw copies."""
     doc = _object(value)
     if doc.get("schema_name") != "DoclingDocument" or doc.get("version") != "1.10.0":
-        raise DocumentError
+        raise DocumentError(
+            diagnostic="schema_unsupported",
+            schema_name_supported=doc.get("schema_name") == "DoclingDocument",
+            schema_version_supported=doc.get("version") == "1.10.0",
+        )
     allowed = {
         "schema_name",
         "version",
@@ -649,7 +667,7 @@ def project_document(
         "pictures",
     }
     if any(value for key, value in doc.items() if key not in allowed):
-        raise DocumentError
+        raise DocumentError(diagnostic="fields_unsupported", unsupported_fields_present=True)
     pages = _page_count(doc.get("pages"), upload.pages, page_limit)
     nodes: dict[str, dict[str, object]] = {}
     for kind in ("texts", "groups", "tables", "pictures"):
@@ -658,33 +676,40 @@ def project_document(
     for root in ("body", "furniture"):
         nodes[f"#/{root}"] = _object(doc.get(root))
     if len(nodes) > MAX_NODES:
-        raise DocumentError(413)
+        raise DocumentError(413, diagnostic="node_limit", node_count=len(nodes))
     projection = _Projection(nodes)
     output = "\n".join(projection.walk({"$ref": f"#/{root}"}, 0) for root in ("body", "furniture"))
     empty_image = allow_empty_image and upload.format == "img" and not projection.has_text
     if projection.seen != set(nodes) or (not output.strip() and not empty_image):
-        raise DocumentError
+        raise DocumentError(
+            diagnostic="projection_incomplete",
+            node_count=len(nodes),
+            visited_nodes=len(projection.seen),
+            has_text=bool(output.strip()),
+        )
     output = "" if empty_image else f"Document: {upload.filename}\n{output}"
     if len(output) > MAX_TEXT:
-        raise DocumentError(413)
+        raise DocumentError(413, diagnostic="text_limit")
     return output, pages
 
 
 def _page_count(value: object, expected: int, limit: int) -> int:
     pages = _object(value)
     if len(pages) > limit:
-        raise DocumentError(413)
+        raise DocumentError(413, diagnostic="page_limit", actual_pages=len(pages), page_limit=limit)
     if expected and len(pages) != expected:
-        raise DocumentError
+        raise DocumentError(
+            diagnostic="page_count_mismatch", expected_pages=expected, actual_pages=len(pages)
+        )
     for number, page in pages.items():
         if (
             not re.fullmatch(r"[1-9][0-9]{0,3}", number)
             or type(_object(page).get("page_no")) is not int
             or _object(page).get("page_no") != int(number)
         ):
-            raise DocumentError
+            raise DocumentError(diagnostic="page_number_invalid")
     if expected and set(pages) != {str(number) for number in range(1, expected + 1)}:
-        raise DocumentError
+        raise DocumentError(diagnostic="page_sequence_invalid")
     return len(pages)
 
 
@@ -699,18 +724,18 @@ class _Projection:
     def text(self, value: object) -> str:
         """Count only canonical text, not metadata or original copies."""
         if not isinstance(value, str) or "\x00" in value:
-            raise DocumentError
+            raise DocumentError(diagnostic="text_invalid")
         self.text_size += len(value) + 1
         self.has_text |= bool(value.strip())
         if self.text_size > MAX_TEXT:
-            raise DocumentError(413)
+            raise DocumentError(413, diagnostic="text_limit")
         return value
 
     def text_item(self, node: dict[str, object]) -> str:
         """Preserve checkbox state and reject formulas without canonical text."""
         value = node.get("text")
         if not isinstance(value, str) or (node.get("label") == "formula" and not value.strip()):
-            raise DocumentError
+            raise DocumentError(diagnostic="text_item_invalid")
         marker = {"checkbox_selected": "[x]", "checkbox_unselected": "[ ]"}.get(
             node.get("label") if isinstance(node.get("label"), str) else ""
         )
@@ -723,22 +748,22 @@ class _Projection:
         data = _object(value)
         rows, cols = data.get("num_rows"), data.get("num_cols")
         if type(rows) is not int or type(cols) is not int or rows < 1 or cols < 1:
-            raise DocumentError
+            raise DocumentError(diagnostic="table_dimensions_invalid")
         self.cells += rows * cols
         if self.cells > MAX_CELLS:
-            raise DocumentError(413)
+            raise DocumentError(413, diagnostic="table_cell_limit")
         grid = [[""] * cols for _ in range(rows)]
         occupied: set[tuple[int, int]] = set()
         entries = _list(data.get("table_cells"))
         if not entries or len(entries) > rows * cols:
-            raise DocumentError
+            raise DocumentError(diagnostic="table_cells_invalid")
         for raw in entries:
             cell = _object(raw)
             sr, er, sc, ec = _cell_offsets(cell, rows, cols)
             for row in range(sr, er):
                 for col in range(sc, ec):
                     if (row, col) in occupied:
-                        raise DocumentError
+                        raise DocumentError(diagnostic="table_overlap")
                     occupied.add((row, col))
             grid[sr][sc] = (
                 self.walk(cell["ref"], depth + 1) if "ref" in cell else self.text(cell.get("text"))
@@ -750,17 +775,17 @@ class _Projection:
         ref = _object(value)
         pointer = ref.get("$ref")
         if set(ref) != {"$ref"} or not isinstance(pointer, str) or pointer not in self.nodes:
-            raise DocumentError
+            raise DocumentError(diagnostic="reference_invalid")
         if pointer in self.active:
-            raise DocumentError
+            raise DocumentError(diagnostic="reference_cycle")
         self.edges += 1
         if depth > 32 or self.edges > MAX_CELLS:
-            raise DocumentError(413)
+            raise DocumentError(413, diagnostic="reference_limit")
         if pointer in self.seen:
             return ""
         node = self.nodes[pointer]
         if node.get("self_ref") != pointer:
-            raise DocumentError
+            raise DocumentError(diagnostic="self_reference_invalid")
         self.active.add(pointer)
         output: list[str] = []
         if pointer.startswith("#/texts/"):
@@ -781,8 +806,8 @@ def _cell_offsets(cell: dict[str, object], rows: int, cols: int) -> tuple[int, i
         for edge in ("start", "end")
     ]
     if any(type(offset) is not int for offset in offsets):
-        raise DocumentError
+        raise DocumentError(diagnostic="cell_offsets_invalid")
     sr, er, sc, ec = cast(list[int], offsets)
     if not (0 <= sr < er <= rows and 0 <= sc < ec <= cols):
-        raise DocumentError
+        raise DocumentError(diagnostic="cell_offsets_invalid")
     return sr, er, sc, ec
