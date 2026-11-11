@@ -1,8 +1,9 @@
-"""Fixed extraction explanations and bounded, content-free log metadata."""
+"""Safe extraction explanations and opt-in bounded native error diagnostics."""
 
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import re
 
@@ -74,6 +75,33 @@ VLM_EXPLANATIONS = {
         "Document conversion stopped because the VLM output was content-filtered."
     ),
 }
+
+
+def log_native_errors(errors: object, task_id: str) -> None:
+    """Log selected native fields at DEBUG; error text may contain document data."""
+    if not _logger.isEnabledFor(logging.DEBUG) or not isinstance(errors, list) or not errors:
+        return
+    entries = []
+    for error in errors[:8]:
+        if not isinstance(error, dict):
+            continue
+        entry: dict[str, str | int] = {}
+        for field in ("error_message", "category", "component_type", "module_name"):
+            value = error.get(field)
+            if isinstance(value, str):
+                limit = 2048 if field == "error_message" else 128
+                entry[field] = value[:limit] + ("...[truncated]" if len(value) > limit else "")
+        page = error.get("page_no")
+        if type(page) is int and 1 <= page <= 1000:
+            entry["page_no"] = page
+        if entry:
+            entries.append(entry)
+    _logger.debug(
+        "Docling native errors task_id_hash=%s error_count=%s errors=%s",
+        safe_metadata({"task_id": task_id}).get("task_id_hash", "unavailable"),
+        len(errors),
+        json.dumps(entries, ensure_ascii=True),
+    )
 
 
 def native_error_metadata(errors: object) -> dict[str, str | int | bool]:

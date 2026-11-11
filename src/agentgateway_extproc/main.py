@@ -28,6 +28,14 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
         level=settings.log_level,
     )
+    if logging.getLogger("agentgateway_extproc.lib.extraction_diagnostics").isEnabledFor(
+        logging.DEBUG
+    ):
+        logging.getLogger(__name__).warning(
+            "DEBUG logging is enabled: upstream diagnostic errors may contain sensitive "
+            "document data, including filenames and document snippets. "
+            "Disable DEBUG after troubleshooting."
+        )
     try:
         asyncio.run(_run(settings))
     except KeyboardInterrupt:
