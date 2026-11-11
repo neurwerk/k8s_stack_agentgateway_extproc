@@ -42,10 +42,11 @@ SENTINEL = "synthetic-sentinel"
 
 @pytest.mark.parametrize("kind", ["chat", "responses"])
 @pytest.mark.parametrize("streaming", [False, True])
-@pytest.mark.parametrize("structured", [False, True])
-async def test_source_history_enforced_and_labels_precede_text_without_notices(
-    admission, source_engine, kind, streaming, structured
+@pytest.mark.parametrize("output_mode", ["plain", "summary", "structured"])
+async def test_source_history_enforced_without_automatic_answer_labels(
+    admission, source_engine, kind, streaming, output_mode
 ):
+    structured = output_mode == "structured"
     client, calls = source_engine
     admission["destination_policy"]["models"]["example-chat"] = False
     messages = request_messages(admission, kind, stream=streaming)
@@ -84,8 +85,12 @@ async def test_source_history_enforced_and_labels_precede_text_without_notices(
         response_headers("text/event-stream" if streaming else "application/json", policy=admission)
     )
     marker = source_marker(["MCP_TOOL_BRAVE", "MCP_TOOL_SALESFORCE"])
-    text = '{"summary":"business"}' if structured else GUARD_INSTRUCTION + marker + "Summary"
-    expected = text if structured else marker + marker + "Summary"
+    expected = (
+        '{"summary":"business"}'
+        if structured
+        else (marker + "Summary" if output_mode == "summary" else "Summary")
+    )
+    text = expected if structured else expected + GUARD_INSTRUCTION
     if not streaming:
         reply = await handler.handle(
             response_body(json.dumps(response_payload(kind, text=text)).encode(), policy=admission)
@@ -98,6 +103,17 @@ async def test_source_history_enforced_and_labels_precede_text_without_notices(
             else result["output"][0]["content"][0]["text"]
         )
         assert actual == expected
+        if output_mode == "summary" and kind == "chat":
+            # Compacted context keeps classifications without the original tool history.
+            payload["messages"] = [
+                {"role": "assistant", "content": actual},
+                {"role": "user", "content": "Continue from this summary"},
+            ]
+            compacted = StreamHandler(client)
+            await compacted.handle(messages[0])
+            await compacted.handle(body_request(json.dumps(payload).encode(), policy=admission))
+            assert calls[-1]["mcp_sources"] == ["MCP_TOOL_BRAVE", "MCP_TOOL_SALESFORCE"]
+            assert calls[-1]["text_pii_enabled"] is False
         return
     emitted = ""
     early = ""
@@ -141,7 +157,7 @@ async def test_source_history_enforced_and_labels_precede_text_without_notices(
         )
         assert frames[-1]["response"]["output"][0]["content"][0]["text"] == expected
     assert actual == expected
-    assert ("NEURWERK_MCP_SOURCES" in early) is not structured
+    assert ("NEURWERK_MCP_SOURCES" in early) is (output_mode == "summary")
 
 
 @pytest.mark.parametrize("streaming", [False, True])
@@ -329,7 +345,6 @@ async def test_chat_held_choices_keep_detached_markers_after_text(
     engine_client, _ = reasoning_engine
     handler = await notice_handler(admission, engine_client, "chat", stream=True)
     handler.mcp_sources = ["MCP_TOOL_SALESFORCE"] if labeled else []
-    marker = source_marker(handler.mcp_sources)
     prefixes = ("", "") if tail_only else ("First ", "Last ")
     events = stream_events("chat", text=prefixes[0] + "<REV_PERSON")
     later = stream_events("chat", text=prefixes[1] + "<REV_PERSON")[:-2]
@@ -352,8 +367,8 @@ async def test_chat_held_choices_keep_detached_markers_after_text(
     for index, prefix in enumerate(prefixes):
         own = [choice for choice in choices if choice["index"] == index]
         text = "".join(choice["delta"].get("content", "") for choice in own)
-        assert text.startswith(marker + prefix + "<PII_INVALID_")
-        assert text.count("<NEURWERK_MCP_SOURCES>") == int(labeled)
+        assert text.startswith(prefix + "<PII_INVALID_")
+        assert "<NEURWERK_MCP_SOURCES>" not in text
         assert own[-1]["finish_reason"] == "stop"
         assert "PII protection notice" not in own[-1]["delta"].get("content", "")
         if index == 0:
@@ -386,9 +401,7 @@ async def test_responses_stream_notice_matches_snapshots(
     text = "".join(
         event["delta"] for event in events if event["type"] == "response.output_text.delta"
     )
-    assert text.startswith(
-        source_marker(handler.mcp_sources) + "<PII_INVALID_" if source_tail else "Jane Doe"
-    )
+    assert text.startswith("<PII_INVALID_" if source_tail else "Jane Doe")
     assert text.count("PII protection notice — powered by neurwerk") == (0 if tools else 1)
     assert (
         next(event["text"] for event in events if event["type"] == "response.output_text.done")

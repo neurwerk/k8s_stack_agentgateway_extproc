@@ -72,8 +72,23 @@ async def test_mcp_trusted_source_survives_spoof_without_text_arguments(
         "id": 1,
         "result": {
             "source_class": "MCP_TOOL_SPOOF",
-            "content": [{"type": "text", "text": text}],
-            "structuredContent": {"name": "unchanged"},
+            "content": [
+                {"type": "text", "text": text, "annotations": {"audience": ["assistant"]}},
+                {"type": "image", "data": "aW1hZ2U=", "mimeType": "image/png"},
+                {
+                    "type": "resource",
+                    "resource": {
+                        "uri": "file:///data",
+                        "text": source_marker(["MCP_TOOL_RESOURCE"]) + "original resource",
+                    },
+                },
+                {"type": "text", "text": "second original text", "_meta": {"key": "value"}},
+            ],
+            "structuredContent": {
+                "name": "unchanged",
+                "nested": [source_marker(["MCP_TOOL_STRUCTURED"]) + "data"],
+            },
+            "_meta": {"key": "original metadata"},
         },
     }
     body = json.dumps(payload)
@@ -91,14 +106,89 @@ async def test_mcp_trusted_source_survives_spoof_without_text_arguments(
     assert response is not None
     output = response.response_body.response.body_mutation.streamed_response.body.decode()
     restored = json.loads(output.split("data: ", 1)[1] if streaming else output)
-    assert restored["result"]["content"][0]["text"].startswith(
-        "<NEURWERK_MCP_SOURCES>MCP_TOOL_BRAVE,MCP_TOOL_SALESFORCE</NEURWERK_MCP_SOURCES>\n"
-    )
-    assert restored["result"]["structuredContent"] == {"name": "unchanged"}
+    assert restored["result"]["content"] == [
+        {
+            "type": "text",
+            "text": source_marker(
+                [
+                    "MCP_TOOL_BRAVE",
+                    "MCP_TOOL_RESOURCE",
+                    "MCP_TOOL_SALESFORCE",
+                    "MCP_TOOL_STRUCTURED",
+                ]
+            ),
+        },
+        *payload["result"]["content"],
+    ]
+    assert {k: v for k, v in restored["result"].items() if k != "content"} == {
+        k: v for k, v in payload["result"].items() if k != "content"
+    }
     assert collect_sources([restored["result"]["content"][0]["text"]]) == [
         "MCP_TOOL_BRAVE",
+        "MCP_TOOL_RESOURCE",
         "MCP_TOOL_SALESFORCE",
+        "MCP_TOOL_STRUCTURED",
     ]
+
+
+@pytest.mark.parametrize("content", [None, []])
+async def test_empty_tool_result_has_source_block(engine_client, content):
+    policy = mcp_policy(pii_enabled=False)
+    handler = StreamHandler(engine_client)
+    await handler.handle(header_request(mcp_headers(), policy=policy))
+    await handler.handle(
+        body_request(
+            json.dumps(
+                {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "empty"}}
+            ).encode(),
+            policy=policy,
+        )
+    )
+    await handler.handle(response_headers("application/json", policy=policy))
+    result = {} if content is None else {"content": content}
+    response = await handler.handle(
+        response_body(
+            json.dumps({"jsonrpc": "2.0", "id": 1, "result": result}).encode(), policy=policy
+        )
+    )
+    assert response is not None
+    restored = json.loads(response.response_body.response.body_mutation.streamed_response.body)
+    assert restored["result"] == {
+        "content": [{"type": "text", "text": source_marker(["MCP_TOOL_DEFAULT"])}]
+    }
+
+
+async def test_tool_discovery_preserves_output_schema_and_response_bytes(engine_client):
+    policy = mcp_policy(pii_enabled=False)
+    handler = StreamHandler(engine_client)
+    await handler.handle(header_request(mcp_headers(), policy=policy))
+    await handler.handle(
+        body_request(b'{"jsonrpc":"2.0","id":1,"method":"tools/list"}', policy=policy)
+    )
+    await handler.handle(response_headers("application/json", policy=policy))
+    upstream = json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "tools": [
+                    {
+                        "name": "lookup",
+                        "inputSchema": {"type": "object"},
+                        "outputSchema": {
+                            "type": "object",
+                            "properties": {"value": {"type": "string"}},
+                            "required": ["value"],
+                            "additionalProperties": False,
+                        },
+                    }
+                ]
+            },
+        }
+    ).encode()
+    response = await handler.handle(response_body(upstream, policy=policy))
+    assert response is not None
+    assert response.response_body.response.body_mutation.streamed_response.body == upstream
 
 
 @pytest.mark.parametrize("value", [None, "MCP_TOOL_", "mcp_tool_brave", "MCP_TOOL_" + "A" * 56])
@@ -775,15 +865,21 @@ async def test_mcp_pii_disabled_text_call_is_protocol_only(engine_client) -> Non
     analyze.assert_not_awaited()
     session_key.assert_not_called()
 
-    upstream = (
-        b'{ "jsonrpc":"2.0", "id":"call-1", "result":{"value":"'
-        + REVERSIBLE_TOKEN.encode()
-        + b'"} }'
-    )
+    upstream = json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "id": "call-1",
+            "result": {"content": [{"type": "text", "text": REVERSIBLE_TOKEN}]},
+        }
+    ).encode()
     assert await handler.handle(response_headers("application/json", policy=policy)) is None
     response = await handler.handle(response_body(upstream, policy=policy))
     assert response is not None
-    assert response.response_body.response.body_mutation.streamed_response.body == upstream
+    restored = json.loads(response.response_body.response.body_mutation.streamed_response.body)
+    assert restored["result"]["content"] == [
+        {"type": "text", "text": source_marker(["MCP_TOOL_DEFAULT"])},
+        {"type": "text", "text": REVERSIBLE_TOKEN},
+    ]
     headers = handler.pop_pending_response_headers()
     assert headers is not None
     assert {
@@ -874,8 +970,10 @@ async def test_mcp_malformed_client_response_is_rejected_before_engine(
     analyze.assert_not_awaited()
 
 
+@pytest.mark.parametrize("content", [None, []])
 async def test_mcp_pii_disabled_gzip_response_preserves_structured_only_result(
     engine_client,
+    content,
 ) -> None:
     policy = mcp_policy(pii_enabled=False)
     request = {
@@ -884,8 +982,11 @@ async def test_mcp_pii_disabled_gzip_response_preserves_structured_only_result(
         "method": "tools/call",
         "params": {"name": "search", "arguments": {"query": REVERSIBLE_TOKEN}},
     }
+    result = {"structuredContent": {"value": REVERSIBLE_TOKEN, "count": 7}}
+    if content is not None:
+        result["content"] = content
     upstream = json.dumps(
-        {"jsonrpc": "2.0", "id": 3, "result": {"value": REVERSIBLE_TOKEN}},
+        {"jsonrpc": "2.0", "id": 3, "result": result},
         separators=(",", ":"),
     ).encode()
     encoded = gzip.compress(upstream)
@@ -899,9 +1000,13 @@ async def test_mcp_pii_disabled_gzip_response_preserves_structured_only_result(
     assert first is None
     response = await handler.handle(response_body(encoded[len(encoded) // 2 :], policy=policy))
     assert response is not None
-    assert json.loads(
-        response.response_body.response.body_mutation.streamed_response.body
-    ) == json.loads(upstream)
+    restored = json.loads(response.response_body.response.body_mutation.streamed_response.body)
+    assert restored["result"]["structuredContent"] == result["structuredContent"]
+    assert restored["result"]["content"][0] == {
+        "type": "text",
+        "text": source_marker(["MCP_TOOL_DEFAULT"]),
+    }
+    assert json.loads(restored["result"]["content"][1]["text"]) == result["structuredContent"]
     headers = handler.pop_pending_response_headers()
     assert headers is not None
     removed = headers.response_headers.response.header_mutation.remove_headers
@@ -1125,13 +1230,11 @@ async def test_mcp_response_reverses_only_authorized_result_locations(
         assert transformed == payload
         return
     assert transformed["result"]["isError"] is (outcome == "tool-error")
-    assert (
-        transformed["result"]["content"][0]["text"]
-        == source_marker(["MCP_TOOL_DEFAULT"]) + "Jane Doe"
-    )
-    assert transformed["result"]["content"][1]["resource"]["text"] == "Jane Doe"
+    assert transformed["result"]["content"][0]["text"] == source_marker(["MCP_TOOL_DEFAULT"])
+    assert transformed["result"]["content"][1]["text"] == "Jane Doe"
+    assert transformed["result"]["content"][2]["resource"]["text"] == "Jane Doe"
     assert transformed["result"]["structuredContent"]["nested"] == ["Jane Doe"]
-    assert transformed["result"]["content"][1]["resource"]["uri"] == "file:///safe"
+    assert transformed["result"]["content"][2]["resource"]["uri"] == "file:///safe"
 
 
 @pytest.mark.parametrize(
@@ -1304,7 +1407,9 @@ async def test_mcp_sse_metadata_cannot_carry_placeholders(
         await handler.handle(response_body(f"{metadata_line}\n\n".encode(), policy=policy))
 
 
-async def test_mcp_pii_disabled_sse_is_byte_identical(engine_client) -> None:
+async def test_mcp_pii_disabled_sse_preserves_server_messages_and_labels_empty_result(
+    engine_client,
+) -> None:
     policy = mcp_policy(pii_enabled=False)
     request = {
         "jsonrpc": "2.0",
@@ -1325,7 +1430,7 @@ async def test_mcp_pii_disabled_sse_is_byte_identical(engine_client) -> None:
         separators=(",", ":"),
     )
     final = json.dumps(
-        {"jsonrpc": "2.0", "id": 9, "result": {"value": REVERSIBLE_TOKEN}},
+        {"jsonrpc": "2.0", "id": 9, "result": {"content": []}},
         separators=(",", ":"),
     )
     stream = (
@@ -1333,7 +1438,12 @@ async def test_mcp_pii_disabled_sse_is_byte_identical(engine_client) -> None:
     ).encode()
     response = await handler.handle(response_body(stream, policy=policy))
     assert response is not None
-    assert response.response_body.response.body_mutation.streamed_response.body == stream
+    output = response.response_body.response.body_mutation.streamed_response.body.decode()
+    assert output.startswith(f"\r\n\nevent:message\r\ndata:{server_message}\r\n\r\n\r\n")
+    final_data = output.split("data:")[-1]
+    assert json.loads(final_data)["result"]["content"] == [
+        {"type": "text", "text": source_marker(["MCP_TOOL_DEFAULT"])}
+    ]
 
 
 async def test_mcp_notification_empty_json_202_is_acknowledged(engine_client) -> None:
@@ -1687,10 +1797,8 @@ async def test_mcp_gzip_json_response_is_bounded_and_reversed(engine_client, eng
     )
     assert response is not None
     transformed = json.loads(response.response_body.response.body_mutation.streamed_response.body)
-    assert (
-        transformed["result"]["content"][0]["text"]
-        == source_marker(["MCP_TOOL_DEFAULT"]) + "Jane Doe"
-    )
+    assert transformed["result"]["content"][0]["text"] == source_marker(["MCP_TOOL_DEFAULT"])
+    assert transformed["result"]["content"][1]["text"] == "Jane Doe"
 
 
 async def test_header_only_mcp_get_and_response_events_pass_without_engine(engine_client) -> None:

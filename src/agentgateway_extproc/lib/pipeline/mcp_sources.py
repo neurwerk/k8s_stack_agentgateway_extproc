@@ -49,11 +49,5 @@ def collect_sources(texts: Iterable[str]) -> list[str]:
 
 
 def source_marker(sources: list[str]) -> str:
-    """Render the canonical complete label before any generated text."""
+    """Render a canonical complete source metadata block."""
     return f"{_OPEN}{','.join(sources)}{_CLOSE}\n" if sources else ""
-
-
-def prefix_sources(text: str, sources: list[str]) -> str:
-    """Prefix a complete carrier without duplicating an already canonical prefix."""
-    marker = source_marker(sources)
-    return text if not marker or text.startswith(marker) else marker + text
