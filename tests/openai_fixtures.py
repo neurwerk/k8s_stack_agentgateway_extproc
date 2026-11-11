@@ -46,7 +46,7 @@ def reasoning_value(kind):
     }
 
 
-def response_payload(kind, text=REVERSIBLE_TOKEN, *, tools=False, reasoning=False):
+def response_payload(kind, text=REVERSIBLE_TOKEN, *, tools=False, reasoning=False, tool_count=1):
     payload = json.loads(
         (Path(__file__).parent / f"fixtures/openai-{kind}-response.json").read_text()
     )
@@ -81,13 +81,30 @@ def response_payload(kind, text=REVERSIBLE_TOKEN, *, tools=False, reasoning=Fals
             payload["choices"][0]["message"].update(reasoning_value(kind))
         else:
             payload["output"].insert(0, reasoning_value(kind))
+    if tools and tool_count != 1:
+        template = (
+            payload["choices"][0]["message"]["tool_calls"][0]
+            if kind == "chat"
+            else payload["output"][-1]
+        )
+        calls = []
+        for index in range(tool_count):
+            call = deepcopy(template)
+            call["id"] = f"call-{index}"
+            if kind == "responses":
+                call["call_id"] = f"call-{index}"
+            calls.append(call)
+        if kind == "chat":
+            payload["choices"][0]["message"]["tool_calls"] = calls
+        else:
+            payload["output"][-1:] = calls
     return payload
 
 
 def stream_events(  # noqa: C901
-    kind, text=REVERSIBLE_TOKEN, *, tools=False, reasoning=False, empty_terminal=False
+    kind, text=REVERSIBLE_TOKEN, *, tools=False, reasoning=False, empty_terminal=False, tool_count=1
 ):
-    payload = response_payload(kind, text, tools=tools)
+    payload = response_payload(kind, text, tools=tools, tool_count=tool_count)
     if kind == "chat":
         envelope = {key: value for key, value in payload.items() if key not in {"choices", "usage"}}
         envelope["object"] = "chat.completion.chunk"
@@ -116,22 +133,27 @@ def stream_events(  # noqa: C901
                                     for fragment in (block[field][:4], block[field][4:])
                                 )
         events += [chunk({"content": part}) for part in [text[:12], text[12:]]]
-        if tools:
-            tool = payload["choices"][0]["message"]["tool_calls"][0]
+        for tool_index, tool in enumerate(payload["choices"][0]["message"].get("tool_calls", [])):
             arguments = tool["function"]["arguments"]
             events += [
                 chunk(
                     {
                         "tool_calls": [
                             {
-                                "index": 0,
+                                "index": tool_index,
                                 **tool,
                                 "function": {"name": "lookup", "arguments": arguments[:16]},
                             }
                         ]
                     }
                 ),
-                chunk({"tool_calls": [{"index": 0, "function": {"arguments": arguments[16:]}}]}),
+                chunk(
+                    {
+                        "tool_calls": [
+                            {"index": tool_index, "function": {"arguments": arguments[16:]}}
+                        ]
+                    }
+                ),
             ]
         return [
             *events,
@@ -162,14 +184,13 @@ def stream_events(  # noqa: C901
         {"type": "response.content_part.done", **coordinates, "part": part},
         {"type": "response.output_item.done", "output_index": 0, "item": message},
     ]
-    if tools:
-        tool = payload["output"][1]
+    for tool_index, tool in enumerate(payload["output"][1:], start=1):
         arguments = tool["arguments"]
-        coordinates = {"item_id": tool["id"], "output_index": 1}
+        coordinates = {"item_id": tool["id"], "output_index": tool_index}
         events += [
             {
                 "type": "response.output_item.added",
-                "output_index": 1,
+                "output_index": tool_index,
                 "item": {**tool, "status": "in_progress", "arguments": ""},
             },
             *[
@@ -181,7 +202,7 @@ def stream_events(  # noqa: C901
                 **coordinates,
                 "arguments": arguments,
             },
-            {"type": "response.output_item.done", "output_index": 1, "item": tool},
+            {"type": "response.output_item.done", "output_index": tool_index, "item": tool},
         ]
     events.append({"type": "response.completed", "response": payload})
     if reasoning:

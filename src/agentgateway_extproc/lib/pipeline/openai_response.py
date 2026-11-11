@@ -78,13 +78,20 @@ def _complete_response(response: ResponsesResponse) -> None:
         _complete_item(item)
 
 
-def validate_json_response(kind: str, payload: object) -> None:
+def validate_json_response(kind: str, payload: object, *, max_tool_calls: int = 32) -> None:
     """Admit only complete, supported JSON envelopes, including all nested output fields."""
     if kind == "responses":
-        _complete_response(ResponsesResponse.model_validate(payload))
+        response = ResponsesResponse.model_validate(payload)
+        _check_tool_budget(
+            sum(isinstance(item, OutputFunction) for item in response.output), max_tool_calls
+        )
+        _complete_response(response)
         return
     response = ChatResponse.model_validate(payload)
     _unique([choice.index for choice in response.choices])
+    _check_tool_budget(
+        sum(len(choice.message.tool_calls or []) for choice in response.choices), max_tool_calls
+    )
     for choice in response.choices:
         tools = choice.message.tool_calls or []
         _unique([tool.id for tool in tools])
@@ -92,6 +99,11 @@ def validate_json_response(kind: str, payload: object) -> None:
             raise InvalidReversalError("tool completion has no calls")
         for tool in tools:
             _arguments(tool.function.arguments)
+
+
+def _check_tool_budget(count: int, limit: int) -> None:
+    if count > limit:
+        raise InvalidReversalError("model response exceeds tool call limit")
 
 
 @dataclass
@@ -195,12 +207,19 @@ class OpenAIStreamValidator:
     """Track bounded v5 choices/items and require a real protocol terminal at EOF."""
 
     def __init__(
-        self, kind: str, *, openrouter: bool = False, local_created_drift: bool = False
+        self,
+        kind: str,
+        *,
+        openrouter: bool = False,
+        local_created_drift: bool = False,
+        max_tool_calls: int = 32,
     ) -> None:
         """Keep only stream-local identities, hashes and incomplete tool arguments."""
         self.kind = kind
         self.openrouter = openrouter
         self.local_created_drift = local_created_drift
+        self.max_tool_calls = max_tool_calls
+        self._tool_call_count = 0
         self._router_usage_seen = False
         self._finish_reasons: dict[int, str] = {}
         self.terminal = False
@@ -327,11 +346,16 @@ class OpenAIStreamValidator:
                 raise InvalidReversalError("function delta has no identity")
             if any(previous.id == tool.id for previous in self.tools.values()):
                 raise InvalidReversalError("duplicate function identity")
+            self._admit_tool_call()
             state = self.tools[key] = _ChatTool(tool.id, name)
         elif tool.id not in {None, state.id} or name not in {None, state.name}:
             raise InvalidReversalError("function identity changed")
         if tool.function is not None and tool.function.arguments is not None:
             state.arguments.append(tool.function.arguments)
+
+    def _admit_tool_call(self) -> None:
+        _check_tool_budget(self._tool_call_count + 1, self.max_tool_calls)
+        self._tool_call_count += 1
 
     def _responses(self, event: SseEvent, payload: object) -> None:
         parsed = RESPONSES_EVENT.validate_python(payload)
@@ -414,6 +438,8 @@ class OpenAIStreamValidator:
                 else item.arguments
             ):
                 raise InvalidReversalError("output item must start empty")
+            if isinstance(item, OutputFunction):
+                self._admit_tool_call()
             self.items[event.output_index] = _Item(item)
         else:
             state = self.items.get(event.output_index)
