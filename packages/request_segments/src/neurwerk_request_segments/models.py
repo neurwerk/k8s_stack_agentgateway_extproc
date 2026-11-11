@@ -224,7 +224,7 @@ class EngineMessage(RequestModel, ChatReasoning):
     role: Literal["system", "developer", "user", "assistant", "tool", "function"]
     content: EngineMessageContent | None = None
     name: str | None = Field(default=None, max_length=256)
-    tool_calls: list[EngineToolCall] | None = Field(default_factory=list, max_length=32)
+    tool_calls: list[EngineToolCall] | None = Field(default_factory=list)
     tool_call_id: str | None = Field(default=None, max_length=256)
     function_call: EngineFunction | None = None
     refusal: str | None = None

@@ -149,6 +149,7 @@ class Settings(BaseSettings):
     )
     max_request_bytes: int = Field(default=MAX_REQUEST_BYTES, ge=1_024, le=MAX_UPLOAD_REQUEST_BYTES)
     max_reasoning_fingerprints: int = Field(default=4096, ge=1)
+    max_tool_calls_per_response: int = Field(default=32, ge=1, le=128)
     max_response_bytes: int = Field(default=MAX_RESPONSE_BYTES, ge=1_024, le=MAX_RESPONSE_BYTES)
     max_transformed_request_bytes: int = Field(
         default=MAX_RESPONSE_BYTES, ge=1_024, le=MAX_RESPONSE_BYTES

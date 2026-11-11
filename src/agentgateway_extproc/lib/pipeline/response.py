@@ -400,7 +400,9 @@ def _validate_profile_response(handler: StreamHandler, payload: Any) -> None:
     """Validate content carriers and completion before restoration."""
     if handler.admission is None or handler.response_api_kind == "mcp":
         return
-    validate_json_response(handler.response_api_kind, payload)
+    validate_json_response(
+        handler.response_api_kind, payload, max_tool_calls=handler.max_tool_calls_per_response
+    )
 
 
 def _reverse_human_json_text(handler: StreamHandler, payload: Any) -> None:
@@ -577,6 +579,7 @@ class SseResponseProcessor:
                 handler.response_api_kind,
                 openrouter=handler.admission.request_context.provider_id == "openrouter",
                 local_created_drift=_local_chat_dispatch(handler),
+                max_tool_calls=handler.max_tool_calls_per_response,
             )
             if handler.admission is not None
             else None

@@ -145,6 +145,7 @@ class StreamHandler:
         self.request_processed = False
         self.max_request_bytes = limits.max_request_bytes
         self.max_reasoning_fingerprints = limits.max_reasoning_fingerprints
+        self.max_tool_calls_per_response = limits.max_tool_calls_per_response
         self.max_response_bytes = limits.max_response_bytes
         self.max_transformed_request_bytes = limits.max_transformed_request_bytes
         self.response_encoded_bytes = 0
