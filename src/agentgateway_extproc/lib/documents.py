@@ -21,7 +21,12 @@ from typing import TYPE_CHECKING, cast
 from xml.parsers import expat
 
 from agentgateway_extproc.config.settings import MEBIBYTE, DoclingSettings
-from agentgateway_extproc.lib.extraction_diagnostics import EXPLANATIONS, log_failure, safe_metadata
+from agentgateway_extproc.lib.extraction_diagnostics import (
+    EXPLANATIONS,
+    VLM_EXPLANATIONS,
+    log_failure,
+    safe_metadata,
+)
 from agentgateway_extproc.lib.image_probe import (
     COUNT_HEADER,
     MAX_FACES,
@@ -124,6 +129,9 @@ class DocumentError(Exception):
                 ),
             }[self.reason]
         )
+        explanation = VLM_EXPLANATIONS.get(str(self.metadata.get("error_code")))
+        if explanation is not None:
+            self.message += " " + explanation
         super().__init__(self.message)
 
     def log(self, request_id: str | None = None) -> None:
