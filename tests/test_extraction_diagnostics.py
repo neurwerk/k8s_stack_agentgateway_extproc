@@ -110,7 +110,7 @@ async def test_partial_result_is_rejected_with_correlated_safe_diagnostics(
             if stop_reason == "length"
             else "Document conversion stopped because the VLM output was content-filtered."
         )
-        assert explanation in error["message"]
+        assert f"Page 1: {explanation}" in error["message"]
         assert explanation in diagnostic.getMessage()
     else:
         assert error["message"].endswith("text extraction could not be completed.")
@@ -149,13 +149,16 @@ async def test_partial_result_is_rejected_with_correlated_safe_diagnostics(
         (None, None),
     ],
 )
-async def test_native_error_details_reject_untrusted_values(message, page, caplog):
+@pytest.mark.parametrize("known_stop", [False, True])
+async def test_native_error_details_reject_untrusted_values(message, page, caplog, known_stop):
     client = DoclingClient(DoclingSettings())
     result = {
         "status": "partial_success",
         "errors": [
             {
-                "error_message": message,
+                "error_message": (
+                    "VLM output incomplete (stop_reason=length)." if known_stop else message
+                ),
                 "category": ["private-category"],
                 "page_no": page,
                 "stop_reason": "length",
@@ -183,14 +186,21 @@ async def test_native_error_details_reject_untrusted_values(message, page, caplo
         "extraction_failed",
         "result_rejected",
     )
-    assert error.message == "neurwerk: text extraction could not be completed."
-    assert set(error.metadata) == {
+    expected_message = "neurwerk: text extraction could not be completed."
+    expected_keys = {
         "task_id_hash",
         "native_status",
         "error_count",
         "errors_present",
         "document_present",
     }
+    if known_stop:
+        expected_message += (
+            " Document conversion stopped because the VLM output token limit was reached."
+        )
+        expected_keys.update({"error_code", "stop_reason"})
+    assert error.message == expected_message
+    assert set(error.metadata) == expected_keys
     error.log("request-1")
     assert "private-" not in caplog.text + str(error)
     assert "9876" not in caplog.text + str(error)

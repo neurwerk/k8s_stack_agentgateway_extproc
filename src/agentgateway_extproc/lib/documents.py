@@ -131,6 +131,9 @@ class DocumentError(Exception):
         )
         explanation = VLM_EXPLANATIONS.get(str(self.metadata.get("error_code")))
         if explanation is not None:
+            page_no = self.metadata.get("page_no")
+            if page_no is not None:
+                explanation = f"Page {page_no}: {explanation}"
             self.message += " " + explanation
         super().__init__(self.message)
 
