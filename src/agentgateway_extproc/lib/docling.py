@@ -22,6 +22,7 @@ from agentgateway_extproc.lib.documents import (
     preflight,
     project_document,
 )
+from agentgateway_extproc.lib.extraction_diagnostics import native_error_metadata
 from agentgateway_extproc.lib.image_inspection import (
     ImageInspectionClient,
     ImageInspectionTimeoutError,
@@ -282,6 +283,7 @@ class DoclingClient:
         ):
             result = value if isinstance(value, dict) else {}
             errors = result.get("errors")
+            error_metadata = native_error_metadata(errors)
             raise DocumentError(
                 diagnostic="result_rejected",
                 task_id=task_id,
@@ -289,6 +291,10 @@ class DoclingClient:
                 error_count=len(errors) if isinstance(errors, list) else None,
                 errors_present=isinstance(errors, list),
                 document_present=isinstance(result.get("document"), dict),
+                category=error_metadata.get("category"),
+                page_no=error_metadata.get("page_no"),
+                stop_reason=error_metadata.get("stop_reason"),
+                error_code=error_metadata.get("error_code"),
             )
         return value["document"].get("json_content")
 
