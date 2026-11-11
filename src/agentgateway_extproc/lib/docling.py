@@ -22,7 +22,7 @@ from agentgateway_extproc.lib.documents import (
     preflight,
     project_document,
 )
-from agentgateway_extproc.lib.extraction_diagnostics import native_error_metadata
+from agentgateway_extproc.lib.extraction_diagnostics import log_native_errors, native_error_metadata
 from agentgateway_extproc.lib.image_inspection import (
     ImageInspectionClient,
     ImageInspectionTimeoutError,
@@ -267,6 +267,7 @@ class DoclingClient:
                 self._poisoned = True
                 _logger.warning("Docling admission disabled: native job completion is unknown")
         if status != "success":
+            log_native_errors([value], task_id)
             raise DocumentError(
                 diagnostic="task_unsuccessful", task_id=task_id, native_status=status
             )
@@ -283,6 +284,7 @@ class DoclingClient:
         ):
             result = value if isinstance(value, dict) else {}
             errors = result.get("errors")
+            log_native_errors(errors, task_id)
             error_metadata = native_error_metadata(errors)
             raise DocumentError(
                 diagnostic="result_rejected",

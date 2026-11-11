@@ -2,6 +2,7 @@
 
 import base64
 import json
+import logging
 import re
 import threading
 from unittest.mock import AsyncMock, patch
@@ -13,14 +14,18 @@ from agentgateway_extproc.config.settings import DoclingSettings, Settings
 from agentgateway_extproc.controllers.grpc_servicer import ExtProcServicer
 from agentgateway_extproc.lib.docling import DoclingClient
 from agentgateway_extproc.lib.documents import DocumentError, Upload, project_document
+from agentgateway_extproc.lib.extraction_diagnostics import log_native_errors
+from agentgateway_extproc.main import main
 
 from .conftest import MODEL_POLICY, body_request, header_request
 
 
 @pytest.mark.parametrize("stop_reason", [None, "length", "content_filter"])
+@pytest.mark.parametrize("level", [logging.INFO, logging.DEBUG])
 async def test_partial_result_is_rejected_with_correlated_safe_diagnostics(
-    engine_client, caplog, stop_reason
+    engine_client, caplog, stop_reason, level
 ):
+    caplog.set_level(level, logger="agentgateway_extproc.lib.extraction_diagnostics")
     sentinels = ("private-filename.txt", "private-document-text", "private-upstream-error")
     settings = Settings(
         docling=DoclingSettings(
@@ -50,6 +55,8 @@ async def test_partial_result_is_rejected_with_correlated_safe_diagnostics(
                         "category": "inference_failure",
                         "page_no": 1,
                         "max_tokens": 9876,
+                        "headers": {"Authorization": "private-credential"},
+                        "document": "private-extra-document",
                     }
                 ],
                 "document": {"json_content": {"name": sentinels[0], "text": sentinels[1]}},
@@ -131,10 +138,87 @@ async def test_partial_result_is_rejected_with_correlated_safe_diagnostics(
         f"gateway rejection request_id={diagnostic.request_id}" in record.getMessage()
         for record in caplog.records
     )
+    assert all(value not in response.body for value in (*sentinels, "private-credential"))
     assert all(
-        value not in caplog.text + response.body for value in (*sentinels, "private-credential")
+        value not in caplog.text
+        for value in (*sentinels[:2], "private-credential", "private-extra-document")
     )
+    if level == logging.DEBUG:
+        assert sentinels[2] in caplog.text
+        assert '"component_type": "pipeline"' in caplog.text
+        assert '"page_no": 1' in caplog.text
+    else:
+        assert sentinels[2] not in caplog.text
     assert "9876" not in error["message"]
+
+
+def test_native_debug_errors_are_bounded_and_escape_control_characters(caplog):
+    caplog.set_level(logging.DEBUG, logger="agentgateway_extproc.lib.extraction_diagnostics")
+    error = {
+        "error_message": "unknown\n\r\x1b\u2028" + "x" * 3000 + "omitted-tail",
+        "component_type": "c" * 200,
+        "module_name": {"nested": "omitted-nested"},
+        "category": "new_category",
+        "page_no": True,
+    }
+    for malformed in (None, {}, "omitted-non-list"):
+        log_native_errors(malformed, "job")
+    log_native_errors([None, "omitted-entry", error] + [error] * 10, "private-task-id")
+    assert len(caplog.records) == 1
+    message = caplog.records[0].getMessage()
+    entries = json.loads(message.split(" errors=", 1)[1])
+    assert len(entries) == 6
+    assert entries[0]["error_message"].startswith("unknown\n\r\x1b\u2028")
+    assert len(entries[0]["error_message"]) < 2100
+    assert len(entries[0]["component_type"]) < 160
+    assert entries[0]["category"] == "new_category"
+    assert "page_no" not in entries[0]
+    assert "module_name" not in entries[0]
+    assert not any(
+        value in message for value in ("omitted-", "private-task-id", "\n", "\r", "\x1b", "\u2028")
+    )
+    assert len(message) < 120000
+
+
+@pytest.mark.parametrize("level", [logging.INFO, logging.DEBUG])
+def test_debug_startup_warns_about_sensitive_native_errors(caplog, level):
+    caplog.set_level(level, logger="agentgateway_extproc.lib.extraction_diagnostics")
+    with (
+        patch("agentgateway_extproc.main.get_settings", return_value=Settings()),
+        patch("agentgateway_extproc.main._run", new_callable=AsyncMock),
+    ):
+        main()
+    if level == logging.DEBUG:
+        assert "upstream diagnostic errors may contain sensitive document data" in caplog.text
+        assert "Disable DEBUG after troubleshooting" in caplog.text
+        assert caplog.records[0].levelno == logging.WARNING
+    else:
+        assert "upstream diagnostic errors" not in caplog.text
+
+
+async def test_failed_task_logs_native_message_only_at_debug(caplog):
+    caplog.set_level(logging.DEBUG, logger="agentgateway_extproc.lib.extraction_diagnostics")
+    client = DoclingClient(DoclingSettings())
+    with (
+        patch.object(
+            client,
+            "_http",
+            return_value={
+                "task_id": "job",
+                "task_type": "convert",
+                "task_status": "failure",
+                "error_message": "unknown task diagnostic",
+                "document": "private-body",
+            },
+        ),
+        pytest.raises(DocumentError) as caught,
+    ):
+        await client._convert_one(Upload("private-file.txt", "txt", b""), threading.Event())
+    assert caught.value.diagnostic == "task_unsuccessful"
+    assert "unknown task diagnostic" in caplog.text
+    assert "unknown task diagnostic" not in caught.value.message
+    assert "private-" not in caplog.text
+    await client.close()
 
 
 @pytest.mark.parametrize(
