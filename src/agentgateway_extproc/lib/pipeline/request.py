@@ -512,6 +512,7 @@ async def process_request(
                     document=True,
                     text_pii_enabled=handler.text_pii_enabled,
                     mcp_sources=handler.mcp_sources,
+                    destination_model=model_id,
                     visual_findings=visual_findings,
                     correlation_id=handler.correlation_id,
                 )
@@ -522,6 +523,7 @@ async def process_request(
                     document=True,
                     text_pii_enabled=handler.text_pii_enabled,
                     mcp_sources=handler.mcp_sources,
+                    destination_model=model_id,
                     correlation_id=handler.correlation_id,
                 )
         else:
@@ -530,6 +532,7 @@ async def process_request(
                 session_key,
                 text_pii_enabled=handler.text_pii_enabled,
                 mcp_sources=handler.mcp_sources,
+                destination_model=model_id,
                 correlation_id=handler.correlation_id,
             )
         validate_request_mutation(request, reply)

@@ -79,6 +79,57 @@ async def exchange(client, messages, *, settings=None):
 
 
 @pytest.mark.parametrize("responses", [False, True])
+async def test_canonical_source_selector_and_session_ignore_spoofed_hints(
+    admission, engine_reply, responses
+):
+    engine_reply["route_class"] = "general"
+    if responses:
+        admission["request_context"]["protocol_profile"] = "openai-responses-v1"
+    admission["destination_policy"]["models"]["second-chat"] = True
+    for values in admission["destination_policy"].values():
+        if isinstance(values, dict) and "example-chat" in values:
+            values["second-chat"] = values["example-chat"]
+    admission["model_bindings"]["second-chat"] = deepcopy(
+        admission["model_bindings"]["example-chat"]
+    )
+    binding = admission["model_bindings"]["second-chat"]
+    binding["upstream_model"] = "second-provider"
+    binding["required_permissions"] = ["llm:invoke", "model:second-chat:invoke"]
+    admission["request_context"]["permissions"].append("model:second-chat:invoke")
+    calls = []
+
+    def analyze(request):
+        calls.append((json.loads(request.content), request.headers["x-pii-session-key"]))
+        return httpx.Response(200, json=segment_reply(engine_reply))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(analyze)) as http:
+        client = EngineClient(EngineSettings(base_url="https://engine.example.test"), http)
+        for requested in ("example-chat", "provider-chat", "second-provider"):
+            handler = StreamHandler(client)
+            head = headers(
+                **{
+                    ":path": "/bindings/openai-api/v1/"
+                    + ("responses" if responses else "chat/completions"),
+                    "x-conversation-id": "same-conversation",
+                    "x-destination-model": "local/spoofed",
+                    "destination-model": "local/spoofed",
+                }
+            )
+            await handler.handle(header_request(head, policy=admission))
+            result = await handler.handle(
+                body_request(body(requested, responses=responses), policy=admission)
+            )
+            assert result is not None and result.HasField("request_body")
+    assert [wire["destination_model"] for wire, _ in calls] == [
+        "example-chat",
+        "example-chat",
+        "second-chat",
+    ]
+    assert calls[0][1] == calls[1][1]
+    assert calls[0][1] != calls[2][1]
+
+
+@pytest.mark.parametrize("responses", [False, True])
 @pytest.mark.parametrize("requested", ["example-chat", "provider-chat"])
 @pytest.mark.parametrize("pii", [True, False])
 async def test_one_resolution_drives_permissions_policy_and_final_provider_model(
@@ -769,7 +820,17 @@ async def test_two_model_selection_never_mixes_pii_tracing_grants_or_upstream(
     assert context.resolved_model == expected
 
 
-async def test_attachment_conversion_uses_the_same_alias_selection(admission, engine_client):
+async def test_attachment_conversion_uses_the_same_alias_selection(admission, engine_reply):
+    calls = []
+
+    def analyze(request):
+        calls.append(json.loads(request.content))
+        return httpx.Response(200, json=segment_reply(engine_reply))
+
+    engine_client = EngineClient(
+        EngineSettings(base_url="https://engine.example.test"),
+        httpx.AsyncClient(transport=httpx.MockTransport(analyze)),
+    )
     admission["destination_policy"]["document_modes"]["example-chat"] = "extract-text"
     admission["destination_policy"]["face_protection"]["example-chat"] = True
     docling = Mock(convert=AsyncMock(return_value=["Jane Doe"]))
@@ -791,6 +852,7 @@ async def test_attachment_conversion_uses_the_same_alias_selection(admission, en
     docling.convert.assert_awaited_once()
     forwarded = json.loads(reply.request_body.response.body_mutation.body)
     assert forwarded["model"] == "example-chat"
+    assert [wire["destination_model"] for wire in calls] == ["example-chat"]
     assert SECRET not in str(docling.convert.call_args)
     assert "Jane Doe" not in str(forwarded)
     assert REVERSIBLE_TOKEN in str(forwarded)
