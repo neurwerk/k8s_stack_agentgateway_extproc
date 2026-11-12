@@ -243,6 +243,7 @@ async def test_native_source_history_does_not_prefix_answers_with_pii_disabled(
     await handler.handle(header_request(headers, policy=admission))
     await handler.handle(body_request(encoded(payload), policy=admission))
     assert calls[0]["mcp_sources"] == ["MCP_TOOL_SALESFORCE"]
+    assert calls[0]["destination_model"] == "example-chat"
     assert calls[0]["text_pii_enabled"] is False
     await handler.handle(
         response_headers("text/event-stream" if streaming else "application/json", policy=admission)
@@ -334,6 +335,8 @@ async def test_native_inspection_routing_and_metadata(native, native_engine, pii
     assert forwarded["model"] == "example-chat"
     assert ("Jane Doe" in str(forwarded)) is not pii
     assert len(calls) == int(pii)
+    if pii:
+        assert calls[0]["destination_model"] == "example-chat"
     assert ("messages" in forwarded) is (kind == "anthropic")
     assert ("contents" in forwarded) is (kind == "google")
     metadata = MessageToDict(reply.dynamic_metadata)["neurwerk.request_context"]
