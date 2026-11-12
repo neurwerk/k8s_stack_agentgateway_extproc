@@ -106,7 +106,6 @@ async def process_native_request(  # noqa: C901
             key,
             text_pii_enabled=handler.text_pii_enabled,
             mcp_sources=handler.mcp_sources,
-            destination_local=context.provider_credential_source == "none",
             correlation_id=handler.correlation_id,
         )
         validate_request_mutation(request, reply)
