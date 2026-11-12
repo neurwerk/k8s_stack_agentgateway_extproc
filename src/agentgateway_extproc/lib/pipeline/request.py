@@ -502,11 +502,6 @@ async def process_request(
         handler.record_dispatch("model_analyzed")
     if handler.text_pii_enabled or not handler.mcp_sources:
         request = _literalize_request_placeholders(request)
-    destination_local = (
-        handler.request_context is not None
-        and handler.request_context.destination_kind == "model"
-        and handler.request_context.provider_credential_source == "none"
-    )
     try:
         if converted:
             _clear_request(handler)
@@ -517,7 +512,6 @@ async def process_request(
                     document=True,
                     text_pii_enabled=handler.text_pii_enabled,
                     mcp_sources=handler.mcp_sources,
-                    destination_local=destination_local,
                     visual_findings=visual_findings,
                     correlation_id=handler.correlation_id,
                 )
@@ -528,7 +522,6 @@ async def process_request(
                     document=True,
                     text_pii_enabled=handler.text_pii_enabled,
                     mcp_sources=handler.mcp_sources,
-                    destination_local=destination_local,
                     correlation_id=handler.correlation_id,
                 )
         else:
@@ -537,7 +530,6 @@ async def process_request(
                 session_key,
                 text_pii_enabled=handler.text_pii_enabled,
                 mcp_sources=handler.mcp_sources,
-                destination_local=destination_local,
                 correlation_id=handler.correlation_id,
             )
         validate_request_mutation(request, reply)

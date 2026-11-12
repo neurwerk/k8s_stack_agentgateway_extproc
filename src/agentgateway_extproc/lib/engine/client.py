@@ -144,7 +144,6 @@ class EngineClient:
         text_pii_enabled: bool = True,
         visual_findings: VisualFindings | None = None,
         mcp_sources: list[str] | None = None,
-        destination_local: bool = False,
         correlation_id: str | None = None,
     ) -> EngineReply:
         """Send only opaque segments and rebuild the validated reply locally."""
@@ -162,8 +161,6 @@ class EngineClient:
             "attachments_present": extracted.attachments_present,
         }
         wire.update(_analysis_controls(document, text_pii_enabled, visual_findings, sources))
-        if destination_local:
-            wire["destination_local"] = True
         try:
             async with (
                 asyncio.timeout(self._settings.timeout),
