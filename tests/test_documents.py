@@ -33,7 +33,7 @@ from .conftest import MODEL_POLICY, REVERSIBLE_TOKEN, body_request, header_reque
 def _document():
     return {
         "schema_name": "DoclingDocument",
-        "version": "1.11.0",
+        "version": "1.10.0",
         "name": "untrusted-name",
         "origin": {"uri": "https://raw.test/source", "filename": "untrusted-name"},
         "body": {"self_ref": "#/body", "children": [{"$ref": "#/groups/0"}]},

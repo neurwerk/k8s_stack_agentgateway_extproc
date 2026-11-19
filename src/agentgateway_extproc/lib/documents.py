@@ -684,11 +684,11 @@ def project_document(
 ) -> tuple[str, int]:
     """Project a complete supported tree, never source metadata or raw copies."""
     doc = _object(value)
-    if doc.get("schema_name") != "DoclingDocument" or doc.get("version") != "1.11.0":
+    if doc.get("schema_name") != "DoclingDocument" or doc.get("version") != "1.10.0":
         raise DocumentError(
             diagnostic="schema_unsupported",
             schema_name_supported=doc.get("schema_name") == "DoclingDocument",
-            schema_version_supported=doc.get("version") == "1.11.0",
+            schema_version_supported=doc.get("version") == "1.10.0",
         )
     allowed = {
         "schema_name",
@@ -828,7 +828,7 @@ class _Projection:
         if not isinstance(value, str):
             raise DocumentError(diagnostic="text_item_invalid")
         if node.get("label") == "formula" and not value.strip():
-            # Docling 2.150.1 leaves formula text empty without formula enrichment.
+            # Docling 2.142.1 leaves formula text empty without formula enrichment.
             original = node.get("orig")
             if not isinstance(original, str) or not original.strip():
                 raise DocumentError(diagnostic="text_item_invalid")
@@ -892,11 +892,7 @@ class _Projection:
             output.extend(self.walk(ref, depth + 1) for ref in _list(node.get(field, [])))
         self.active.remove(pointer)
         self.seen.add(pointer)
-        # Schema 1.11 inline runs carry their own significant boundary whitespace.
-        separator = (
-            "" if pointer.startswith("#/groups/") and node.get("label") == "inline" else "\n"
-        )
-        return separator.join(part for part in output if part)
+        return "\n".join(part for part in output if part)
 
 
 def _cell_offsets(cell: dict[str, object], rows: int, cols: int) -> tuple[int, int, int, int]:

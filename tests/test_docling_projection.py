@@ -22,24 +22,6 @@ def test_reviewed_schema_preserves_canonical_content():
     )
 
 
-def test_inline_runs_preserve_significant_whitespace():
-    document = _document()
-    document.update(
-        tables=[],
-        pictures=[],
-        texts=[
-            {"self_ref": f"#/texts/{index}", "text": run}
-            for index, run in enumerate(["H", "2", "O", " is water"])
-        ],
-    )
-    document["groups"][0].update(
-        label="inline", children=[{"$ref": f"#/texts/{index}"} for index in range(4)]
-    )
-    document["furniture"]["children"] = []
-    text, _ = project_document(document, Upload("example.docx", "docx", b"", pages=1), 250)
-    assert text == "Document: example.docx\nH2O is water\n"
-
-
 @pytest.mark.parametrize(
     ("case", "diagnostic"),
     [
@@ -61,7 +43,7 @@ def test_reviewed_schema_rejects_incomplete_trees(case, diagnostic):
     assert caught.value.diagnostic == diagnostic
 
 
-@pytest.mark.parametrize("version", ["1.10.0", "1.11.1", "1.12.0"])
+@pytest.mark.parametrize("version", ["1.10.1", "1.11.0", "1.12.0"])
 def test_other_schema_versions_are_rejected(version):
     document = _document()
     document["version"] = version
