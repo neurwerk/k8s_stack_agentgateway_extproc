@@ -44,7 +44,7 @@ class DoclingSettings(BaseModel):
     base_url: str = "https://docling.docling.svc"
     ca_cert: str | None = None
     api_key: SecretStr | None = None
-    inference_mode: Literal["internal-standard", "private-vlm", "cpu", "remote"] = (
+    inference_mode: Literal["internal-standard", "private-standard", "private-vlm"] = (
         "internal-standard"
     )
     timeout: float = Field(default=360, gt=0, le=3660)
@@ -52,7 +52,7 @@ class DoclingSettings(BaseModel):
     file_bytes: int = Field(default=20 * MEBIBYTE, ge=1, le=40 * MEBIBYTE)
     total_bytes: int = Field(default=40 * MEBIBYTE, ge=1, le=40 * MEBIBYTE)
     count: int = Field(default=5, ge=1, le=20)
-    pages: int = Field(default=200, ge=1, le=1000)
+    pages: int = Field(default=250, ge=1, le=1000)
     max_response_bytes: int = Field(default=16 * MEBIBYTE, ge=1024, le=16 * MEBIBYTE)
 
     @model_validator(mode="after")

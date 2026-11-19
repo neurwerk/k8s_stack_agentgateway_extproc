@@ -33,7 +33,7 @@ from .conftest import MODEL_POLICY, REVERSIBLE_TOKEN, body_request, header_reque
 def _document():
     return {
         "schema_name": "DoclingDocument",
-        "version": "1.10.0",
+        "version": "1.11.0",
         "name": "untrusted-name",
         "origin": {"uri": "https://raw.test/source", "filename": "untrusted-name"},
         "body": {"self_ref": "#/body", "children": [{"$ref": "#/groups/0"}]},
@@ -190,15 +190,15 @@ def _upload(extension="txt", case="ok"):  # noqa: C901
     [
         (api, pii, mode, extension, "ok", 0)
         for api, pii, mode in [
-            ("chat", True, "cpu"),
-            ("chat", False, "remote"),
-            ("responses", True, "remote"),
-            ("responses", False, "cpu"),
+            ("chat", True, "internal-standard"),
+            ("chat", False, "private-vlm"),
+            ("responses", True, "private-vlm"),
+            ("responses", False, "internal-standard"),
         ]
         for extension in ("pdf", "docx", "xlsx", "pptx", "txt", "md", "csv")
     ]
     + [
-        ("chat", True, "cpu", extension, case, status)
+        ("chat", True, "internal-standard", extension, case, status)
         for extension, case, status in [
             ("txt", "base64", 400),
             ("txt", "mime", 400),
@@ -251,7 +251,10 @@ def _upload(extension="txt", case="ok"):  # noqa: C901
             ("txt", "pii-reroute", 0),
         ]
     ]
-    + [("responses", False, "cpu", "txt", case, 413) for case in ("text-limit", "wire-limit")],
+    + [
+        ("responses", False, "internal-standard", "txt", case, 413)
+        for case in ("text-limit", "wire-limit")
+    ],
 )
 async def test_document_dispatch(engine_reply, api, pii, mode, extension, case, status):  # noqa: C901
     policy = {**MODEL_POLICY, "models": {"test": pii}, "attachment_modes": {"test": "extract"}}
@@ -346,15 +349,17 @@ async def test_document_dispatch(engine_reply, api, pii, mode, extension, case, 
                 == f"upload.{'md' if extension == 'txt' else extension}"
             )
             assert b"/private/path" not in request.content
-            assert fields["pipeline"].get_payload() == ("standard" if mode == "cpu" else "vlm")
+            assert fields["pipeline"].get_payload() == (
+                "standard" if mode == "internal-standard" else "vlm"
+            )
             assert fields["to_formats"].get_payload() == "json"
             assert fields["target_type"].get_payload() == "inbody"
             assert "ocr_lang" not in fields
             assert fields["abort_on_error"].get_payload() == "true"
             assert fields["include_images"].get_payload() == "false"
             assert fields["include_page_images"].get_payload() == "false"
-            if mode == "cpu":
-                assert fields["ocr_preset"].get_payload() == "rapidocr"
+            if mode == "internal-standard":
+                assert fields["ocr_preset"].get_payload() == "default"
                 assert fields["do_ocr"].get_payload() == "true"
                 assert fields["do_table_structure"].get_payload() == "true"
             else:

@@ -127,7 +127,7 @@ def test_real_phone_source_above_legacy_bytes_keeps_normalized_and_request_caps(
     upload = preflight([part], DoclingSettings(), batch)[0]
     assert len(upload.data) < MAX_IMAGE_BYTES and len(batch.images[0]) < MAX_IMAGE_BYTES
     for parts, settings, version in [
-        ([part], DoclingSettings(inference_mode="remote"), 2),
+        ([part], DoclingSettings(inference_mode="private-vlm"), 2),
         ([part], DoclingSettings(file_bytes=MAX_IMAGE_BYTES), 3),
         ([part], DoclingSettings(total_bytes=len(data) - 1), 3),
         ([part, part], DoclingSettings(), 3),

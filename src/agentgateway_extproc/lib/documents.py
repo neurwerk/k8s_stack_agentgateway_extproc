@@ -250,7 +250,7 @@ def _decode_image(
     deadline: float,
 ) -> Upload:
     modern = images.policy_version >= 3
-    if not modern and settings.inference_mode not in {"private-vlm", "remote"}:
+    if not modern and settings.inference_mode != "private-vlm":
         raise DocumentError(403, reason="image_processing_unavailable")
     limit = min(settings.file_bytes, MAX_SOURCE_BYTES if modern else MAX_IMAGE_BYTES)
     mime, data = _image_data(part, limit, policy_version=images.policy_version)
@@ -684,11 +684,11 @@ def project_document(
 ) -> tuple[str, int]:
     """Project a complete supported tree, never source metadata or raw copies."""
     doc = _object(value)
-    if doc.get("schema_name") != "DoclingDocument" or doc.get("version") != "1.10.0":
+    if doc.get("schema_name") != "DoclingDocument" or doc.get("version") != "1.11.0":
         raise DocumentError(
             diagnostic="schema_unsupported",
             schema_name_supported=doc.get("schema_name") == "DoclingDocument",
-            schema_version_supported=doc.get("version") == "1.10.0",
+            schema_version_supported=doc.get("version") == "1.11.0",
         )
     allowed = {
         "schema_name",
@@ -823,10 +823,16 @@ class _Projection:
         return value
 
     def text_item(self, node: dict[str, object]) -> str:
-        """Preserve checkbox state and reject formulas without canonical text."""
+        """Preserve checkbox state and the standard pipeline's source formula text."""
         value = node.get("text")
-        if not isinstance(value, str) or (node.get("label") == "formula" and not value.strip()):
+        if not isinstance(value, str):
             raise DocumentError(diagnostic="text_item_invalid")
+        if node.get("label") == "formula" and not value.strip():
+            # Docling 2.150.1 leaves formula text empty without formula enrichment.
+            original = node.get("orig")
+            if not isinstance(original, str) or not original.strip():
+                raise DocumentError(diagnostic="text_item_invalid")
+            value = f"[Source formula text] {original}"
         marker = {"checkbox_selected": "[x]", "checkbox_unselected": "[ ]"}.get(
             node.get("label") if isinstance(node.get("label"), str) else ""
         )
@@ -840,26 +846,25 @@ class _Projection:
         rows, cols = data.get("num_rows"), data.get("num_cols")
         if type(rows) is not int or type(cols) is not int or rows < 1 or cols < 1:
             raise DocumentError(diagnostic="table_dimensions_invalid")
-        self.cells += rows * cols
+        entries = _list(data.get("table_cells"))
+        if not entries:
+            raise DocumentError(diagnostic="table_cells_invalid")
+        # Overlaps can make the canonical cell count exceed the declared grid.
+        self.cells += max(rows * cols, len(entries))
         if self.cells > MAX_CELLS:
             raise DocumentError(413, diagnostic="table_cell_limit")
-        grid = [[""] * cols for _ in range(rows)]
-        occupied: set[tuple[int, int]] = set()
-        entries = _list(data.get("table_cells"))
-        if not entries or len(entries) > rows * cols:
-            raise DocumentError(diagnostic="table_cells_invalid")
+        grid: list[list[list[str]]] = [[[] for _ in range(cols)] for _ in range(rows)]
+        cells: list[tuple[int, int, dict[str, object]]] = []
         for raw in entries:
             cell = _object(raw)
-            sr, er, sc, ec = _cell_offsets(cell, rows, cols)
-            for row in range(sr, er):
-                for col in range(sc, ec):
-                    if (row, col) in occupied:
-                        raise DocumentError(diagnostic="table_overlap")
-                    occupied.add((row, col))
-            grid[sr][sc] = (
+            sr, _, sc, _ = _cell_offsets(cell, rows, cols)
+            cells.append((sr, sc, cell))
+        # Stable sorting preserves source order for cells sharing an origin.
+        for sr, sc, cell in sorted(cells, key=lambda item: (item[0], item[1])):
+            grid[sr][sc].append(
                 self.walk(cell["ref"], depth + 1) if "ref" in cell else self.text(cell.get("text"))
             )
-        return "\n".join(" | ".join(row) for row in grid)
+        return "\n".join(" | ".join("\n".join(cell) for cell in row) for row in grid)
 
     def walk(self, value: object, depth: int) -> str:
         """Walk reading-order refs, rejecting cycles and unresolved content."""
@@ -887,7 +892,11 @@ class _Projection:
             output.extend(self.walk(ref, depth + 1) for ref in _list(node.get(field, [])))
         self.active.remove(pointer)
         self.seen.add(pointer)
-        return "\n".join(part for part in output if part)
+        # Schema 1.11 inline runs carry their own significant boundary whitespace.
+        separator = (
+            "" if pointer.startswith("#/groups/") and node.get("label") == "inline" else "\n"
+        )
+        return separator.join(part for part in output if part)
 
 
 def _cell_offsets(cell: dict[str, object], rows: int, cols: int) -> tuple[int, int, int, int]:

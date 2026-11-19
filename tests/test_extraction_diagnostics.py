@@ -295,7 +295,7 @@ async def test_native_error_details_reject_untrusted_values(message, page, caplo
 def test_projection_diagnostics_expose_only_support_flags_and_counts(case, caplog):
     document = {
         "schema_name": "private-schema" if case == "schema" else "DoclingDocument",
-        "version": "private-version" if case == "schema" else "1.10.0",
+        "version": "private-version" if case == "schema" else "1.11.0",
         "pages": {"1": {"page_no": 1}, "2": {"page_no": 2}},
         "name": "private-filename.pdf",
     }

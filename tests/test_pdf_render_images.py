@@ -600,7 +600,7 @@ async def test_checked_native_coverage_retries_original_without_rendering(real_c
 
 
 @pytest.mark.parametrize("enabled", [False, True])
-@pytest.mark.parametrize("inference", ["internal-standard", "private-vlm"])
+@pytest.mark.parametrize("inference", ["internal-standard", "private-standard", "private-vlm"])
 async def test_native_http_options_and_original_retry_bytes(real_children, enabled, inference):
     posts = []
 
@@ -648,11 +648,19 @@ async def test_native_http_options_and_original_retry_bytes(real_children, enabl
         assert b'name="do_ocr"\r\n\r\nfalse' in posts[0]
         assert b"vlm_pipeline_preset" not in posts[0]
         assert b"force_ocr" not in posts[0]
-    expected = b"standard" if inference == "internal-standard" else b"vlm"
+    standard = inference in {"internal-standard", "private-standard"}
+    expected = b"standard" if standard else b"vlm"
     assert b'name="pipeline"\r\n\r\n' + expected in pdf_posts[-1]
     assert b'name="pipeline"\r\n\r\n' + expected in posts[-1]
     assert b"force_ocr" not in posts[-1]
-    if enabled and inference == "internal-standard":
+    if standard:
+        for body in (pdf_posts[-1], posts[-1]):
+            for preset in ("layout_preset", "ocr_preset", "table_structure_preset"):
+                assert f'name="{preset}"\r\n\r\ndefault'.encode() in body
+            assert b'name="do_ocr"\r\n\r\ntrue' in body
+            assert b'name="do_table_structure"\r\n\r\ntrue' in body
+            assert b"vlm_pipeline_preset" not in body
+    if enabled and standard:
         assert b'name="force_ocr"\r\n\r\ntrue' in pdf_posts[-1]
     else:
         assert b"force_ocr" not in pdf_posts[-1]

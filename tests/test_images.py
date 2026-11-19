@@ -961,9 +961,8 @@ def test_ambiguous_face_detector_output_is_never_clean(result):
             has_faces(image)
 
 
-@pytest.mark.parametrize("mode", ["private-vlm", "remote"])
-def test_image_preset_and_transition_alias_preserve_pdf_default(mode):
-    client = DoclingClient(DoclingSettings(inference_mode=mode))
+def test_image_preset_preserves_pdf_default():
+    client = DoclingClient(DoclingSettings(inference_mode="private-vlm"))
     assert client._options("img")["vlm_pipeline_preset"] == "images"
     assert client._options("pdf")["vlm_pipeline_preset"] == "default"
 

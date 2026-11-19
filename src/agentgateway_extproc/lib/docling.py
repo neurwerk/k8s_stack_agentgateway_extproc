@@ -281,7 +281,8 @@ class DoclingClient:
                     document = await self._convert_one(
                         upload,
                         abandoned,
-                        force_ocr=self.settings.inference_mode in {"cpu", "internal-standard"},
+                        force_ocr=self.settings.inference_mode
+                        in {"internal-standard", "private-standard"},
                     )
             else:
                 document = await self._convert_one(upload, abandoned)
@@ -499,9 +500,15 @@ class DoclingClient:
         }
         if native and source_format == "pdf":
             options.update(pipeline="native", pdf_backend="threaded_docling_parse", do_ocr="false")
-        elif self.settings.inference_mode in {"cpu", "internal-standard"}:
+        elif self.settings.inference_mode in {"internal-standard", "private-standard"}:
+            # The trusted service owns model placement, pinned options and credentials.
             options.update(
-                pipeline="standard", ocr_preset="rapidocr", do_ocr="true", do_table_structure="true"
+                pipeline="standard",
+                layout_preset="default",
+                ocr_preset="default",
+                table_structure_preset="default",
+                do_ocr="true",
+                do_table_structure="true",
             )
             if force_ocr and source_format == "pdf":
                 options["force_ocr"] = "true"
