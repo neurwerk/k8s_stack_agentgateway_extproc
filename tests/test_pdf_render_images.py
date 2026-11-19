@@ -232,13 +232,11 @@ async def test_mixed_batch_retains_nonpdf_extraction(engine_client, real_childre
     assert b"Document: report.txt" in response.request_body.response.body_mutation.body
 
 
-@pytest.mark.parametrize("mode", ["extract-text", "native-first"])
-async def test_pdf_extract_overrides_blocked_documents(engine_client, real_children, mode):
+async def test_pdf_extract_overrides_blocked_documents(engine_client, real_children):
     docling = DoclingClient(DoclingSettings(enabled=True, api_key=SecretStr("test-only")))
     selected_policy = policy(
         document_modes={"test": "block"},
-        pdf_modes={"test": mode},
-        pdf_fallbacks={"test": "extract-text"} if mode == "native-first" else {},
+        pdf_modes={"test": "extract-text"},
     )
     with patch.object(docling, "_convert_one", return_value=_document()) as extract:
         good = await dispatch(
@@ -253,7 +251,7 @@ async def test_pdf_extract_overrides_blocked_documents(engine_client, real_child
     await docling.close()
     assert good.HasField("request_body")
     assert bad.immediate_response.status.code == 403
-    assert extract.await_count == (2 if mode == "native-first" else 1)
+    assert extract.await_count == 1
 
 
 @pytest.mark.parametrize(
@@ -497,14 +495,13 @@ def test_expansion_preserves_reviewed_controls():
     assert locations == {(0, 0): "first", (0, 1): "second"}
 
 
-def native_document(pages=2):
+def extracted_document(pages=2):
     doc = _document()
     doc.update(groups=[], tables=[], pictures=[])
     doc["texts"] = [
         {
             "self_ref": f"#/texts/{index}",
-            "text": f"Native page {index + 1}",
-            "prov": [{"page_no": index + 1, "charspan": [0, len(f"Native page {index + 1}")]}],
+            "text": f"Extracted page {index + 1}",
         }
         for index in range(pages)
     ]
@@ -517,91 +514,8 @@ def native_document(pages=2):
     return doc
 
 
-def incomplete_native(case):
-    doc = native_document()
-    if case in {"picture", "table"}:
-        kind = "pictures" if case == "picture" else "tables"
-        node = {"self_ref": f"#/{kind}/0", "prov": [{"page_no": 1}]}
-        if case == "table":
-            node["data"] = {
-                "num_rows": 1,
-                "num_cols": 1,
-                "table_cells": [
-                    {
-                        "start_row_offset_idx": 0,
-                        "end_row_offset_idx": 1,
-                        "start_col_offset_idx": 0,
-                        "end_col_offset_idx": 1,
-                        "text": "cell",
-                    }
-                ],
-            }
-        doc[kind] = [node]
-        doc["body"]["children"].append({"$ref": node["self_ref"]})
-    elif case == "empty":
-        doc["texts"] = []
-        doc["body"]["children"] = []
-    elif case == "missing-page":
-        doc["texts"].pop()
-        doc["body"]["children"].pop()
-    elif case == "whitespace":
-        doc["texts"][1]["text"] = " " * len(doc["texts"][1]["text"])
-    elif case == "missing-prov":
-        del doc["texts"][1]["prov"]
-    elif case == "invalid-prov":
-        doc["texts"][1]["prov"][0]["page_no"] = True
-    elif case == "partial-span":
-        doc["texts"][1]["prov"][0]["charspan"][1] -= 1
-    elif case == "ambiguous-span":
-        doc["texts"][0]["prov"].append(
-            {"page_no": 2, "charspan": doc["texts"][0]["prov"][0]["charspan"]}
-        )
-    return doc
-
-
-@pytest.mark.parametrize(
-    "case",
-    [
-        "complete",
-        "empty",
-        "missing-page",
-        "whitespace",
-        "picture",
-        "table",
-        "missing-prov",
-        "invalid-prov",
-        "partial-span",
-        "ambiguous-span",
-    ],
-)
-async def test_checked_native_coverage_retries_original_without_rendering(real_children, case):
-    docling = DoclingClient(DoclingSettings(enabled=True, api_key=SecretStr("test-only")))
-    part = EngineAttachmentPart.model_validate(pdf_part())
-    original = base64.b64decode(part.model_dump()["file"]["file_data"].partition(",")[2])
-    uploads, calls = [], []
-
-    async def convert(upload, abandoned, *, native=False, force_ocr=False):
-        uploads.append(upload)
-        calls.append((native, force_ocr, upload.data))
-        return incomplete_native(case) if native else native_document()
-
-    with (
-        patch.object(docling, "_convert_one", side_effect=convert),
-        patch("agentgateway_extproc.lib.docling.render_pdf") as render_mock,
-    ):
-        result = await docling.convert([part], pdf_mode="native-first", pdf_fallback="extract-text")
-    await docling.close()
-    assert "Native page 2" in result[0]
-    assert calls == [(True, False, original)] + (
-        [] if case == "complete" else [(False, True, original)]
-    )
-    assert all(upload.data == b"" for upload in uploads)
-    render_mock.assert_not_called()
-
-
-@pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("inference", ["internal-standard", "private-standard", "private-vlm"])
-async def test_native_http_options_and_original_retry_bytes(real_children, enabled, inference):
+async def test_extraction_http_options_and_original_bytes(real_children, inference):
     posts = []
 
     def transport(request):
@@ -611,7 +525,7 @@ async def test_native_http_options_and_original_retry_bytes(real_children, enabl
                 200,
                 json={"task_id": str(len(posts)), "task_type": "convert", "task_status": "success"},
             )
-        doc = incomplete_native("picture") if enabled and len(posts) == 1 else native_document()
+        doc = extracted_document()
         return httpx.Response(
             200, json={"status": "success", "errors": [], "document": {"json_content": doc}}
         )
@@ -626,28 +540,17 @@ async def test_native_http_options_and_original_retry_bytes(real_children, enabl
             client,
         )
         part = EngineAttachmentPart.model_validate(pdf_part())
-        result = await docling.convert(
-            [part],
-            pdf_mode="native-first" if enabled else "extract-text",
-            pdf_fallback="extract-text" if enabled else None,
-        )
+        result = await docling.convert([part], pdf_mode="extract-text")
         pdf_posts = list(posts)
         await docling.convert(
             [EngineAttachmentPart.model_validate({"type": "file", "file": _upload()})],
-            pdf_mode="native-first",
-            pdf_fallback="extract-text",
+            pdf_mode="extract-text",
         )
         await docling.close()
-    assert "Native page 2" in result[0]
+    assert "Extracted page 2" in result[0]
     original = base64.b64decode(part.model_dump()["file"]["file_data"].partition(",")[2])
     assert all(original in body for body in pdf_posts)
-    assert len(pdf_posts) == (2 if enabled else 1)
-    if enabled:
-        assert b'name="pipeline"\r\n\r\nnative' in posts[0]
-        assert b'name="pdf_backend"\r\n\r\nthreaded_docling_parse' in posts[0]
-        assert b'name="do_ocr"\r\n\r\nfalse' in posts[0]
-        assert b"vlm_pipeline_preset" not in posts[0]
-        assert b"force_ocr" not in posts[0]
+    assert len(pdf_posts) == 1
     standard = inference in {"internal-standard", "private-standard"}
     expected = b"standard" if standard else b"vlm"
     assert b'name="pipeline"\r\n\r\n' + expected in pdf_posts[-1]
@@ -660,69 +563,21 @@ async def test_native_http_options_and_original_retry_bytes(real_children, enabl
             assert b'name="do_ocr"\r\n\r\ntrue' in body
             assert b'name="do_table_structure"\r\n\r\ntrue' in body
             assert b"vlm_pipeline_preset" not in body
-    if enabled and standard:
-        assert b'name="force_ocr"\r\n\r\ntrue' in pdf_posts[-1]
-    else:
-        assert b"force_ocr" not in pdf_posts[-1]
+    assert b"force_ocr" not in pdf_posts[-1]
+    assert b'name="pipeline"\r\n\r\nnative' not in b"".join(posts)
 
 
-@pytest.mark.parametrize("chat", [True, False])
-async def test_native_local_mixed_results_preserve_full_order(engine_client, real_children, chat):
-    docling = DoclingClient(DoclingSettings(enabled=True, api_key=SecretStr("test-only")))
-    calls = []
-
-    async def convert(upload, abandoned, *, native=False):
-        calls.append((upload.format, native))
-        return native_document(1) if len(calls) != 2 else incomplete_native("missing-page")
-
-    text_file = {"type": "file", "file": _upload()} if chat else {"type": "input_file", **_upload()}
-    with patch.object(docling, "_convert_one", side_effect=convert):
-        response = await dispatch(
-            engine_client,
-            docling,
-            [pdf_part(1, chat=chat), pdf_part(2, chat=chat), text_file],
-            chat=chat,
-            selected_policy=policy(
-                pdf_modes={"test": "native-first"}, pdf_fallbacks={"test": "render-images"}
-            ),
-        )
-    await docling.close()
-    assert calls == [("pdf", True), ("pdf", True), ("txt", False)]
-    assert response.HasField("request_body")
-    content = json.loads(response.request_body.response.body_mutation.body)[
-        "messages" if chat else "input"
-    ][0]["content"]
-    assert [part["type"] for part in content] == [
-        "text" if chat else "input_text",
-        "text" if chat else "input_text",
-        "image_url" if chat else "input_image",
-        "image_url" if chat else "input_image",
-        "text" if chat else "input_text",
-        "text" if chat else "input_text",
-    ]
-    assert "Document: pages.pdf" in content[1]["text"]
-    assert "Document: report.txt" in content[4]["text"]
-
-
-@pytest.mark.parametrize("mode", ["render-images", "native-first"])
 @pytest.mark.parametrize("limit", [1, 20])
 async def test_configured_render_budget_is_independent_of_upload_count(
-    engine_client, real_children, limit, mode
+    engine_client, real_children, limit
 ):
     docling = DoclingClient(DoclingSettings(enabled=True, api_key=SecretStr("test-only")))
     selected = policy(
-        pdf_modes={"test": mode},
+        pdf_modes={"test": "render-images"},
         pdf_max_rendered_pages={"test": limit},
-        pdf_fallbacks={"test": "render-images"} if mode == "native-first" else {},
     )
 
-    async def empty(upload, abandoned, *, native=False):
-        doc = native_document(upload.pages)
-        doc["texts"] = []
-        doc["body"]["children"] = []
-        return doc
-
-    with patch.object(docling, "_convert_one", side_effect=empty):
+    with patch.object(docling, "_convert_one") as convert:
         good = await dispatch(engine_client, docling, [pdf_part(limit)], selected_policy=selected)
         bad = await dispatch(
             engine_client, docling, [pdf_part(limit), pdf_part(1)], selected_policy=selected
@@ -738,6 +593,7 @@ async def test_configured_render_budget_is_independent_of_upload_count(
     assert good.HasField("request_body")
     assert bad.immediate_response.status.code == 413
     assert history.immediate_response.status.code == 413
+    convert.assert_not_called()
 
 
 @pytest.mark.parametrize("limit", [0, 21, True, 1.5, "5"])
@@ -746,30 +602,14 @@ def test_render_budget_rejects_coercion_and_out_of_bounds(limit):
         ModelDestinationPolicy.model_validate(policy(pdf_max_rendered_pages={"test": limit}))
 
 
-def test_checked_policy_cannot_enable_native_image_fallback():
-    for extra in (
-        {"models": {"test": True}},
-        {"image_models": {"test": False}},
-        {"local_models": {"test": False}},
-    ):
-        with pytest.raises(ValidationError):
-            ModelDestinationPolicy.model_validate(
-                policy(
-                    pdf_modes={"test": "native-first"},
-                    pdf_fallbacks={"test": "render-images"},
-                    **extra,
-                )
-            )
-
-
 @pytest.mark.parametrize("failure", ["http", "schema", "pages", "limit"])
-async def test_native_failure_never_falls_back_and_clears_remaining_uploads(real_children, failure):
+async def test_extraction_failure_clears_remaining_uploads(real_children, failure):
     docling = DoclingClient(DoclingSettings(enabled=True, api_key=SecretStr("test-only")))
     uploads = [
         Upload("one.pdf", "pdf", b"original-one", 2),
         Upload("two.pdf", "pdf", b"original-two", 2),
     ]
-    doc = native_document()
+    doc = extracted_document()
     if failure == "schema":
         doc["version"] = "unknown"
     elif failure == "pages":
@@ -784,29 +624,26 @@ async def test_native_failure_never_falls_back_and_clears_remaining_uploads(real
             side_effect=DocumentError() if failure == "http" else None,
             return_value=doc,
         ) as convert,
-        patch("agentgateway_extproc.lib.docling.render_pdf") as renderer,
         pytest.raises(DocumentError),
     ):
         await docling.convert(
             [EngineAttachmentPart.model_validate(pdf_part())] * 2,
-            pdf_mode="native-first",
-            pdf_fallback="extract-text",
+            pdf_mode="extract-text",
         )
     await docling.close()
     assert convert.await_count == 1
-    renderer.assert_not_called()
     assert all(upload.data == b"" for upload in uploads)
 
 
-async def test_cancelled_native_job_drains_before_cleanup_without_fallback(real_children):
+async def test_cancelled_extraction_job_drains_before_cleanup(real_children):
     docling = DoclingClient(DoclingSettings(enabled=True, api_key=SecretStr("test-only")))
     uploads = [Upload("one.pdf", "pdf", b"first", 2), Upload("two.pdf", "pdf", b"second", 2)]
     entered, release = asyncio.Event(), asyncio.Event()
 
-    async def convert(upload, abandoned, *, native=False):
+    async def convert(upload, abandoned):
         entered.set()
         await release.wait()
-        return incomplete_native("empty")
+        return extracted_document()
 
     with (
         patch("agentgateway_extproc.lib.docling.preflight", return_value=uploads),
@@ -815,8 +652,7 @@ async def test_cancelled_native_job_drains_before_cleanup_without_fallback(real_
         task = asyncio.create_task(
             docling.convert(
                 [EngineAttachmentPart.model_validate(pdf_part())] * 2,
-                pdf_mode="native-first",
-                pdf_fallback="extract-text",
+                pdf_mode="extract-text",
             )
         )
         await entered.wait()
@@ -833,7 +669,7 @@ async def test_cancelled_native_job_drains_before_cleanup_without_fallback(real_
 
 
 @pytest.mark.parametrize("failure", ["lost-post", "lost-poll", "result", "partial"])
-async def test_native_unknown_jobs_and_bad_envelopes_do_not_retry(real_children, failure):
+async def test_unknown_jobs_and_bad_envelopes_do_not_retry(real_children, failure):
     posts = []
 
     def transport(request):
@@ -868,8 +704,7 @@ async def test_native_unknown_jobs_and_bad_envelopes_do_not_retry(real_children,
         with pytest.raises(DocumentError):
             await docling.convert(
                 [EngineAttachmentPart.model_validate(pdf_part())],
-                pdf_mode="native-first",
-                pdf_fallback="extract-text",
+                pdf_mode="extract-text",
             )
         assert docling._poisoned == (failure in {"lost-post", "lost-poll"})
         await docling.close()
@@ -909,14 +744,10 @@ def test_failed_preflight_clears_already_decoded_uploads():
 
 
 @pytest.mark.parametrize("document_mode", ["block", "extract-text"])
-@pytest.mark.parametrize("case", ["complete", "picture"])
-async def test_checked_native_result_still_passes_text_pii_policy(
-    engine_client, real_children, case, document_mode
-):
+async def test_extracted_pdf_passes_text_pii_policy(engine_client, real_children, document_mode):
     docling = DoclingClient(DoclingSettings(enabled=True, api_key=SecretStr("test-only")))
     selected = policy(
-        pdf_modes={"test": "native-first"},
-        pdf_fallbacks={"test": "extract-text"},
+        pdf_modes={"test": "extract-text"},
         document_modes={"test": document_mode},
         models={"test": True},
         image_modes={"test": "block"},
@@ -925,10 +756,6 @@ async def test_checked_native_result_still_passes_text_pii_policy(
         local_models={"test": False},
         image_models={"test": False},
     )
-
-    async def convert(upload, abandoned, *, native=False, force_ocr=False):
-        assert force_ocr == (not native)
-        return incomplete_native(case) if native else native_document()
 
     async def analyze(request, session_key, **kwargs):
         assert kwargs["text_pii_enabled"]
@@ -943,8 +770,7 @@ async def test_checked_native_result_still_passes_text_pii_policy(
         )
 
     with (
-        patch.object(docling, "_convert_one", side_effect=convert),
-        patch("agentgateway_extproc.lib.docling.render_pdf") as renderer,
+        patch.object(docling, "_convert_one", return_value=extracted_document()),
         patch.object(engine_client, "analyze_request", side_effect=analyze) as analysis,
     ):
         response = await dispatch(
@@ -967,13 +793,15 @@ async def test_checked_native_result_still_passes_text_pii_policy(
     await docling.close()
     assert response.HasField("request_body")
     analysis.assert_awaited_once()
-    renderer.assert_not_called()
 
 
 @pytest.mark.parametrize(
     "extra",
     [
         {"pdf_modes": {"test": "native-first"}},
+        {"pdf_modes": {"test": "native-first"}, "pdf_fallbacks": {"test": "extract-text"}},
+        {"pdf_modes": {"test": "native-first"}, "pdf_fallbacks": {"test": "render-images"}},
+        {"pdf_fallbacks": {}},
         {"pdf_fallbacks": {"test": "extract-text"}},
         {"pdf_modes": {"test": "extract-text"}, "pdf_fallbacks": {"test": "extract-text"}},
         {"pdf_modes": {"test": "block"}, "pdf_fallbacks": {"test": "render-images"}},
@@ -987,6 +815,6 @@ async def test_checked_native_result_still_passes_text_pii_policy(
         {"pdf_modes": {"test": "extract-text"}, "pdf_max_rendered_pages": {"test": 10}},
     ],
 )
-def test_native_fallback_and_render_budget_must_match_pdf_mode(extra):
+def test_retired_pdf_modes_fallbacks_and_invalid_render_budgets_are_rejected(extra):
     with pytest.raises(ValidationError):
         ModelDestinationPolicy.model_validate(policy(**extra))

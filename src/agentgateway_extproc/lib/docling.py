@@ -19,7 +19,6 @@ from agentgateway_extproc.lib.documents import (
     ImageBatch,
     Upload,
     inspect_canonical_faces,
-    native_pdf_covered,
     preflight,
     project_document,
 )
@@ -28,9 +27,8 @@ from agentgateway_extproc.lib.image_inspection import (
     ImageInspectionClient,
     ImageInspectionTimeoutError,
 )
-from agentgateway_extproc.lib.image_probe import MAX_IMAGE_BYTES
 from agentgateway_extproc.lib.json_limits import strict_json_loads
-from agentgateway_extproc.lib.local_attachments import LocalAttachments, render_pdf
+from agentgateway_extproc.lib.local_attachments import LocalAttachments
 from agentgateway_extproc.models.engine import EngineAttachmentPart
 
 _STATUSES = {"pending", "started", "success", "partial_success", "failure", "skipped"}
@@ -75,7 +73,6 @@ class DoclingClient:
         images: ImageBatch | None = None,
         inspect_images: set[int] | None = None,
         pdf_mode: str | None = None,
-        pdf_fallback: str | None = None,
         document_mode: str | None = None,
     ) -> list[str]:
         """Extract every attachment, preserving the legacy ordered result."""
@@ -85,7 +82,6 @@ class DoclingClient:
             images=images,
             inspect_images=inspect_images,
             pdf_mode=pdf_mode,
-            pdf_fallback=pdf_fallback,
             document_mode=document_mode,
         )
         return list(texts.values())
@@ -98,9 +94,7 @@ class DoclingClient:
         images: ImageBatch | None = None,
         inspect_images: set[int] | None = None,
         pdf_mode: str | None = None,
-        pdf_fallback: str | None = None,
         document_mode: str | None = None,
-        pdf_max_rendered_pages: int = 5,
     ) -> dict[int, str]:
         """Admit one batch; an empty selection normalizes images without Docling."""
         if (
@@ -123,9 +117,7 @@ class DoclingClient:
                 images,
                 inspect_images or set(),
                 pdf_mode,
-                pdf_fallback,
                 document_mode,
-                pdf_max_rendered_pages,
             )
         )
         self._task = task
@@ -172,9 +164,7 @@ class DoclingClient:
         images: ImageBatch | None = None,
         inspect_images: set[int] | None = None,
         pdf_mode: str | None = None,
-        pdf_fallback: str | None = None,
         document_mode: str | None = None,
-        pdf_max_rendered_pages: int = 5,
     ) -> dict[int, str]:
         """Validate every part before extracting the selected uploads in order."""
         try:
@@ -196,9 +186,7 @@ class DoclingClient:
                 images,
                 inspect_images,
                 pdf_mode,
-                pdf_fallback,
                 document_mode,
-                pdf_max_rendered_pages,
             )
         finally:
             for upload in uploads:
@@ -213,13 +201,9 @@ class DoclingClient:
         images: ImageBatch | None,
         inspect_images: set[int] | None,
         pdf_mode: str | None,
-        pdf_fallback: str | None,
         document_mode: str | None,
-        pdf_max_rendered_pages: int,
     ) -> dict[int, str]:
-        """Keep original bytes until the native coverage decision and fallback finish."""
-        if pdf_mode == "native-first" and pdf_fallback not in {"extract-text", "render-images"}:
-            raise DocumentError(403, reason="attachments_disabled")
+        """Extract each selected upload once, retaining admission until completion."""
         if any(
             (pdf_mode if upload.format == "pdf" and pdf_mode is not None else document_mode)
             == "block"
@@ -244,48 +228,7 @@ class DoclingClient:
                 else None
             )
             self._active_stage = "extraction"
-            native = upload.format == "pdf" and pdf_mode == "native-first"
-            if native:
-                document = await self._convert_one(upload, abandoned, native=True)
-                if abandoned.is_set():
-                    break
-                text, count = await asyncio.to_thread(
-                    project_document,
-                    document,
-                    upload,
-                    self.settings.pages - pages,
-                    allow_empty_native=True,
-                )
-                if not native_pdf_covered(document, count):
-                    if time.monotonic() >= deadline or abandoned.is_set():
-                        raise DocumentError(504, reason="extraction_timeout")
-                    if pdf_fallback == "render-images":
-                        if images is None or images.protect_faces:
-                            raise DocumentError(403, reason="attachments_disabled")
-                        total_pages = sum(map(len, images.pdf_images.values())) + upload.pages
-                        if total_pages + len(images.images) > pdf_max_rendered_pages:
-                            raise DocumentError(413)
-                        rendered = await asyncio.to_thread(
-                            render_pdf, upload, abandoned, deadline, pdf_max_rendered_pages
-                        )
-                        images.pdf_images[index] = rendered
-                        upload.data = b""
-                        if (
-                            sum(map(len, images.images.values()))
-                            + sum(len(uri) for batch in images.pdf_images.values() for uri in batch)
-                            > MAX_IMAGE_BYTES
-                        ):
-                            raise DocumentError(413)
-                        pages += count
-                        continue
-                    document = await self._convert_one(
-                        upload,
-                        abandoned,
-                        force_ocr=self.settings.inference_mode
-                        in {"internal-standard", "private-standard"},
-                    )
-            else:
-                document = await self._convert_one(upload, abandoned)
+            document = await self._convert_one(upload, abandoned)
             upload.data = b""
             if abandoned.is_set():
                 break
@@ -364,9 +307,6 @@ class DoclingClient:
         self,
         upload: Upload,
         abandoned: threading.Event,
-        *,
-        native: bool = False,
-        force_ocr: bool = False,
     ) -> object:
         terminal = False
         try:
@@ -375,8 +315,6 @@ class DoclingClient:
                 "/v1/convert/file/async",
                 limit=65_536,
                 upload=upload,
-                native=native,
-                force_ocr=force_ocr,
             )
             task_id, status = _task_status(value)
             while status in _ACTIVE:
@@ -431,8 +369,6 @@ class DoclingClient:
         *,
         limit: int,
         upload: Upload | None = None,
-        native: bool = False,
-        force_ocr: bool = False,
     ) -> object:
         client = self._client
         key = self.settings.api_key
@@ -445,7 +381,7 @@ class DoclingClient:
             extension = "png" if source_format == "img" else source_format
             mime = "image/png" if source_format == "img" else _MIMES[source_format]
             files = {"files": (f"upload.{extension}", upload.data, mime)}
-            options = self._options(source_format, native=native, force_ocr=force_ocr)
+            options = self._options(source_format)
         try:
             async with (
                 asyncio.timeout(30),
@@ -479,9 +415,7 @@ class DoclingClient:
         except ValueError:
             raise DocumentError(diagnostic="http_json_invalid") from None
 
-    def _options(
-        self, source_format: str, *, native: bool = False, force_ocr: bool = False
-    ) -> dict[str, str]:
+    def _options(self, source_format: str) -> dict[str, str]:
         options = {
             "from_formats": "image" if source_format == "img" else source_format,
             "target_type": "inbody",
@@ -498,9 +432,7 @@ class DoclingClient:
             "do_picture_description": "false",
             "do_pdf_heading_hierarchy": "false",
         }
-        if native and source_format == "pdf":
-            options.update(pipeline="native", pdf_backend="threaded_docling_parse", do_ocr="false")
-        elif self.settings.inference_mode in {"internal-standard", "private-standard"}:
+        if self.settings.inference_mode in {"internal-standard", "private-standard"}:
             # The trusted service owns model placement, pinned options and credentials.
             options.update(
                 pipeline="standard",
@@ -510,8 +442,6 @@ class DoclingClient:
                 do_ocr="true",
                 do_table_structure="true",
             )
-            if force_ocr and source_format == "pdf":
-                options["force_ocr"] = "true"
         else:
             options.update(
                 pipeline="vlm",
