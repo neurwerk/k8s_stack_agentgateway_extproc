@@ -23,7 +23,6 @@ from xml.parsers import expat
 from agentgateway_extproc.config.settings import MEBIBYTE, DoclingSettings
 from agentgateway_extproc.lib.extraction_diagnostics import (
     EXPLANATIONS,
-    VLM_EXPLANATIONS,
     log_failure,
     safe_metadata,
 )
@@ -131,12 +130,6 @@ class DocumentError(Exception):
                 ),
             }[self.reason]
         )
-        explanation = VLM_EXPLANATIONS.get(str(self.metadata.get("error_code")))
-        if explanation is not None:
-            page_no = self.metadata.get("page_no")
-            if page_no is not None:
-                explanation = f"Page {page_no}: {explanation}"
-            self.message += " " + explanation
         super().__init__(self.message)
 
     def log(self, request_id: str | None = None) -> None:
@@ -249,10 +242,9 @@ def _decode_image(
     abandoned: threading.Event | None,
     deadline: float,
 ) -> Upload:
-    modern = images.policy_version >= 3
-    if not modern and settings.inference_mode != "private-vlm":
+    if images.policy_version < 3:
         raise DocumentError(403, reason="image_processing_unavailable")
-    limit = min(settings.file_bytes, MAX_SOURCE_BYTES if modern else MAX_IMAGE_BYTES)
+    limit = min(settings.file_bytes, MAX_SOURCE_BYTES)
     mime, data = _image_data(part, limit, policy_version=images.policy_version)
     _check_preflight(abandoned, deadline)
     normalized, count = _normalize_image(
@@ -275,7 +267,7 @@ def inspect_canonical_faces(images: ImageBatch, index: int, png: bytes) -> None:
 
 
 def _image_data(
-    part: EngineAttachmentPart, limit: int, *, policy_version: int = 2
+    part: EngineAttachmentPart, limit: int, *, policy_version: int
 ) -> tuple[str, bytes]:
     value = part.model_dump()
     url_key = "image_url"
@@ -286,17 +278,14 @@ def _image_data(
     else:
         value.pop("type")
     # Caller detail is only a rendering hint, never a normalization/OCR setting.
-    if policy_version >= 3 and value.pop("detail", "auto") not in ("auto", "low", "high"):
+    if value.pop("detail", "auto") not in ("auto", "low", "high"):
         raise DocumentError(400)
     url = value.get(url_key)
     if set(value) != {url_key} or not isinstance(url, str):
         raise DocumentError(400)
     match = re.fullmatch(r"data:image/([a-z-]+);base64,([A-Za-z0-9+/]*={0,2})", url)
-    allowed = (
-        {"jpeg", "png", "heic", "heif", "x-heic", "x-heif"}
-        | ({"webp"} if policy_version == 4 else set())
-        if policy_version >= 3
-        else {"jpeg", "png"}
+    allowed = {"jpeg", "png", "heic", "heif", "x-heic", "x-heif"} | (
+        {"webp"} if policy_version == 4 else set()
     )
     if match is None or match[1] not in allowed:
         raise DocumentError(400, reason="unsupported_format" if match else "invalid_upload")
@@ -315,7 +304,7 @@ def _image_data(
 
 
 def _normalize_image(
-    data: bytes, mime: str, protect_faces: bool, policy_version: int = 2
+    data: bytes, mime: str, protect_faces: bool, policy_version: int
 ) -> tuple[bytes, int]:
     try:
         result = subprocess.run(  # noqa: S603 - fixed executable/module and allowlisted arguments
@@ -333,7 +322,7 @@ def _normalize_image(
                 if mime == "webp"
                 else "HEIF",
                 "detect" if protect_faces else "skip",
-                *([str(policy_version)] if policy_version >= 3 else []),
+                str(policy_version),
             ],
             input=data,
             stdout=subprocess.PIPE,
@@ -352,22 +341,16 @@ def _normalize_image(
         raise DocumentError(reason="image_analysis_failed")
     if result.returncode:
         raise DocumentError(400)
-    if policy_version >= 3:
-        count = int.from_bytes(result.stdout[4:6], "big")
-        valid = (
-            result.stdout.startswith(COUNT_HEADER)
-            and len(result.stdout) >= 6
-            and count <= MAX_FACES
-            and (protect_faces or count == 0)
-        )
-        normalized = result.stdout[6:]
-    else:
-        valid = result.stdout[:1] in {b"\x00", b"\x01"}
-        count, normalized = int.from_bytes(result.stdout[:1], "big"), result.stdout[1:]
+    count = int.from_bytes(result.stdout[4:6], "big")
+    valid = (
+        result.stdout.startswith(COUNT_HEADER)
+        and len(result.stdout) >= 6
+        and count <= MAX_FACES
+        and (protect_faces or count == 0)
+    )
+    normalized = result.stdout[6:]
     if not valid:
-        raise DocumentError(503 if policy_version >= 3 else 400, reason="image_analysis_failed")
-    if count and policy_version < 3:
-        raise DocumentError(403, reason="face_policy_blocked")
+        raise DocumentError(503, reason="image_analysis_failed")
     if not normalized.startswith(b"\x89PNG\r\n\x1a\n") or len(normalized) > MAX_IMAGE_BYTES:
         raise DocumentError(413)
     return normalized, count

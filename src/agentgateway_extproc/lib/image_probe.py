@@ -16,8 +16,6 @@ MAX_IMAGE_BYTES = 5 * 1_048_576
 MAX_SOURCE_BYTES = 20 * 1_048_576
 MAX_SOURCE_PIXELS = 50_000_000
 MAX_SOURCE_DIMENSION = 10_000
-MAX_PIXELS = 12_000_000
-MAX_DIMENSION = 4096
 MAX_DETECTION_PIXELS = 2_000_000
 MAX_DETECTION_DIMENSION = 2048
 MIN_DETECTION_DIMENSION = 64
@@ -28,54 +26,42 @@ MODEL_SHA256 = "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4
 
 
 def normalize(
-    data: bytes, expected: str, *, protect_faces: bool = False, policy_version: int = 2
+    data: bytes, expected: str, *, protect_faces: bool = False, policy_version: int
 ) -> bytes:
     """Rebuild single-frame, oriented RGB pixels without source metadata."""
     from PIL import Image, ImageOps
 
     # Enforce our own stricter dimensions before load(), with one stable limit error.
     Image.MAX_IMAGE_PIXELS = None
-    modern = policy_version >= 3
+    if policy_version not in {3, 4}:
+        raise ValueError("unsupported image policy")  # noqa: TRY003
     if expected == "HEIF":
-        if not modern:
-            raise ValueError("unsupported image format")  # noqa: TRY003
         _register_heif(data)
     elif expected not in {"JPEG", "PNG"} and (expected != "WEBP" or policy_version != 4):
         raise ValueError("unsupported image format")  # noqa: TRY003
-    pixel_limit = (
-        MAX_SOURCE_PIXELS if modern else MAX_DETECTION_PIXELS if protect_faces else MAX_PIXELS
-    )
-    dimension_limit = (
-        MAX_SOURCE_DIMENSION
-        if modern
-        else MAX_DETECTION_DIMENSION
-        if protect_faces
-        else MAX_DIMENSION
-    )
     with Image.open(io.BytesIO(data), formats=[expected]) as image:
         width, height = image.size
         if (
-            width * height > pixel_limit
-            or max(width, height) > dimension_limit
+            width * height > MAX_SOURCE_PIXELS
+            or max(width, height) > MAX_SOURCE_DIMENSION
             or (protect_faces and min(width, height) < MIN_DETECTION_DIMENSION)
         ):
             raise MemoryError
         if getattr(image, "n_frames", 1) != 1 or min(width, height) < 1:
             raise ValueError("invalid image frames")  # noqa: TRY003
-        if modern:
-            # One canonical reduction, before full-size orientation/RGBA copies.
-            # Every reader, detector and downstream destination gets these pixels.
-            scale = min(
-                1,
-                MAX_DETECTION_DIMENSION / max(width, height),
-                math.sqrt(MAX_DETECTION_PIXELS / (width * height)),
-            )
-            image.thumbnail(
-                (max(1, int(width * scale)), max(1, int(height * scale))),
-                Image.Resampling.LANCZOS,
-            )
-            if protect_faces and min(image.size) < MIN_DETECTION_DIMENSION:
-                raise MemoryError
+        # One canonical reduction, before full-size orientation/RGBA copies.
+        # Every reader, detector and downstream destination gets these pixels.
+        scale = min(
+            1,
+            MAX_DETECTION_DIMENSION / max(width, height),
+            math.sqrt(MAX_DETECTION_PIXELS / (width * height)),
+        )
+        image.thumbnail(
+            (max(1, int(width * scale)), max(1, int(height * scale))),
+            Image.Resampling.LANCZOS,
+        )
+        if protect_faces and min(image.size) < MIN_DETECTION_DIMENSION:
+            raise MemoryError
         image.load()
         # HEIF's plugin already applies irot/imir and clears descriptive EXIF
         # orientation; this therefore does not rotate HEIF a second time.
@@ -189,13 +175,8 @@ def count_faces(data: bytes) -> int:
     return len(faces)
 
 
-def has_faces(data: bytes) -> bool:
-    """Keep the shipped boolean interface for version-two callers."""
-    return bool(count_faces(data))
-
-
 def main() -> int:
-    """Emit a bounded count (v3) or legacy flag, followed by canonical PNG bytes."""
+    """Emit a bounded versioned face count, followed by canonical PNG bytes."""
     output = os.dup(1)
     os.dup2(2, 1)
     try:
@@ -205,10 +186,9 @@ def main() -> int:
         resource.setrlimit(resource.RLIMIT_CPU, (10, 10))
         logging.disable(logging.CRITICAL)
         warnings.simplefilter("error")
-        version = int(sys.argv[3]) if len(sys.argv) == 4 else 2
-        limit = MAX_SOURCE_BYTES if version >= 3 else MAX_IMAGE_BYTES
-        data = sys.stdin.buffer.read(limit + 1)
-        if len(data) > limit:
+        version = int(sys.argv[3])
+        data = sys.stdin.buffer.read(MAX_SOURCE_BYTES + 1)
+        if len(data) > MAX_SOURCE_BYTES:
             return 2
         normalized = normalize(
             data, sys.argv[1], protect_faces=sys.argv[2] == "detect", policy_version=version
@@ -220,9 +200,7 @@ def main() -> int:
         except Exception:  # noqa: BLE001
             return 3
         with os.fdopen(output, "wb", closefd=False) as stream:
-            header = (
-                COUNT_HEADER + count.to_bytes(2, "big") if version >= 3 else bytes([bool(count)])
-            )
+            header = COUNT_HEADER + count.to_bytes(2, "big")
             stream.write(header + normalized)
     except MemoryError:
         return 2

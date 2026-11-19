@@ -432,21 +432,15 @@ class DoclingClient:
             "do_picture_description": "false",
             "do_pdf_heading_hierarchy": "false",
         }
-        if self.settings.inference_mode in {"internal-standard", "private-standard"}:
-            # The trusted service owns model placement, pinned options and credentials.
-            options.update(
-                pipeline="standard",
-                layout_preset="default",
-                ocr_preset="default",
-                table_structure_preset="default",
-                do_ocr="true",
-                do_table_structure="true",
-            )
-        else:
-            options.update(
-                pipeline="vlm",
-                vlm_pipeline_preset="images" if source_format == "img" else "default",
-            )
+        # The trusted service owns model placement, pinned options and credentials.
+        options.update(
+            pipeline="standard",
+            layout_preset="default",
+            ocr_preset="default",
+            table_structure_preset="default",
+            do_ocr="true",
+            do_table_structure="true",
+        )
         return options
 
 

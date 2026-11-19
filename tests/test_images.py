@@ -25,7 +25,7 @@ from agentgateway_extproc.controllers.grpc_servicer import ExtProcServicer
 from agentgateway_extproc.lib.docling import DoclingClient
 from agentgateway_extproc.lib.documents import DocumentError, ImageBatch, preflight
 from agentgateway_extproc.lib.engine.client import EngineClient
-from agentgateway_extproc.lib.image_probe import MODEL_PATH, MODEL_SHA256, has_faces, normalize
+from agentgateway_extproc.lib.image_probe import MODEL_PATH, MODEL_SHA256, count_faces, normalize
 from agentgateway_extproc.lib.pipeline.request import request_mutation
 from agentgateway_extproc.models.destination import ModelDestinationPolicy
 from agentgateway_extproc.models.engine import EngineAttachmentPart
@@ -183,9 +183,9 @@ def test_v3_requires_explicit_image_capability_and_typed_bindings(extra, valid):
 def test_real_model_load_and_inference_and_normalization(format):
     assert hashlib.sha256(MODEL_PATH.read_bytes()).hexdigest() == MODEL_SHA256
     part = EngineAttachmentPart.model_validate(image_part(format=format))
-    batch = ImageBatch()
-    upload = preflight([part], DoclingSettings(inference_mode="private-vlm"), batch)[0]
-    assert not has_faces(upload.data)
+    batch = ImageBatch(policy_version=3)
+    upload = preflight([part], DoclingSettings(), batch)[0]
+    assert count_faces(upload.data) == 0
     assert upload.pages == 1 and upload.format == "img"
     assert b"DO-NOT-FORWARD" not in upload.data
     assert base64.b64decode(batch.images[0].split(",")[1]) == upload.data
@@ -202,7 +202,7 @@ def test_image_format_does_not_expand_the_document_file_allowlist():
         },
     )
     with pytest.raises(DocumentError) as error:
-        preflight([part], DoclingSettings(inference_mode="private-vlm"), ImageBatch())
+        preflight([part], DoclingSettings(), ImageBatch())
     assert error.value.status == 400
 
 
@@ -212,16 +212,16 @@ def test_jpeg_orientation_and_missing_or_corrupt_detector(tmp_path):
     exif[274] = 6
     buffer = io.BytesIO()
     image.save(buffer, format="JPEG", exif=exif)
-    normalized = normalize(buffer.getvalue(), "JPEG")
+    normalized = normalize(buffer.getvalue(), "JPEG", policy_version=3)
     with Image.open(io.BytesIO(normalized)) as rebuilt:
         assert rebuilt.size == (48, 32) and not rebuilt.getexif()
     corrupt = tmp_path / "invalid.onnx"
     with patch("agentgateway_extproc.lib.image_probe.MODEL_PATH", corrupt):
         with pytest.raises(FileNotFoundError):
-            has_faces(normalized)
+            count_faces(normalized)
         corrupt.write_bytes(b"corrupt")
         with pytest.raises(ValueError, match="invalid face model"):
-            has_faces(normalized)
+            count_faces(normalized)
 
 
 @pytest.mark.parametrize(
@@ -234,17 +234,15 @@ def test_jpeg_orientation_and_missing_or_corrupt_detector(tmp_path):
         ("base64", 400),
         ("frames", 400),
         ("dimension", 413),
-        ("pixels", 413),
-        ("cpu", 403),
+        ("legacy", 403),
         ("timeout", 413),
         ("detector-error", 503),
-        ("face", 403),
         ("empty", 400),
     ],
 )
 def test_image_preflight_rejections(case, status):
     part = image_part(
-        size=(4097, 1) if case == "dimension" else (4000, 4000) if case == "pixels" else (64, 64),
+        size=(10001, 1) if case == "dimension" else (64, 64),
         frames=case == "frames",
     )
     if case == "url":
@@ -257,19 +255,19 @@ def test_image_preflight_rejections(case, status):
         part["image_url"]["url"] += "!"
     if case == "empty":
         part["image_url"]["url"] = "data:image/png;base64,"
-    settings = DoclingSettings(
-        inference_mode="internal-standard" if case == "cpu" else "private-vlm"
-    )
+    settings = DoclingSettings()
     with patch("agentgateway_extproc.lib.documents.subprocess.run", wraps=subprocess.run) as run:
         if case == "timeout":
             run.side_effect = subprocess.TimeoutExpired("fixed", 15)
-        if case in {"detector-error", "face"}:
-            run.return_value = subprocess.CompletedProcess(
-                [], 3 if case == "detector-error" else 0, b"\x01"
-            )
+        if case == "detector-error":
+            run.return_value = subprocess.CompletedProcess([], 3, b"")
             run.side_effect = None
         with pytest.raises(DocumentError) as error:
-            preflight([EngineAttachmentPart.model_validate(part)], settings, ImageBatch())
+            preflight(
+                [EngineAttachmentPart.model_validate(part)],
+                settings,
+                ImageBatch(policy_version=2 if case == "legacy" else 3),
+            )
         assert error.value.status == status
 
 
@@ -321,7 +319,6 @@ async def test_image_dispatch(engine_reply, api, case):  # noqa: C901
         docling=DoclingSettings(
             enabled=True,
             api_key="test-only",
-            inference_mode="internal-standard" if v3 else "private-vlm",
         ),
         max_transformed_request_bytes=1024 if case == "final-limit" else 10 * 1_048_576,
     )
@@ -379,16 +376,12 @@ async def test_image_dispatch(engine_reply, api, case):  # noqa: C901
             }
             current_format = fields["from_formats"].get_payload()
             if current_format == "image":
-                if not v3:
-                    assert fields["vlm_pipeline_preset"].get_payload() == "images"
                 assert fields["files"].get_filename() == "upload.png"
                 canonical.append(fields["files"].get_payload(decode=True))
                 assert b"DO-NOT-FORWARD" not in canonical[-1]
-            elif not v3:
-                assert fields["vlm_pipeline_preset"].get_payload() == "default"
-            assert fields["pipeline"].get_payload() == ("standard" if v3 else "vlm")
-            if v3:
-                assert fields["do_ocr"].get_payload() == "true"
+            assert fields["pipeline"].get_payload() == "standard"
+            assert "vlm_pipeline_preset" not in fields
+            assert fields["do_ocr"].get_payload() == "true"
             return httpx.Response(
                 200, json={"task_id": "job", "task_type": "convert", "task_status": "success"}
             )
@@ -480,7 +473,7 @@ async def test_image_dispatch(engine_reply, api, case):  # noqa: C901
         def checked_probe(command, **kwargs):
             # A face-positive or failing detector must never gate text-only extraction.
             if text_only:
-                assert command[-1] == "skip", "YuNet must not run for image_forwarding=none"
+                assert command[-2] == "skip", "YuNet must not run for image_forwarding=none"
             return native_run(command, **kwargs)
 
         with (
@@ -488,17 +481,20 @@ async def test_image_dispatch(engine_reply, api, case):  # noqa: C901
                 "agentgateway_extproc.lib.documents.subprocess.run", side_effect=checked_probe
             ) as run,
             patch(
-                "agentgateway_extproc.lib.image_probe.has_faces",
+                "agentgateway_extproc.lib.image_probe.count_faces",
                 side_effect=AssertionError("face detector must stay off the text-only path"),
             ),
         ):
-            if case in {"face", "detector-error"}:
+            if case == "detector-error":
                 run.side_effect = None
-                run.return_value = subprocess.CompletedProcess(
-                    [], 3 if case == "detector-error" else 0, b"\x01"
-                )
+                run.return_value = subprocess.CompletedProcess([], 3, b"")
             replies = [reply async for reply in servicer.Process(requests(), object())]
         result = replies[-1]
+        if not v3:
+            assert result.immediate_response.status.code == 403
+            assert not native_calls and not engine_calls
+            await docling.close()
+            return
         if (
             case in {"clean", "unchecked", "unchecked-bypass", "v3-cpu-clean", "v3-cpu-no-text"}
             or text_only
@@ -517,7 +513,7 @@ async def test_image_dispatch(engine_reply, api, case):  # noqa: C901
                     assert b"Jane Doe" not in wire and "***" in content[1]["text"]
                 else:
                     assert "Jane Doe" in content[1]["text"]
-                assert all(call.args[0][-1] == "skip" for call in run.call_args_list)
+                assert all(call.args[0][-2] == "skip" for call in run.call_args_list)
             else:
                 image = content[2]["image_url"]
                 uri = image["url"] if api == "chat" else image
@@ -954,23 +950,19 @@ def test_ambiguous_face_detector_output_is_never_clean(result):
     import numpy as np
 
     status, rows = result
-    image = normalize(base64.b64decode(image_part()["image_url"]["url"].split(",")[1]), "PNG")
+    image = normalize(
+        base64.b64decode(image_part()["image_url"]["url"].split(",")[1]), "PNG", policy_version=3
+    )
     with patch("cv2.FaceDetectorYN.create") as create:
         create.return_value.detect.return_value = (status, None if rows is None else np.array(rows))
         with pytest.raises(ValueError):
-            has_faces(image)
-
-
-def test_image_preset_preserves_pdf_default():
-    client = DoclingClient(DoclingSettings(inference_mode="private-vlm"))
-    assert client._options("img")["vlm_pipeline_preset"] == "images"
-    assert client._options("pdf")["vlm_pipeline_preset"] == "default"
+            count_faces(image)
 
 
 @pytest.mark.parametrize("size", [(2000, 1000), (1000, 2000), (2048, 64), (64, 2048), (64, 64)])
 def test_real_protected_helper_at_supported_bounds(size):
     part = EngineAttachmentPart.model_validate(image_part(size=size))
-    upload = preflight([part], DoclingSettings(inference_mode="private-vlm"), ImageBatch())[0]
+    upload = preflight([part], DoclingSettings(), ImageBatch(policy_version=3))[0]
     with Image.open(io.BytesIO(upload.data)) as image:
         assert image.size == size
         assert image.getextrema() == ((255, 255),) * 3
@@ -991,31 +983,34 @@ def test_real_protected_helper_at_supported_bounds(size):
         (32, 2048),
     ],
 )
-def test_real_protected_helper_rejects_overlimit_without_resizing(size):
+def test_legacy_image_policy_is_rejected_before_normalization(size):
     part = EngineAttachmentPart.model_validate(image_part(size=size))
     with pytest.raises(DocumentError) as error:
-        preflight([part], DoclingSettings(inference_mode="private-vlm"), ImageBatch())
-    assert error.value.status == 413
+        preflight([part], DoclingSettings(), ImageBatch())
+    assert error.value.status == 403
 
 
 @pytest.mark.parametrize("size", [(4000, 3000), (3000, 4000), (4096, 32), (32, 4096)])
-def test_real_text_only_helper_keeps_higher_normalization_bounds(size):
+def test_real_text_only_helper_normalizes_with_modern_bounds(size):
     part = EngineAttachmentPart.model_validate(image_part(size=size))
     upload = preflight(
-        [part], DoclingSettings(inference_mode="private-vlm"), ImageBatch(protect_faces=False)
+        [part], DoclingSettings(), ImageBatch(protect_faces=False, policy_version=3)
     )[0]
     with Image.open(io.BytesIO(upload.data)) as image:
-        assert image.size == size
+        assert max(image.size) <= 2048
+        assert image.width * image.height <= 2_000_000
 
 
 def test_opencv_identifiable_memory_error_is_a_size_failure():
     import cv2
 
-    image = normalize(base64.b64decode(image_part()["image_url"]["url"].split(",")[1]), "PNG")
+    image = normalize(
+        base64.b64decode(image_part()["image_url"]["url"].split(",")[1]), "PNG", policy_version=3
+    )
     error = cv2.error("private allocation error")
     error.code = cv2.Error.StsNoMem
     with patch("cv2.FaceDetectorYN.create", side_effect=error), pytest.raises(MemoryError):
-        has_faces(image)
+        count_faces(image)
 
 
 @pytest.mark.parametrize("case", ["cancel", "deadline"])
@@ -1024,7 +1019,6 @@ async def test_image_preflight_stops_between_helpers_and_retains_admission(case)
     settings = DoclingSettings(
         enabled=True,
         api_key="test-only",
-        inference_mode="private-vlm",
         timeout=0.1 if case == "deadline" else 5,
     )
     parts = [EngineAttachmentPart.model_validate(image_part()) for _ in range(3)]
@@ -1043,7 +1037,7 @@ async def test_image_preflight_stops_between_helpers_and_retains_admission(case)
         with patch(
             "agentgateway_extproc.lib.documents.subprocess.run", side_effect=in_flight_helper
         ) as run:
-            caller = asyncio.create_task(client.convert(parts, images=ImageBatch()))
+            caller = asyncio.create_task(client.convert(parts, images=ImageBatch(policy_version=3)))
             try:
                 assert await asyncio.to_thread(entered.wait, 2)
                 retained = client._task
@@ -1077,7 +1071,7 @@ def test_preflight_expired_monotonic_deadline_never_starts_helper():
         with pytest.raises(DocumentError) as error:
             preflight(
                 parts,
-                DoclingSettings(inference_mode="private-vlm"),
+                DoclingSettings(),
                 ImageBatch(),
                 threading.Event(),
                 time.monotonic() - 1,

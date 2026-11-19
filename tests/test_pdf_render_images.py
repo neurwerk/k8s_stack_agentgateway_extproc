@@ -195,7 +195,7 @@ async def test_unchecked_image_also_ignores_poisoned_http(engine_client, real_ch
 async def test_image_only_batch_uses_attachment_count_not_pdf_budget(
     engine_client, real_children, version
 ):
-    docling = DoclingClient(DoclingSettings(count=6))
+    docling = DoclingClient(DoclingSettings(count=6, pages=250))
     selected = _v4_policy() if version == 4 else policy(pdf_modes={})
     with patch.object(docling, "_http", new_callable=AsyncMock) as http:
         response = await dispatch(
@@ -285,7 +285,7 @@ async def test_invalid_batches_fail_before_render_or_network(engine_client, real
 
 
 async def test_page_count_includes_history_images(engine_client, real_children):
-    docling = DoclingClient(DoclingSettings(count=5))
+    docling = DoclingClient(DoclingSettings(count=5, pages=250))
     good = await dispatch(engine_client, docling, [pdf_part(5)])
     assert good.HasField("request_body")
     with patch("agentgateway_extproc.lib.local_attachments.render_pdf") as renderer:
@@ -418,7 +418,7 @@ async def test_late_invalid_upload_never_starts_rendering(engine_client, real_ch
 @pytest.mark.parametrize("chat", [True, False])
 async def test_expanded_locations_survive_source_analysis(source_engine, real_children, chat):
     client, calls = source_engine
-    docling = DoclingClient(DoclingSettings())
+    docling = DoclingClient(DoclingSettings(pages=250))
     text = "text" if chat else "input_text"
     response = await dispatch(
         client,
@@ -514,11 +514,12 @@ def extracted_document(pages=2):
     return doc
 
 
-@pytest.mark.parametrize("inference", ["internal-standard", "private-standard", "private-vlm"])
-async def test_extraction_http_options_and_original_bytes(real_children, inference):
+async def test_extraction_http_options_and_original_bytes(real_children):
     posts = []
 
     def transport(request):
+        assert request.headers["x-api-key"] == "test-only"
+        assert "authorization" not in request.headers
         if request.method == "POST":
             posts.append(request.read())
             return httpx.Response(
@@ -535,7 +536,6 @@ async def test_extraction_http_options_and_original_bytes(real_children, inferen
             DoclingSettings(
                 enabled=True,
                 api_key=SecretStr("test-only"),
-                inference_mode=inference,
             ),
             client,
         )
@@ -551,27 +551,89 @@ async def test_extraction_http_options_and_original_bytes(real_children, inferen
     original = base64.b64decode(part.model_dump()["file"]["file_data"].partition(",")[2])
     assert all(original in body for body in pdf_posts)
     assert len(pdf_posts) == 1
-    standard = inference in {"internal-standard", "private-standard"}
-    expected = b"standard" if standard else b"vlm"
-    assert b'name="pipeline"\r\n\r\n' + expected in pdf_posts[-1]
-    assert b'name="pipeline"\r\n\r\n' + expected in posts[-1]
+    assert b'name="pipeline"\r\n\r\nstandard' in pdf_posts[-1]
+    assert b'name="pipeline"\r\n\r\nstandard' in posts[-1]
     assert b"force_ocr" not in posts[-1]
-    if standard:
-        for body in (pdf_posts[-1], posts[-1]):
-            for preset in ("layout_preset", "ocr_preset", "table_structure_preset"):
-                assert f'name="{preset}"\r\n\r\ndefault'.encode() in body
-            assert b'name="do_ocr"\r\n\r\ntrue' in body
-            assert b'name="do_table_structure"\r\n\r\ntrue' in body
-            assert b"vlm_pipeline_preset" not in body
+    for body in (pdf_posts[-1], posts[-1]):
+        for preset in ("layout_preset", "ocr_preset", "table_structure_preset"):
+            assert f'name="{preset}"\r\n\r\ndefault'.encode() in body
+        assert b'name="do_ocr"\r\n\r\ntrue' in body
+        assert b'name="do_table_structure"\r\n\r\ntrue' in body
+        assert b"vlm_pipeline_preset" not in body
     assert b"force_ocr" not in pdf_posts[-1]
     assert b'name="pipeline"\r\n\r\nnative' not in b"".join(posts)
+
+
+@pytest.mark.parametrize("limit", [2, 250])
+async def test_pdf_page_boundary_rejects_complete_batch_before_http(real_children, limit):
+    settings = DoclingSettings(
+        enabled=True, api_key=SecretStr("test-only"), **({"pages": limit} if limit != 2 else {})
+    )
+    requests = []
+
+    def transport(request):
+        requests.append(request.method)
+        if request.method == "POST":
+            return httpx.Response(
+                200, json={"task_id": "one", "task_type": "convert", "task_status": "success"}
+            )
+        return httpx.Response(
+            200,
+            json={
+                "status": "success",
+                "errors": [],
+                "document": {"json_content": extracted_document(limit)},
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as http:
+        docling = DoclingClient(settings, http)
+        try:
+            result = await docling.convert(
+                [EngineAttachmentPart.model_validate(pdf_part(limit))], pdf_mode="extract-text"
+            )
+            assert f"Extracted page {limit}" in result[0]
+            assert requests == ["POST", "GET"]
+            requests.clear()
+            for parts in ([pdf_part(limit + 1)], [pdf_part(1), pdf_part(limit)]):
+                with pytest.raises(DocumentError) as error:
+                    await docling.convert(
+                        [EngineAttachmentPart.model_validate(part) for part in parts],
+                        pdf_mode="extract-text",
+                    )
+                assert error.value.status == 413
+                assert not requests
+        finally:
+            await docling.close()
+
+
+async def test_legacy_images_are_rejected_before_normalization_or_http():
+    def unexpected(request):
+        pytest.fail("legacy image policy must not submit a conversion")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(unexpected)) as http:
+        docling = DoclingClient(DoclingSettings(enabled=True, api_key=SecretStr("test-only")), http)
+        try:
+            with patch("agentgateway_extproc.lib.documents._normalize_image") as normalize:
+                with pytest.raises(DocumentError) as error:
+                    await docling.convert(
+                        [EngineAttachmentPart.model_validate(image_part())],
+                        images=ImageBatch(policy_version=2),
+                    )
+                assert error.value.status == 403
+                assert error.value.reason == "image_processing_unavailable"
+                normalize.assert_not_called()
+        finally:
+            await docling.close()
 
 
 @pytest.mark.parametrize("limit", [1, 20])
 async def test_configured_render_budget_is_independent_of_upload_count(
     engine_client, real_children, limit
 ):
-    docling = DoclingClient(DoclingSettings(enabled=True, api_key=SecretStr("test-only")))
+    docling = DoclingClient(
+        DoclingSettings(enabled=True, api_key=SecretStr("test-only"), pages=250)
+    )
     selected = policy(
         pdf_modes={"test": "render-images"},
         pdf_max_rendered_pages={"test": limit},
