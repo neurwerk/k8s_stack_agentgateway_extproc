@@ -138,7 +138,12 @@ def test_formula_source_text_is_used_only_without_canonical_text(canonical):
         ("", 123, "text_item_invalid"),
         ("", " \n", "text_item_invalid"),
         ("", "source\x00text", "text_invalid"),
-        ("", "x" * (MAX_TEXT - len("[Source formula text] ")), "text_limit"),
+        pytest.param(
+            "",
+            "x" * (MAX_TEXT - len("[Source formula text] ")),
+            "text_limit",
+            id="formula-text-budget",
+        ),
     ],
 )
 def test_formula_fallback_preserves_text_validation_and_budget(canonical, original, diagnostic):
