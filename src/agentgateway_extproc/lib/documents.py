@@ -23,7 +23,6 @@ from xml.parsers import expat
 from agentgateway_extproc.config.settings import MEBIBYTE, DoclingSettings
 from agentgateway_extproc.lib.extraction_diagnostics import (
     EXPLANATIONS,
-    VLM_EXPLANATIONS,
     log_failure,
     safe_metadata,
 )
@@ -131,12 +130,6 @@ class DocumentError(Exception):
                 ),
             }[self.reason]
         )
-        explanation = VLM_EXPLANATIONS.get(str(self.metadata.get("error_code")))
-        if explanation is not None:
-            page_no = self.metadata.get("page_no")
-            if page_no is not None:
-                explanation = f"Page {page_no}: {explanation}"
-            self.message += " " + explanation
         super().__init__(self.message)
 
     def log(self, request_id: str | None = None) -> None:
@@ -249,10 +242,9 @@ def _decode_image(
     abandoned: threading.Event | None,
     deadline: float,
 ) -> Upload:
-    modern = images.policy_version >= 3
-    if not modern and settings.inference_mode not in {"private-vlm", "remote"}:
+    if images.policy_version < 3:
         raise DocumentError(403, reason="image_processing_unavailable")
-    limit = min(settings.file_bytes, MAX_SOURCE_BYTES if modern else MAX_IMAGE_BYTES)
+    limit = min(settings.file_bytes, MAX_SOURCE_BYTES)
     mime, data = _image_data(part, limit, policy_version=images.policy_version)
     _check_preflight(abandoned, deadline)
     normalized, count = _normalize_image(
@@ -275,7 +267,7 @@ def inspect_canonical_faces(images: ImageBatch, index: int, png: bytes) -> None:
 
 
 def _image_data(
-    part: EngineAttachmentPart, limit: int, *, policy_version: int = 2
+    part: EngineAttachmentPart, limit: int, *, policy_version: int
 ) -> tuple[str, bytes]:
     value = part.model_dump()
     url_key = "image_url"
@@ -286,17 +278,14 @@ def _image_data(
     else:
         value.pop("type")
     # Caller detail is only a rendering hint, never a normalization/OCR setting.
-    if policy_version >= 3 and value.pop("detail", "auto") not in ("auto", "low", "high"):
+    if value.pop("detail", "auto") not in ("auto", "low", "high"):
         raise DocumentError(400)
     url = value.get(url_key)
     if set(value) != {url_key} or not isinstance(url, str):
         raise DocumentError(400)
     match = re.fullmatch(r"data:image/([a-z-]+);base64,([A-Za-z0-9+/]*={0,2})", url)
-    allowed = (
-        {"jpeg", "png", "heic", "heif", "x-heic", "x-heif"}
-        | ({"webp"} if policy_version == 4 else set())
-        if policy_version >= 3
-        else {"jpeg", "png"}
+    allowed = {"jpeg", "png", "heic", "heif", "x-heic", "x-heif"} | (
+        {"webp"} if policy_version == 4 else set()
     )
     if match is None or match[1] not in allowed:
         raise DocumentError(400, reason="unsupported_format" if match else "invalid_upload")
@@ -315,7 +304,7 @@ def _image_data(
 
 
 def _normalize_image(
-    data: bytes, mime: str, protect_faces: bool, policy_version: int = 2
+    data: bytes, mime: str, protect_faces: bool, policy_version: int
 ) -> tuple[bytes, int]:
     try:
         result = subprocess.run(  # noqa: S603 - fixed executable/module and allowlisted arguments
@@ -333,7 +322,7 @@ def _normalize_image(
                 if mime == "webp"
                 else "HEIF",
                 "detect" if protect_faces else "skip",
-                *([str(policy_version)] if policy_version >= 3 else []),
+                str(policy_version),
             ],
             input=data,
             stdout=subprocess.PIPE,
@@ -352,22 +341,16 @@ def _normalize_image(
         raise DocumentError(reason="image_analysis_failed")
     if result.returncode:
         raise DocumentError(400)
-    if policy_version >= 3:
-        count = int.from_bytes(result.stdout[4:6], "big")
-        valid = (
-            result.stdout.startswith(COUNT_HEADER)
-            and len(result.stdout) >= 6
-            and count <= MAX_FACES
-            and (protect_faces or count == 0)
-        )
-        normalized = result.stdout[6:]
-    else:
-        valid = result.stdout[:1] in {b"\x00", b"\x01"}
-        count, normalized = int.from_bytes(result.stdout[:1], "big"), result.stdout[1:]
+    count = int.from_bytes(result.stdout[4:6], "big")
+    valid = (
+        result.stdout.startswith(COUNT_HEADER)
+        and len(result.stdout) >= 6
+        and count <= MAX_FACES
+        and (protect_faces or count == 0)
+    )
+    normalized = result.stdout[6:]
     if not valid:
-        raise DocumentError(503 if policy_version >= 3 else 400, reason="image_analysis_failed")
-    if count and policy_version < 3:
-        raise DocumentError(403, reason="face_policy_blocked")
+        raise DocumentError(503, reason="image_analysis_failed")
     if not normalized.startswith(b"\x89PNG\r\n\x1a\n") or len(normalized) > MAX_IMAGE_BYTES:
         raise DocumentError(413)
     return normalized, count
@@ -680,7 +663,6 @@ def project_document(
     page_limit: int,
     *,
     allow_empty_image: bool = False,
-    allow_empty_native: bool = False,
 ) -> tuple[str, int]:
     """Project a complete supported tree, never source metadata or raw copies."""
     doc = _object(value)
@@ -717,9 +699,7 @@ def project_document(
     projection = _Projection(nodes)
     output = "\n".join(projection.walk({"$ref": f"#/{root}"}, 0) for root in ("body", "furniture"))
     empty_image = allow_empty_image and upload.format == "img" and not projection.has_text
-    if projection.seen != set(nodes) or (
-        not output.strip() and not empty_image and not allow_empty_native
-    ):
+    if projection.seen != set(nodes) or (not output.strip() and not empty_image):
         raise DocumentError(
             diagnostic="projection_incomplete",
             node_count=len(nodes),
@@ -730,58 +710,6 @@ def project_document(
     if len(output) > MAX_TEXT:
         raise DocumentError(413, diagnostic="text_limit")
     return output, pages
-
-
-def native_pdf_covered(value: object, pages: int) -> bool:
-    """Accept only canonical native text with unambiguous coverage and no pictures.
-
-    Call only after complete structural projection. Even logos require fallback.
-    """
-    doc = _object(value)
-    if doc.get("pictures") or doc.get("tables"):
-        return False
-    covered: set[int] = set()
-    for raw in _list(doc.get("texts")):
-        node = _object(raw)
-        text = node.get("text")
-        if not isinstance(text, str) or not text.strip():
-            continue
-        item_pages = _native_text_pages(text, node.get("prov"), pages)
-        if item_pages is None:
-            return False
-        covered.update(item_pages)
-    return covered == set(range(1, pages + 1))
-
-
-def _native_text_pages(text: str, provenance: object, pages: int) -> set[int] | None:
-    """Require exact, non-overlapping provenance for the entire canonical text."""
-    if not isinstance(provenance, list) or not provenance:
-        return None
-    covered: set[int] = set()
-    spans: list[tuple[int, int]] = []
-    for item in provenance:
-        if not isinstance(item, dict):
-            return None
-        page = item.get("page_no")
-        span = item.get("charspan")
-        if (
-            type(page) is not int
-            or not 1 <= page <= pages
-            or not isinstance(span, list)
-            or len(span) != 2
-            or any(type(offset) is not int for offset in span)
-            or not 0 <= span[0] < span[1] <= len(text)
-        ):
-            return None
-        if text[span[0] : span[1]].strip():
-            covered.add(page)
-        spans.append((span[0], span[1]))
-    end = 0
-    for start, stop in sorted(spans):
-        if start != end:
-            return None
-        end = stop
-    return covered if end == len(text) else None
 
 
 def _page_count(value: object, expected: int, limit: int) -> int:
@@ -823,10 +751,16 @@ class _Projection:
         return value
 
     def text_item(self, node: dict[str, object]) -> str:
-        """Preserve checkbox state and reject formulas without canonical text."""
+        """Preserve checkbox state and the standard pipeline's source formula text."""
         value = node.get("text")
-        if not isinstance(value, str) or (node.get("label") == "formula" and not value.strip()):
+        if not isinstance(value, str):
             raise DocumentError(diagnostic="text_item_invalid")
+        if node.get("label") == "formula" and not value.strip():
+            # Docling 2.142.1 leaves formula text empty without formula enrichment.
+            original = node.get("orig")
+            if not isinstance(original, str) or not original.strip():
+                raise DocumentError(diagnostic="text_item_invalid")
+            value = f"[Source formula text] {original}"
         marker = {"checkbox_selected": "[x]", "checkbox_unselected": "[ ]"}.get(
             node.get("label") if isinstance(node.get("label"), str) else ""
         )
@@ -840,26 +774,25 @@ class _Projection:
         rows, cols = data.get("num_rows"), data.get("num_cols")
         if type(rows) is not int or type(cols) is not int or rows < 1 or cols < 1:
             raise DocumentError(diagnostic="table_dimensions_invalid")
-        self.cells += rows * cols
+        entries = _list(data.get("table_cells"))
+        if not entries:
+            raise DocumentError(diagnostic="table_cells_invalid")
+        # Overlaps can make the canonical cell count exceed the declared grid.
+        self.cells += max(rows * cols, len(entries))
         if self.cells > MAX_CELLS:
             raise DocumentError(413, diagnostic="table_cell_limit")
-        grid = [[""] * cols for _ in range(rows)]
-        occupied: set[tuple[int, int]] = set()
-        entries = _list(data.get("table_cells"))
-        if not entries or len(entries) > rows * cols:
-            raise DocumentError(diagnostic="table_cells_invalid")
+        grid: list[list[list[str]]] = [[[] for _ in range(cols)] for _ in range(rows)]
+        cells: list[tuple[int, int, dict[str, object]]] = []
         for raw in entries:
             cell = _object(raw)
-            sr, er, sc, ec = _cell_offsets(cell, rows, cols)
-            for row in range(sr, er):
-                for col in range(sc, ec):
-                    if (row, col) in occupied:
-                        raise DocumentError(diagnostic="table_overlap")
-                    occupied.add((row, col))
-            grid[sr][sc] = (
+            sr, _, sc, _ = _cell_offsets(cell, rows, cols)
+            cells.append((sr, sc, cell))
+        # Stable sorting preserves source order for cells sharing an origin.
+        for sr, sc, cell in sorted(cells, key=lambda item: (item[0], item[1])):
+            grid[sr][sc].append(
                 self.walk(cell["ref"], depth + 1) if "ref" in cell else self.text(cell.get("text"))
             )
-        return "\n".join(" | ".join(row) for row in grid)
+        return "\n".join(" | ".join("\n".join(cell) for cell in row) for row in grid)
 
     def walk(self, value: object, depth: int) -> str:
         """Walk reading-order refs, rejecting cycles and unresolved content."""

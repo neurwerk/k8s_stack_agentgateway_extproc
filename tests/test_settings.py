@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import ssl
+from unittest.mock import patch
+
+import httpx
 import pytest
 from pydantic import ValidationError
 
@@ -14,6 +18,7 @@ from agentgateway_extproc.config.settings import (
     EngineSettings,
     Settings,
 )
+from agentgateway_extproc.lib.docling import DoclingClient
 from agentgateway_extproc.metrics import engine_request_latency_seconds
 
 
@@ -82,9 +87,52 @@ def test_engine_limits_accept_exact_maxima_and_reject_larger() -> None:
         {"enabled": True},
         {"enabled": True, "api_key": "test-only", "base_url": "http://docling.test"},
         {"enabled": True, "api_key": "test-only", "base_url": "https://user@docling.test"},
+        {"enabled": True, "api_key": "", "allow_http": True},
+        *(
+            {"enabled": True, "api_key": "test-only", "allow_http": True, "base_url": url}
+            for url in (
+                "http://user:password@docling.test",
+                "http://docling.test/path",
+                "http://docling.test?query=value",
+                "http://docling.test#fragment",
+                "http:///missing-host",
+                "ftp://docling.test",
+            )
+        ),
     ]:
         with pytest.raises(ValidationError):
             DoclingSettings.model_validate(values)
+
+
+def test_docling_http_requires_explicit_opt_in():
+    settings = DoclingSettings(
+        enabled=True, api_key="test-only", base_url="http://docling.test:8011", allow_http=True
+    )
+    assert settings.base_url == "http://docling.test:8011"
+
+
+async def test_docling_http_opt_in_keeps_https_ca_verification():
+    context = ssl.create_default_context()
+    settings = DoclingSettings(
+        enabled=True,
+        api_key="test-only",
+        allow_http=True,
+        ca_cert="/synthetic/ca.pem",
+    )
+    with (
+        patch(
+            "agentgateway_extproc.lib.docling.ssl.create_default_context", return_value=context
+        ) as ca,
+        patch(
+            "agentgateway_extproc.lib.docling.httpx.AsyncClient", wraps=httpx.AsyncClient
+        ) as client,
+    ):
+        docling = DoclingClient(settings)
+        await docling.close()
+    ca.assert_called_once_with(cafile="/synthetic/ca.pem")
+    assert client.call_args.kwargs["verify"] is context
+    assert context.check_hostname
+    assert context.verify_mode == ssl.CERT_REQUIRED
 
 
 def test_engine_latency_histogram_has_buckets_through_six_hundred_seconds() -> None:

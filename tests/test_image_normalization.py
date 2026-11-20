@@ -44,8 +44,6 @@ def _part(data, mime="heic"):
         ("chat", {"detail": "auto"}, 3, True),
         ("responses", {"detail": "low"}, 3, True),
         ("chat", {"detail": "high"}, 3, True),
-        ("chat", {"detail": "auto"}, 2, False),
-        ("responses", {"detail": "auto"}, 2, False),
         ("chat", {"detail": "other"}, 3, False),
         ("responses", {"detail": None}, 3, False),
         ("chat", {"detail": ["auto"]}, 3, False),
@@ -127,7 +125,7 @@ def test_real_phone_source_above_legacy_bytes_keeps_normalized_and_request_caps(
     upload = preflight([part], DoclingSettings(), batch)[0]
     assert len(upload.data) < MAX_IMAGE_BYTES and len(batch.images[0]) < MAX_IMAGE_BYTES
     for parts, settings, version in [
-        ([part], DoclingSettings(inference_mode="remote"), 2),
+        ([part], DoclingSettings(), 2),
         ([part], DoclingSettings(file_bytes=MAX_IMAGE_BYTES), 3),
         ([part], DoclingSettings(total_bytes=len(data) - 1), 3),
         ([part, part], DoclingSettings(), 3),
@@ -139,7 +137,7 @@ def test_real_phone_source_above_legacy_bytes_keeps_normalized_and_request_caps(
     ]:
         with pytest.raises(DocumentError) as error:
             preflight(parts, settings, ImageBatch(policy_version=version))
-        assert error.value.status == 413
+        assert error.value.status == (403 if version < 3 else 413)
 
 
 @pytest.mark.parametrize("size", [(10001, 64), (10000, 5001)])

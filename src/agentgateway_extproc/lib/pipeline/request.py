@@ -274,7 +274,6 @@ async def process_request(
             raise GatewayPolicyError("unsupported_feature")
         image_forwarding = policy.image_forwarding.get(model_id, "none")
         pdf_mode = policy.pdf_modes.get(model_id)
-        pdf_fallback = policy.pdf_fallbacks.get(model_id)
         pdf_max_rendered_pages = policy.pdf_max_rendered_pages.get(model_id, 5)
         unchecked_without_documents = False
         if attachments and policy.contract_version in {4, "4.1"}:
@@ -305,13 +304,10 @@ async def process_request(
                     document_indexes
                     and policy.document_mode(model_id) == "block"
                     and pdf_mode != "extract-text"
-                    and not (pdf_mode == "native-first" and pdf_fallback == "extract-text")
                 ) or (image_indexes and policy.image_mode(model_id) == "block"):
                     raise DocumentError(403, reason="attachments_disabled")  # noqa: TRY301
                 unchecked = image_forwarding == "pii-unchecked" and (
-                    bool(image_indexes)
-                    or pdf_mode == "render-images"
-                    or pdf_fallback == "render-images"
+                    bool(image_indexes) or pdf_mode == "render-images"
                 )
                 inspect_images = (
                     image_indexes
@@ -341,9 +337,7 @@ async def process_request(
                             selected,
                             images=images,
                             pdf_mode=pdf_mode,
-                            pdf_fallback=pdf_fallback,
                             document_mode=policy.document_mode(model_id),
-                            pdf_max_rendered_pages=pdf_max_rendered_pages,
                         )
                         if selected
                         else {}
@@ -364,7 +358,6 @@ async def process_request(
                         images=images,
                         inspect_images=inspect_images,
                         pdf_mode=pdf_mode,
-                        pdf_fallback=pdf_fallback,
                         document_mode=policy.document_mode(model_id),
                     )
                     if images is not None:
