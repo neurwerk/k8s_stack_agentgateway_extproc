@@ -74,6 +74,7 @@ class DoclingClient:
         inspect_images: set[int] | None = None,
         pdf_mode: str | None = None,
         document_mode: str | None = None,
+        incomplete: set[int] | None = None,
     ) -> list[str]:
         """Extract every attachment, preserving the legacy ordered result."""
         texts = await self.convert_selected(
@@ -83,6 +84,7 @@ class DoclingClient:
             inspect_images=inspect_images,
             pdf_mode=pdf_mode,
             document_mode=document_mode,
+            incomplete=incomplete,
         )
         return list(texts.values())
 
@@ -95,6 +97,7 @@ class DoclingClient:
         inspect_images: set[int] | None = None,
         pdf_mode: str | None = None,
         document_mode: str | None = None,
+        incomplete: set[int] | None = None,
     ) -> dict[int, str]:
         """Admit one batch; an empty selection normalizes images without Docling."""
         if (
@@ -118,6 +121,7 @@ class DoclingClient:
                 inspect_images or set(),
                 pdf_mode,
                 document_mode,
+                incomplete,
             )
         )
         self._task = task
@@ -165,6 +169,7 @@ class DoclingClient:
         inspect_images: set[int] | None = None,
         pdf_mode: str | None = None,
         document_mode: str | None = None,
+        incomplete: set[int] | None = None,
     ) -> dict[int, str]:
         """Validate every part before extracting the selected uploads in order."""
         try:
@@ -187,6 +192,7 @@ class DoclingClient:
                 inspect_images,
                 pdf_mode,
                 document_mode,
+                incomplete,
             )
         finally:
             for upload in uploads:
@@ -202,6 +208,7 @@ class DoclingClient:
         inspect_images: set[int] | None,
         pdf_mode: str | None,
         document_mode: str | None,
+        incomplete: set[int] | None,
     ) -> dict[int, str]:
         """Extract each selected upload once, retaining admission until completion."""
         if any(
@@ -239,6 +246,15 @@ class DoclingClient:
                 self.settings.pages - pages,
                 allow_empty_image=images is not None and images.policy_version >= 3,
             )
+            if upload.extraction_incomplete:
+                if not text.strip():
+                    raise DocumentError(diagnostic="projection_incomplete", has_text=False)
+                if incomplete is not None:
+                    incomplete.add(index)
+                text = (
+                    "Warning: document extraction is incomplete. Acknowledge that content is "
+                    "missing and do not infer the missing content.\n\n" + text
+                )
             if images is not None and upload.format == "img":
                 if index in (inspect_images or set()):
                     if canonical_image is None:
@@ -328,7 +344,7 @@ class DoclingClient:
                 # A lost POST reply or status does not prove native capacity is free.
                 self._poisoned = True
                 _logger.warning("Docling admission disabled: native job completion is unknown")
-        if status != "success":
+        if status not in {"success", "partial_success"}:
             log_native_errors([value], task_id)
             raise DocumentError(
                 diagnostic="task_unsuccessful", task_id=task_id, native_status=status
@@ -340,8 +356,17 @@ class DoclingClient:
         )
         if (
             not isinstance(value, dict)
-            or value.get("status") != "success"
-            or value.get("errors") != []
+            or value.get("status") not in ("success", "partial_success")
+            or not isinstance(value.get("errors"), list)
+            or any(
+                not isinstance(error, dict)
+                or any(
+                    not isinstance(error.get(field), str)
+                    for field in ("component_type", "module_name", "error_message")
+                )
+                for error in value["errors"]
+            )
+            or (value["status"] == "success" and value["errors"] != [])
             or not isinstance(value.get("document"), dict)
         ):
             result = value if isinstance(value, dict) else {}
@@ -360,6 +385,9 @@ class DoclingClient:
                 stop_reason=error_metadata.get("stop_reason"),
                 error_code=error_metadata.get("error_code"),
             )
+        upload.extraction_incomplete = (
+            status == "partial_success" or value["status"] == "partial_success"
+        )
         return value["document"].get("json_content")
 
     async def _http(
@@ -388,7 +416,11 @@ class DoclingClient:
                 client.stream(
                     method,
                     self.settings.base_url.rstrip("/") + path,
-                    headers={"X-Api-Key": key.get_secret_value(), "Accept-Encoding": "identity"},
+                    headers={
+                        "X-Api-Key": key.get_secret_value(),
+                        "Accept-Encoding": "identity",
+                        "Accept-Docling-Document-Version": "1.10.0",
+                    },
                     files=files,
                     data=options,
                     follow_redirects=False,

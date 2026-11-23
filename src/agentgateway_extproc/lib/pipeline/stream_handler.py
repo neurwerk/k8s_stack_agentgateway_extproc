@@ -132,6 +132,7 @@ class StreamHandler:
         self.response_passthrough_chunks: list[bytes] = []
         self.notice_messages: list[str] = []
         self.safety_notice_messages: list[str] = []
+        self.incomplete_extractions: set[int] = set()
         self.response_notice_allowed = True
         self.response_structured_json = False
         self.presidio_code: str | None = None

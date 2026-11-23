@@ -338,6 +338,7 @@ async def process_request(
                             images=images,
                             pdf_mode=pdf_mode,
                             document_mode=policy.document_mode(model_id),
+                            incomplete=handler.incomplete_extractions,
                         )
                         if selected
                         else {}
@@ -359,6 +360,7 @@ async def process_request(
                         inspect_images=inspect_images,
                         pdf_mode=pdf_mode,
                         document_mode=policy.document_mode(model_id),
+                        incomplete=handler.incomplete_extractions,
                     )
                     if images is not None:
                         _validate_image_inspections(images, inspect_images)
@@ -409,13 +411,17 @@ async def process_request(
                         and policy.protects_faces(model_id),
                         policy_version=cast(int, policy.contract_version),
                     )
-                    texts = await handler.docling.convert(attachments, images=images)
+                    texts = await handler.docling.convert(
+                        attachments, images=images, incomplete=handler.incomplete_extractions
+                    )
                     if isinstance(policy.contract_version, int) and policy.contract_version >= 3:
                         visual_findings = _visual_findings(attachments, images)
                     if image_forwarding != "none":
                         image_locations = _image_locations(payload, images)
                 else:
-                    texts = await handler.docling.convert(attachments)
+                    texts = await handler.docling.convert(
+                        attachments, incomplete=handler.incomplete_extractions
+                    )
                 request, body = _converted_request(payload, texts, controls=request._controls)
             except DocumentError as exc:
                 _clear_request(handler)
@@ -427,6 +433,21 @@ async def process_request(
             handler.request_body_chunks.clear()
             attachments.clear()
             payload = None
+        if handler.incomplete_extractions and (
+            bool(request.tools)
+            or (
+                _has_structured_chat_format(request)
+                if isinstance(request, EngineChatRequest)
+                else _has_structured_responses_format(request)
+            )
+        ):
+            _clear_request(handler)
+            handler.record_dispatch("policy_block")
+            return immediate_response(
+                422,
+                '{"error":"Document extraction is incomplete; a visible warning cannot '
+                'be included safely in a structured or tool-enabled response."}',
+            )
         handler.mcp_sources = source_union(
             handler.mcp_sources,
             collect_sources(segment.text for segment in extract_request(request).segments),
@@ -472,8 +493,12 @@ async def process_request(
                     _clear_request(handler)
                     return immediate_response(exc.status, json.dumps({"error": exc.message}))
             _clear_request(handler)
-            handler.response_processing_enabled = handler.admission is not None
-            handler.response_notice_allowed = handler.admission is None
+            handler.response_processing_enabled = handler.admission is not None or bool(
+                handler.incomplete_extractions
+            )
+            handler.response_notice_allowed = handler.admission is None or bool(
+                handler.incomplete_extractions
+            )
             body, alias_changed = _upstream_model_body(handler, body)
             handler.record_dispatch("model_bypass")
             return request_mutation(body, {}, converted or alias_changed)

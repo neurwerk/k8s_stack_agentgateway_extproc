@@ -155,6 +155,7 @@ class Upload:
     data: bytes
     pages: int = 0
     source_bytes: int = 0
+    extraction_incomplete: bool = False
 
 
 @dataclass
@@ -687,7 +688,12 @@ def project_document(
     }
     if any(value for key, value in doc.items() if key not in allowed):
         raise DocumentError(diagnostic="fields_unsupported", unsupported_fields_present=True)
-    pages = _page_count(doc.get("pages"), upload.pages, page_limit)
+    pages = _page_count(
+        doc.get("pages"),
+        upload.pages,
+        page_limit,
+        partial=upload.extraction_incomplete and upload.format == "pdf",
+    )
     nodes: dict[str, dict[str, object]] = {}
     for kind in ("texts", "groups", "tables", "pictures"):
         for index, item in enumerate(_list(doc.get(kind))):
@@ -698,6 +704,8 @@ def project_document(
         raise DocumentError(413, diagnostic="node_limit", node_count=len(nodes))
     projection = _Projection(nodes)
     output = "\n".join(projection.walk({"$ref": f"#/{root}"}, 0) for root in ("body", "furniture"))
+    if upload.extraction_incomplete and not projection.has_text:
+        raise DocumentError(diagnostic="projection_incomplete", has_text=False)
     empty_image = allow_empty_image and upload.format == "img" and not projection.has_text
     if projection.seen != set(nodes) or (not output.strip() and not empty_image):
         raise DocumentError(
@@ -712,11 +720,11 @@ def project_document(
     return output, pages
 
 
-def _page_count(value: object, expected: int, limit: int) -> int:
+def _page_count(value: object, expected: int, limit: int, *, partial: bool = False) -> int:
     pages = _object(value)
     if len(pages) > limit:
         raise DocumentError(413, diagnostic="page_limit", actual_pages=len(pages), page_limit=limit)
-    if expected and len(pages) != expected:
+    if expected and (not pages or (not partial and len(pages) != expected)):
         raise DocumentError(
             diagnostic="page_count_mismatch", expected_pages=expected, actual_pages=len(pages)
         )
@@ -727,7 +735,11 @@ def _page_count(value: object, expected: int, limit: int) -> int:
             or _object(page).get("page_no") != int(number)
         ):
             raise DocumentError(diagnostic="page_number_invalid")
-    if expected and set(pages) != {str(number) for number in range(1, expected + 1)}:
+    expected_numbers = {str(number) for number in range(1, expected + 1)}
+    if expected and (
+        not set(pages).issubset(expected_numbers)
+        or (not partial and set(pages) != expected_numbers)
+    ):
         raise DocumentError(diagnostic="page_sequence_invalid")
     return len(pages)
 

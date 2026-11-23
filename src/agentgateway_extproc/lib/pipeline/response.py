@@ -364,6 +364,10 @@ def process_json_response(handler: StreamHandler, text: str) -> str:
         payload = _reverse_json_values(handler, payload)
     notice = _render_handler_notice(handler)
     transformed_target = _json_notice_target(handler, payload)
+    if handler.incomplete_extractions and (
+        not notice or transformed_target is None or _requests_tool_execution(handler, payload)
+    ):
+        raise InvalidReversalError("incomplete extraction requires a visible response warning")
     if notice and transformed_target is not None and not _requests_tool_execution(handler, payload):
         container, field = transformed_target
         container[field] += notice
@@ -448,6 +452,7 @@ def _json_notice_target(handler: StreamHandler, payload: Any) -> tuple[dict[str,
         or (
             handler.response_api_kind == "responses"
             and payload.get("status") in {"failed", "incomplete"}
+            and not handler.incomplete_extractions
         )
     ):
         return None
@@ -496,8 +501,15 @@ def _notice_configured(handler: StreamHandler) -> bool:
 
 
 def _render_handler_notice(handler: StreamHandler) -> str:
-    if not handler.response_notice_allowed or not handler.notice_preferences.notices_enabled:
+    if not handler.response_notice_allowed:
         return ""
+    mandatory = (
+        ["Warning: document extraction is incomplete. Some document content is missing."]
+        if handler.incomplete_extractions
+        else []
+    )
+    if not handler.notice_preferences.notices_enabled:
+        return render_notice(mandatory, "")
     report = ""
     messages = handler.notice_messages
     if stats := handler.request_stats:
@@ -533,7 +545,7 @@ def _render_handler_notice(handler: StreamHandler) -> str:
     safety_messages = handler.safety_notice_messages
     if safety_messages and not _image_notice_visible(handler):
         safety_messages = []
-    return render_notice([*messages, *safety_messages], report)
+    return render_notice([*messages, *safety_messages, *mandatory], report)
 
 
 def _image_notice_visible(handler: StreamHandler) -> bool:
@@ -935,6 +947,17 @@ class SseResponseProcessor:
 
     def _render_terminal(self) -> list[str]:
         notice = _render_handler_notice(self._handler)
+        if self._handler.incomplete_extractions and (
+            not notice
+            or self._tool_execution_requested
+            or self._responses_terminal_type in {"response.failed", "error"}
+            or (
+                self._responses_coordinates is None
+                if self._handler.response_api_kind == "responses"
+                else self._chat_notice_index is None
+            )
+        ):
+            raise InvalidReversalError("incomplete extraction requires a visible response warning")
         if (
             not notice
             or not self._handler.response_notice_allowed
@@ -942,7 +965,7 @@ class SseResponseProcessor:
         ):
             return [event.render() for event in self._held]
         if self._handler.response_api_kind == "responses":
-            if self._responses_terminal_type in {
+            if not self._handler.incomplete_extractions and self._responses_terminal_type in {
                 "response.failed",
                 "response.incomplete",
                 "error",
@@ -1099,7 +1122,7 @@ def _responses_snapshot_text_target(
         output_index = payload.get("output_index")
         if isinstance(output_index, int):
             return _item_text_target(payload.get("item"), output_index)
-    if event_type == "response.completed":
+    if event_type in {"response.completed", "response.incomplete"}:
         response = payload.get("response")
         output = response.get("output") if isinstance(response, dict) else None
         if isinstance(output, list):
@@ -1171,7 +1194,7 @@ def _append_notice_to_snapshots(
         if payload.get("output_index") == output_index:
             _append_item_notice(payload.get("item"), item_id, content_index, notice)
         return
-    if payload.get("type") != "response.completed":
+    if payload.get("type") not in {"response.completed", "response.incomplete"}:
         return
     response = payload.get("response")
     output = response.get("output") if isinstance(response, dict) else None

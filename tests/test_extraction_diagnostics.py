@@ -21,7 +21,7 @@ from .conftest import MODEL_POLICY, body_request, header_request
 
 
 @pytest.mark.parametrize("level", [logging.INFO, logging.DEBUG])
-async def test_partial_result_is_rejected_with_correlated_safe_diagnostics(
+async def test_failed_result_is_rejected_with_correlated_safe_diagnostics(
     engine_client, caplog, level
 ):
     caplog.set_level(level, logger="agentgateway_extproc.lib.extraction_diagnostics")
@@ -41,7 +41,7 @@ async def test_partial_result_is_rejected_with_correlated_safe_diagnostics(
         return httpx.Response(
             200,
             json={
-                "status": "partial_success",
+                "status": "failure",
                 "errors": [
                     {
                         "component_type": "pipeline",
@@ -102,7 +102,7 @@ async def test_partial_result_is_rejected_with_correlated_safe_diagnostics(
     assert re.fullmatch(r"[0-9a-f]{16}", metadata.pop("task_id_hash"))
     assert error["message"].endswith("text extraction could not be completed.")
     assert metadata == {
-        "native_status": "partial_success",
+        "native_status": "failure",
         "error_count": 1,
         "errors_present": True,
         "document_present": True,
