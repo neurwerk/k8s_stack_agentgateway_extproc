@@ -21,7 +21,11 @@ from typing import TYPE_CHECKING, cast
 from xml.parsers import expat
 
 from agentgateway_extproc.config.settings import MEBIBYTE, DoclingSettings
-from agentgateway_extproc.lib.extraction_diagnostics import EXPLANATIONS, log_failure, safe_metadata
+from agentgateway_extproc.lib.extraction_diagnostics import (
+    EXPLANATIONS,
+    log_failure,
+    safe_metadata,
+)
 from agentgateway_extproc.lib.image_probe import (
     COUNT_HEADER,
     MAX_FACES,
@@ -91,6 +95,8 @@ class DocumentError(Exception):
                 "extraction_unavailable": "text extraction service unavailable.",
                 "extraction_failed": "text extraction could not be completed.",
                 "extraction_timeout": "text extraction timed out.",
+                "pdf_render_failed": "PDF page rendering could not be completed.",
+                "pdf_render_timeout": "PDF page rendering timed out.",
                 "image_analysis_failed": "required image safety analysis could not be completed.",
                 "image_inspection_failed": "required image inspection could not be completed.",
                 "image_inspection_timeout": "image inspection timed out. Please retry.",
@@ -159,6 +165,7 @@ class ImageBatch:
     protect_faces: bool = True
     defer_face_inspection: bool = False
     images: dict[int, str] = dataclass_field(default_factory=dict)
+    pdf_images: dict[int, list[str]] = dataclass_field(default_factory=dict)
     policy_version: int = 2
     face_count: int = 0
     scan_status: str = "not_scanned"
@@ -166,27 +173,46 @@ class ImageBatch:
     inspections: dict[int, ImageInspectionResult] = dataclass_field(default_factory=dict)
 
 
-def preflight(  # noqa: C901 - publish scan provenance only after the complete batch passes
+def preflight(
     parts: list[EngineAttachmentPart],
     settings: DoclingSettings,
     images: ImageBatch | None = None,
     abandoned: threading.Event | None = None,
     deadline: float = float("inf"),
 ) -> list[Upload]:
+    """Release any decoded bytes if validation of the complete batch fails."""
+    uploads: list[Upload] = []
+    try:
+        return _preflight(parts, settings, images, abandoned, deadline, uploads)
+    except BaseException:
+        for upload in uploads:
+            upload.data = b""
+        raise
+
+
+def _preflight(  # noqa: C901 - publish provenance only after the complete batch passes
+    parts: list[EngineAttachmentPart],
+    settings: DoclingSettings,
+    images: ImageBatch | None,
+    abandoned: threading.Event | None,
+    deadline: float,
+    uploads: list[Upload],
+) -> list[Upload]:
     """Validate every file before the first network call, under batch admission."""
     if len(parts) > settings.count:
         raise DocumentError(413)
-    uploads: list[Upload] = []
     total = pages = 0
     for index, part in enumerate(parts):
         _check_preflight(abandoned, deadline)
         if part.type in {"image_url", "input_image"} and images is not None:
             upload = _decode_image(part, settings, images, abandoned, deadline)
+            uploads.append(upload)
             images.images[index] = "data:image/png;base64," + base64.b64encode(upload.data).decode()
             if sum(len(value) for value in images.images.values()) > MAX_IMAGE_BYTES:
                 raise DocumentError(413)
         else:
             upload = _decode_upload(part, settings.file_bytes)
+            uploads.append(upload)
         total += max(len(upload.data), upload.source_bytes)
         if total > settings.total_bytes:
             raise DocumentError(413)
@@ -199,7 +225,6 @@ def preflight(  # noqa: C901 - publish scan provenance only after the complete b
         pages += upload.pages
         if pages > settings.pages:
             raise DocumentError(413)
-        uploads.append(upload)
     _check_preflight(abandoned, deadline)
     if images is not None:
         images.scan_status = "complete" if images.protect_faces and images.images else "not_scanned"
@@ -218,10 +243,9 @@ def _decode_image(
     abandoned: threading.Event | None,
     deadline: float,
 ) -> Upload:
-    modern = images.policy_version >= 3
-    if not modern and settings.inference_mode not in {"private-vlm", "remote"}:
+    if images.policy_version < 3:
         raise DocumentError(403, reason="image_processing_unavailable")
-    limit = min(settings.file_bytes, MAX_SOURCE_BYTES if modern else MAX_IMAGE_BYTES)
+    limit = min(settings.file_bytes, MAX_SOURCE_BYTES)
     mime, data = _image_data(part, limit, policy_version=images.policy_version)
     _check_preflight(abandoned, deadline)
     normalized, count = _normalize_image(
@@ -244,7 +268,7 @@ def inspect_canonical_faces(images: ImageBatch, index: int, png: bytes) -> None:
 
 
 def _image_data(
-    part: EngineAttachmentPart, limit: int, *, policy_version: int = 2
+    part: EngineAttachmentPart, limit: int, *, policy_version: int
 ) -> tuple[str, bytes]:
     value = part.model_dump()
     url_key = "image_url"
@@ -255,17 +279,14 @@ def _image_data(
     else:
         value.pop("type")
     # Caller detail is only a rendering hint, never a normalization/OCR setting.
-    if policy_version >= 3 and value.pop("detail", "auto") not in ("auto", "low", "high"):
+    if value.pop("detail", "auto") not in ("auto", "low", "high"):
         raise DocumentError(400)
     url = value.get(url_key)
     if set(value) != {url_key} or not isinstance(url, str):
         raise DocumentError(400)
     match = re.fullmatch(r"data:image/([a-z-]+);base64,([A-Za-z0-9+/]*={0,2})", url)
-    allowed = (
-        {"jpeg", "png", "heic", "heif", "x-heic", "x-heif"}
-        | ({"webp"} if policy_version == 4 else set())
-        if policy_version >= 3
-        else {"jpeg", "png"}
+    allowed = {"jpeg", "png", "heic", "heif", "x-heic", "x-heif"} | (
+        {"webp"} if policy_version == 4 else set()
     )
     if match is None or match[1] not in allowed:
         raise DocumentError(400, reason="unsupported_format" if match else "invalid_upload")
@@ -284,7 +305,7 @@ def _image_data(
 
 
 def _normalize_image(
-    data: bytes, mime: str, protect_faces: bool, policy_version: int = 2
+    data: bytes, mime: str, protect_faces: bool, policy_version: int
 ) -> tuple[bytes, int]:
     try:
         result = subprocess.run(  # noqa: S603 - fixed executable/module and allowlisted arguments
@@ -302,7 +323,7 @@ def _normalize_image(
                 if mime == "webp"
                 else "HEIF",
                 "detect" if protect_faces else "skip",
-                *([str(policy_version)] if policy_version >= 3 else []),
+                str(policy_version),
             ],
             input=data,
             stdout=subprocess.PIPE,
@@ -321,22 +342,16 @@ def _normalize_image(
         raise DocumentError(reason="image_analysis_failed")
     if result.returncode:
         raise DocumentError(400)
-    if policy_version >= 3:
-        count = int.from_bytes(result.stdout[4:6], "big")
-        valid = (
-            result.stdout.startswith(COUNT_HEADER)
-            and len(result.stdout) >= 6
-            and count <= MAX_FACES
-            and (protect_faces or count == 0)
-        )
-        normalized = result.stdout[6:]
-    else:
-        valid = result.stdout[:1] in {b"\x00", b"\x01"}
-        count, normalized = int.from_bytes(result.stdout[:1], "big"), result.stdout[1:]
+    count = int.from_bytes(result.stdout[4:6], "big")
+    valid = (
+        result.stdout.startswith(COUNT_HEADER)
+        and len(result.stdout) >= 6
+        and count <= MAX_FACES
+        and (protect_faces or count == 0)
+    )
+    normalized = result.stdout[6:]
     if not valid:
-        raise DocumentError(503 if policy_version >= 3 else 400, reason="image_analysis_failed")
-    if count and policy_version < 3:
-        raise DocumentError(403, reason="face_policy_blocked")
+        raise DocumentError(503, reason="image_analysis_failed")
     if not normalized.startswith(b"\x89PNG\r\n\x1a\n") or len(normalized) > MAX_IMAGE_BYTES:
         raise DocumentError(413)
     return normalized, count
@@ -644,7 +659,11 @@ def _list(value: object) -> list[object]:
 
 
 def project_document(
-    value: object, upload: Upload, page_limit: int, *, allow_empty_image: bool = False
+    value: object,
+    upload: Upload,
+    page_limit: int,
+    *,
+    allow_empty_image: bool = False,
 ) -> tuple[str, int]:
     """Project a complete supported tree, never source metadata or raw copies."""
     doc = _object(value)
@@ -669,7 +688,12 @@ def project_document(
     }
     if any(value for key, value in doc.items() if key not in allowed):
         raise DocumentError(diagnostic="fields_unsupported", unsupported_fields_present=True)
-    pages = _page_count(doc.get("pages"), upload.pages, page_limit)
+    pages = _page_count(
+        doc.get("pages"),
+        upload.pages,
+        page_limit,
+        partial=upload.extraction_incomplete and upload.format == "pdf",
+    )
     nodes: dict[str, dict[str, object]] = {}
     for kind in ("texts", "groups", "tables", "pictures"):
         for index, item in enumerate(_list(doc.get(kind))):
@@ -680,6 +704,8 @@ def project_document(
         raise DocumentError(413, diagnostic="node_limit", node_count=len(nodes))
     projection = _Projection(nodes)
     output = "\n".join(projection.walk({"$ref": f"#/{root}"}, 0) for root in ("body", "furniture"))
+    if upload.extraction_incomplete and not projection.has_text:
+        raise DocumentError(diagnostic="projection_incomplete", has_text=False)
     empty_image = allow_empty_image and upload.format == "img" and not projection.has_text
     if projection.seen != set(nodes) or (not output.strip() and not empty_image):
         raise DocumentError(
@@ -694,11 +720,11 @@ def project_document(
     return output, pages
 
 
-def _page_count(value: object, expected: int, limit: int) -> int:
+def _page_count(value: object, expected: int, limit: int, *, partial: bool = False) -> int:
     pages = _object(value)
     if len(pages) > limit:
         raise DocumentError(413, diagnostic="page_limit", actual_pages=len(pages), page_limit=limit)
-    if expected and len(pages) != expected:
+    if expected and (not pages or (not partial and len(pages) != expected)):
         raise DocumentError(
             diagnostic="page_count_mismatch", expected_pages=expected, actual_pages=len(pages)
         )
@@ -709,7 +735,11 @@ def _page_count(value: object, expected: int, limit: int) -> int:
             or _object(page).get("page_no") != int(number)
         ):
             raise DocumentError(diagnostic="page_number_invalid")
-    if expected and set(pages) != {str(number) for number in range(1, expected + 1)}:
+    expected_numbers = {str(number) for number in range(1, expected + 1)}
+    if expected and (
+        not set(pages).issubset(expected_numbers)
+        or (not partial and set(pages) != expected_numbers)
+    ):
         raise DocumentError(diagnostic="page_sequence_invalid")
     return len(pages)
 
@@ -733,10 +763,16 @@ class _Projection:
         return value
 
     def text_item(self, node: dict[str, object]) -> str:
-        """Preserve checkbox state and reject formulas without canonical text."""
+        """Preserve checkbox state and the standard pipeline's source formula text."""
         value = node.get("text")
-        if not isinstance(value, str) or (node.get("label") == "formula" and not value.strip()):
+        if not isinstance(value, str):
             raise DocumentError(diagnostic="text_item_invalid")
+        if node.get("label") == "formula" and not value.strip():
+            # Docling 2.142.1 leaves formula text empty without formula enrichment.
+            original = node.get("orig")
+            if not isinstance(original, str) or not original.strip():
+                raise DocumentError(diagnostic="text_item_invalid")
+            value = f"[Source formula text] {original}"
         marker = {"checkbox_selected": "[x]", "checkbox_unselected": "[ ]"}.get(
             node.get("label") if isinstance(node.get("label"), str) else ""
         )
@@ -750,26 +786,25 @@ class _Projection:
         rows, cols = data.get("num_rows"), data.get("num_cols")
         if type(rows) is not int or type(cols) is not int or rows < 1 or cols < 1:
             raise DocumentError(diagnostic="table_dimensions_invalid")
-        self.cells += rows * cols
+        entries = _list(data.get("table_cells"))
+        if not entries:
+            raise DocumentError(diagnostic="table_cells_invalid")
+        # Overlaps can make the canonical cell count exceed the declared grid.
+        self.cells += max(rows * cols, len(entries))
         if self.cells > MAX_CELLS:
             raise DocumentError(413, diagnostic="table_cell_limit")
-        grid = [[""] * cols for _ in range(rows)]
-        occupied: set[tuple[int, int]] = set()
-        entries = _list(data.get("table_cells"))
-        if not entries or len(entries) > rows * cols:
-            raise DocumentError(diagnostic="table_cells_invalid")
+        grid: list[list[list[str]]] = [[[] for _ in range(cols)] for _ in range(rows)]
+        cells: list[tuple[int, int, dict[str, object]]] = []
         for raw in entries:
             cell = _object(raw)
-            sr, er, sc, ec = _cell_offsets(cell, rows, cols)
-            for row in range(sr, er):
-                for col in range(sc, ec):
-                    if (row, col) in occupied:
-                        raise DocumentError(diagnostic="table_overlap")
-                    occupied.add((row, col))
-            grid[sr][sc] = (
+            sr, _, sc, _ = _cell_offsets(cell, rows, cols)
+            cells.append((sr, sc, cell))
+        # Stable sorting preserves source order for cells sharing an origin.
+        for sr, sc, cell in sorted(cells, key=lambda item: (item[0], item[1])):
+            grid[sr][sc].append(
                 self.walk(cell["ref"], depth + 1) if "ref" in cell else self.text(cell.get("text"))
             )
-        return "\n".join(" | ".join(row) for row in grid)
+        return "\n".join(" | ".join("\n".join(cell) for cell in row) for row in grid)
 
     def walk(self, value: object, depth: int) -> str:
         """Walk reading-order refs, rejecting cycles and unresolved content."""

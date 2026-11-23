@@ -37,7 +37,12 @@ def image_output(
         raise DocumentError(
             403, reason=("face_policy_blocked" if face_action == "block" else "policy_blocked")
         )
-    if policy.contract_version == "4.1" and not has_text and not allow_textless:
+    if (
+        policy.contract_version == "4.1"
+        and forwarding != "pii-unchecked"
+        and not has_text
+        and not allow_textless
+    ):
         raise DocumentError(403, reason="image_textless_blocked")
     if face_action == "text-only":
         if not has_text:

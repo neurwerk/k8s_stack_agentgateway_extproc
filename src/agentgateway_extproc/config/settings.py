@@ -42,25 +42,23 @@ class DoclingSettings(BaseModel):
 
     enabled: bool = False
     base_url: str = "https://docling.docling.svc"
+    allow_http: bool = False
     ca_cert: str | None = None
     api_key: SecretStr | None = None
-    inference_mode: Literal["internal-standard", "private-vlm", "cpu", "remote"] = (
-        "internal-standard"
-    )
     timeout: float = Field(default=360, gt=0, le=3660)
     document_timeout: float = Field(default=300, gt=0, le=3600)
     file_bytes: int = Field(default=20 * MEBIBYTE, ge=1, le=40 * MEBIBYTE)
     total_bytes: int = Field(default=40 * MEBIBYTE, ge=1, le=40 * MEBIBYTE)
     count: int = Field(default=5, ge=1, le=20)
-    pages: int = Field(default=200, ge=1, le=1000)
+    pages: int = Field(default=2, ge=1, le=1000)
     max_response_bytes: int = Field(default=16 * MEBIBYTE, ge=1024, le=16 * MEBIBYTE)
 
     @model_validator(mode="after")
     def validate_service(self) -> DoclingSettings:
-        """Require verified HTTPS and a service-only credential when enabled."""
+        """Require a fixed service origin, explicit HTTP opt-in and a credential."""
         url = urlsplit(self.base_url)
         if self.enabled and (
-            url.scheme != "https"
+            url.scheme not in ({"https", "http"} if self.allow_http else {"https"})
             or not url.hostname
             or url.username is not None
             or url.password is not None
@@ -149,6 +147,7 @@ class Settings(BaseSettings):
     )
     max_request_bytes: int = Field(default=MAX_REQUEST_BYTES, ge=1_024, le=MAX_UPLOAD_REQUEST_BYTES)
     max_reasoning_fingerprints: int = Field(default=4096, ge=1)
+    max_tool_calls_per_response: int = Field(default=32, ge=1, le=128)
     max_response_bytes: int = Field(default=MAX_RESPONSE_BYTES, ge=1_024, le=MAX_RESPONSE_BYTES)
     max_transformed_request_bytes: int = Field(
         default=MAX_RESPONSE_BYTES, ge=1_024, le=MAX_RESPONSE_BYTES

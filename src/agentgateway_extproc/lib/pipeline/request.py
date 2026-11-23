@@ -273,6 +273,8 @@ async def process_request(
         if handler.admission is not None and attachments and attachment_mode == "passthrough":
             raise GatewayPolicyError("unsupported_feature")
         image_forwarding = policy.image_forwarding.get(model_id, "none")
+        pdf_mode = policy.pdf_modes.get(model_id)
+        pdf_max_rendered_pages = policy.pdf_max_rendered_pages.get(model_id, 5)
         unchecked_without_documents = False
         if attachments and policy.contract_version in {4, "4.1"}:
             document_indexes = {
@@ -298,11 +300,15 @@ async def process_request(
                     for index, part in enumerate(attachments)
                 ):
                     raise DocumentError(400, reason="unsupported_format")  # noqa: TRY301
-                if (document_indexes and policy.document_mode(model_id) == "block") or (
-                    image_indexes and policy.image_mode(model_id) == "block"
-                ):
+                if (
+                    document_indexes
+                    and policy.document_mode(model_id) == "block"
+                    and pdf_mode != "extract-text"
+                ) or (image_indexes and policy.image_mode(model_id) == "block"):
                     raise DocumentError(403, reason="attachments_disabled")  # noqa: TRY301
-                unchecked = bool(image_indexes) and image_forwarding == "pii-unchecked"
+                unchecked = image_forwarding == "pii-unchecked" and (
+                    bool(image_indexes) or pdf_mode == "render-images"
+                )
                 inspect_images = (
                     image_indexes
                     if policy.contract_version == "4.1"
@@ -315,18 +321,27 @@ async def process_request(
                         defer_face_inspection=bool(inspect_images),
                         policy_version=4,
                     )
-                    if image_indexes
+                    if image_indexes or unchecked
                     else None
                 )
                 if unchecked:
                     images = cast(ImageBatch, images)
                     if handler.docling is None:
                         raise DocumentError(reason="extraction_unavailable")  # noqa: TRY301
-                    texts_by_index = await handler.docling.convert_selected(
-                        attachments,
-                        document_indexes,
-                        images=images,
-                        inspect_images=inspect_images,
+                    selected = await handler.docling.local_attachments.prepare(
+                        attachments, images, pdf_mode, pdf_max_rendered_pages
+                    )
+                    texts_by_index = (
+                        await handler.docling.convert_selected(
+                            attachments,
+                            selected,
+                            images=images,
+                            pdf_mode=pdf_mode,
+                            document_mode=policy.document_mode(model_id),
+                            incomplete=handler.incomplete_extractions,
+                        )
+                        if selected
+                        else {}
                     )
                     _validate_image_inspections(images, inspect_images)
                     request, body, unchecked_image_locations = _converted_unchecked_request(
@@ -335,7 +350,7 @@ async def process_request(
                         images,
                         controls=request._controls,
                     )
-                    unchecked_without_documents = not document_indexes
+                    unchecked_without_documents = not texts_by_index
                 else:
                     if handler.docling is None:
                         raise DocumentError(reason="extraction_unavailable")  # noqa: TRY301
@@ -343,6 +358,9 @@ async def process_request(
                         attachments,
                         images=images,
                         inspect_images=inspect_images,
+                        pdf_mode=pdf_mode,
+                        document_mode=policy.document_mode(model_id),
+                        incomplete=handler.incomplete_extractions,
                     )
                     if images is not None:
                         _validate_image_inspections(images, inspect_images)
@@ -393,13 +411,17 @@ async def process_request(
                         and policy.protects_faces(model_id),
                         policy_version=cast(int, policy.contract_version),
                     )
-                    texts = await handler.docling.convert(attachments, images=images)
+                    texts = await handler.docling.convert(
+                        attachments, images=images, incomplete=handler.incomplete_extractions
+                    )
                     if isinstance(policy.contract_version, int) and policy.contract_version >= 3:
                         visual_findings = _visual_findings(attachments, images)
                     if image_forwarding != "none":
                         image_locations = _image_locations(payload, images)
                 else:
-                    texts = await handler.docling.convert(attachments)
+                    texts = await handler.docling.convert(
+                        attachments, incomplete=handler.incomplete_extractions
+                    )
                 request, body = _converted_request(payload, texts, controls=request._controls)
             except DocumentError as exc:
                 _clear_request(handler)
@@ -411,6 +433,21 @@ async def process_request(
             handler.request_body_chunks.clear()
             attachments.clear()
             payload = None
+        if handler.incomplete_extractions and (
+            bool(request.tools)
+            or (
+                _has_structured_chat_format(request)
+                if isinstance(request, EngineChatRequest)
+                else _has_structured_responses_format(request)
+            )
+        ):
+            _clear_request(handler)
+            handler.record_dispatch("policy_block")
+            return immediate_response(
+                422,
+                '{"error":"Document extraction is incomplete; a visible warning cannot '
+                'be included safely in a structured or tool-enabled response."}',
+            )
         handler.mcp_sources = source_union(
             handler.mcp_sources,
             collect_sources(segment.text for segment in extract_request(request).segments),
@@ -456,8 +493,12 @@ async def process_request(
                     _clear_request(handler)
                     return immediate_response(exc.status, json.dumps({"error": exc.message}))
             _clear_request(handler)
-            handler.response_processing_enabled = handler.admission is not None
-            handler.response_notice_allowed = handler.admission is None
+            handler.response_processing_enabled = handler.admission is not None or bool(
+                handler.incomplete_extractions
+            )
+            handler.response_notice_allowed = handler.admission is None or bool(
+                handler.incomplete_extractions
+            )
             body, alias_changed = _upstream_model_body(handler, body)
             handler.record_dispatch("model_bypass")
             return request_mutation(body, {}, converted or alias_changed)
@@ -489,6 +530,7 @@ async def process_request(
                     document=True,
                     text_pii_enabled=handler.text_pii_enabled,
                     mcp_sources=handler.mcp_sources,
+                    destination_model=model_id,
                     visual_findings=visual_findings,
                     correlation_id=handler.correlation_id,
                 )
@@ -499,6 +541,7 @@ async def process_request(
                     document=True,
                     text_pii_enabled=handler.text_pii_enabled,
                     mcp_sources=handler.mcp_sources,
+                    destination_model=model_id,
                     correlation_id=handler.correlation_id,
                 )
         else:
@@ -507,6 +550,7 @@ async def process_request(
                 session_key,
                 text_pii_enabled=handler.text_pii_enabled,
                 mcp_sources=handler.mcp_sources,
+                destination_model=model_id,
                 correlation_id=handler.correlation_id,
             )
         validate_request_mutation(request, reply)
@@ -918,20 +962,37 @@ def _converted_unchecked_request(
     for mi, message in enumerate(_dict_list(data.get("messages" if chat else "input"))):
         if not chat and message.get("type", "message") != "message":
             continue
-        for pi, part in enumerate(_dict_list(message.get("content"))):
+        content = _dict_list(message.get("content"))
+        expanded: list[dict[str, object]] = []
+        for part in content:
             if part.get("type") not in {"file", "input_file", "image_url", "input_image"}:
+                expanded.append(part)
                 continue
-            if attachment in images.images:
-                locations[mi, pi] = images.images[attachment]
-                value = _UNCHECKED_IMAGE_MARKER
+            pages = images.pdf_images.get(attachment)
+            if pages is None and attachment in images.images:
+                pages = [images.images[attachment]]
+            if pages is not None:
+                for uri in pages:
+                    locations[mi, len(expanded)] = uri
+                    expanded.append(
+                        {
+                            "type": "text" if chat else "input_text",
+                            "text": _UNCHECKED_IMAGE_MARKER,
+                        }
+                    )
             else:
                 value = texts.get(attachment)
                 if value is None:
                     raise DocumentError
-            part.clear()
-            part.update(type="text" if chat else "input_text", text=value)
+                expanded.append({"type": "text" if chat else "input_text", "text": value})
             attachment += 1
-    if attachment != len(texts) + len(images.images) or len(locations) != len(images.images):
+        if len(expanded) > 64:
+            raise DocumentError(413)
+        if isinstance(message.get("content"), list):
+            message["content"] = expanded
+    if attachment != len(texts) + len(images.images) + len(images.pdf_images) or len(
+        locations
+    ) != len(images.images) + sum(map(len, images.pdf_images.values())):
         raise DocumentError
     request = cast(
         EngineChatRequest | EngineResponsesRequest,

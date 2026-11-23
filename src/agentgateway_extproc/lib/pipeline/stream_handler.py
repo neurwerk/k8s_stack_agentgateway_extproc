@@ -132,6 +132,7 @@ class StreamHandler:
         self.response_passthrough_chunks: list[bytes] = []
         self.notice_messages: list[str] = []
         self.safety_notice_messages: list[str] = []
+        self.incomplete_extractions: set[int] = set()
         self.response_notice_allowed = True
         self.response_structured_json = False
         self.presidio_code: str | None = None
@@ -145,6 +146,7 @@ class StreamHandler:
         self.request_processed = False
         self.max_request_bytes = limits.max_request_bytes
         self.max_reasoning_fingerprints = limits.max_reasoning_fingerprints
+        self.max_tool_calls_per_response = limits.max_tool_calls_per_response
         self.max_response_bytes = limits.max_response_bytes
         self.max_transformed_request_bytes = limits.max_transformed_request_bytes
         self.response_encoded_bytes = 0

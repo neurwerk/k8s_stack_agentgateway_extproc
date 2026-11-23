@@ -22,11 +22,13 @@ from agentgateway_extproc.lib.documents import (
     preflight,
     project_document,
 )
+from agentgateway_extproc.lib.extraction_diagnostics import log_native_errors, native_error_metadata
 from agentgateway_extproc.lib.image_inspection import (
     ImageInspectionClient,
     ImageInspectionTimeoutError,
 )
 from agentgateway_extproc.lib.json_limits import strict_json_loads
+from agentgateway_extproc.lib.local_attachments import LocalAttachments
 from agentgateway_extproc.models.engine import EngineAttachmentPart
 
 _STATUSES = {"pending", "started", "success", "partial_success", "failure", "skipped"}
@@ -62,6 +64,7 @@ class DoclingClient:
         self._closed = False
         self._active_stage = "extraction"
         self.image_inspection = image_inspection
+        self.local_attachments = LocalAttachments(settings)
 
     async def convert(
         self,
@@ -69,6 +72,9 @@ class DoclingClient:
         *,
         images: ImageBatch | None = None,
         inspect_images: set[int] | None = None,
+        pdf_mode: str | None = None,
+        document_mode: str | None = None,
+        incomplete: set[int] | None = None,
     ) -> list[str]:
         """Extract every attachment, preserving the legacy ordered result."""
         texts = await self.convert_selected(
@@ -76,6 +82,9 @@ class DoclingClient:
             set(range(len(parts))),
             images=images,
             inspect_images=inspect_images,
+            pdf_mode=pdf_mode,
+            document_mode=document_mode,
+            incomplete=incomplete,
         )
         return list(texts.values())
 
@@ -86,6 +95,9 @@ class DoclingClient:
         *,
         images: ImageBatch | None = None,
         inspect_images: set[int] | None = None,
+        pdf_mode: str | None = None,
+        document_mode: str | None = None,
+        incomplete: set[int] | None = None,
     ) -> dict[int, str]:
         """Admit one batch; an empty selection normalizes images without Docling."""
         if (
@@ -100,7 +112,17 @@ class DoclingClient:
         self._active_stage = "extraction"
         deadline = time.monotonic() + self.settings.timeout
         task = asyncio.create_task(
-            self._batch(parts, selected, abandoned, deadline, images, inspect_images or set())
+            self._batch(
+                parts,
+                selected,
+                abandoned,
+                deadline,
+                images,
+                inspect_images or set(),
+                pdf_mode,
+                document_mode,
+                incomplete,
+            )
         )
         self._task = task
         task.add_done_callback(self._finished)
@@ -131,12 +153,13 @@ class DoclingClient:
         """Stop admission and allow at most five seconds of native-job draining."""
         self._closed = True
         self._abandoned.set()
+        await self.local_attachments.close()
         if self._task is not None:
             await asyncio.wait({self._task}, timeout=5)
         if self._owns_client and self._client is not None:
             await self._client.aclose()
 
-    async def _batch(  # noqa: C901
+    async def _batch(
         self,
         parts: list[EngineAttachmentPart],
         selected: set[int],
@@ -144,6 +167,9 @@ class DoclingClient:
         deadline: float,
         images: ImageBatch | None = None,
         inspect_images: set[int] | None = None,
+        pdf_mode: str | None = None,
+        document_mode: str | None = None,
+        incomplete: set[int] | None = None,
     ) -> dict[int, str]:
         """Validate every part before extracting the selected uploads in order."""
         try:
@@ -156,6 +182,42 @@ class DoclingClient:
             # Third-party parsers have multiple malformed-input exception types.
             raise DocumentError(400, diagnostic="preflight_failed") from None
         del parts
+        try:
+            return await self._extract_uploads(
+                uploads,
+                selected,
+                abandoned,
+                deadline,
+                images,
+                inspect_images,
+                pdf_mode,
+                document_mode,
+                incomplete,
+            )
+        finally:
+            for upload in uploads:
+                upload.data = b""
+
+    async def _extract_uploads(  # noqa: C901
+        self,
+        uploads: list[Upload],
+        selected: set[int],
+        abandoned: threading.Event,
+        deadline: float,
+        images: ImageBatch | None,
+        inspect_images: set[int] | None,
+        pdf_mode: str | None,
+        document_mode: str | None,
+        incomplete: set[int] | None,
+    ) -> dict[int, str]:
+        """Extract each selected upload once, retaining admission until completion."""
+        if any(
+            (pdf_mode if upload.format == "pdf" and pdf_mode is not None else document_mode)
+            == "block"
+            for upload in uploads
+            if upload.format != "img"
+        ):
+            raise DocumentError(403, reason="attachments_disabled")
         # The retained task owns the thread and native job, not the caller timeout.
         output: dict[int, str] = {}
         pages = size = 0
@@ -187,6 +249,8 @@ class DoclingClient:
             if upload.extraction_incomplete:
                 if not text.strip():
                     raise DocumentError(diagnostic="projection_incomplete", has_text=False)
+                if incomplete is not None:
+                    incomplete.add(index)
                 text = (
                     "Warning: document extraction is incomplete. Acknowledge that content is "
                     "missing and do not infer the missing content.\n\n" + text
@@ -255,11 +319,19 @@ class DoclingClient:
         if result.outcome == "failed":
             raise DocumentError(reason="image_inspection_failed")
 
-    async def _convert_one(self, upload: Upload, abandoned: threading.Event) -> object:
+    async def _convert_one(
+        self,
+        upload: Upload,
+        abandoned: threading.Event,
+    ) -> object:
         terminal = False
         try:
-            value = await self._http("POST", "/v1/convert/file/async", limit=65_536, upload=upload)
-            upload.data = b""
+            value = await self._http(
+                "POST",
+                "/v1/convert/file/async",
+                limit=65_536,
+                upload=upload,
+            )
             task_id, status = _task_status(value)
             while status in _ACTIVE:
                 # The native job is not cancelled by an HTTP/caller timeout.
@@ -273,6 +345,7 @@ class DoclingClient:
                 self._poisoned = True
                 _logger.warning("Docling admission disabled: native job completion is unknown")
         if status not in {"success", "partial_success"}:
+            log_native_errors([value], task_id)
             raise DocumentError(
                 diagnostic="task_unsuccessful", task_id=task_id, native_status=status
             )
@@ -298,6 +371,8 @@ class DoclingClient:
         ):
             result = value if isinstance(value, dict) else {}
             errors = result.get("errors")
+            log_native_errors(errors, task_id)
+            error_metadata = native_error_metadata(errors)
             raise DocumentError(
                 diagnostic="result_rejected",
                 task_id=task_id,
@@ -305,6 +380,10 @@ class DoclingClient:
                 error_count=len(errors) if isinstance(errors, list) else None,
                 errors_present=isinstance(errors, list),
                 document_present=isinstance(result.get("document"), dict),
+                category=error_metadata.get("category"),
+                page_no=error_metadata.get("page_no"),
+                stop_reason=error_metadata.get("stop_reason"),
+                error_code=error_metadata.get("error_code"),
             )
         upload.extraction_incomplete = (
             status == "partial_success" or value["status"] == "partial_success"
@@ -312,7 +391,12 @@ class DoclingClient:
         return value["document"].get("json_content")
 
     async def _http(
-        self, method: str, path: str, *, limit: int, upload: Upload | None = None
+        self,
+        method: str,
+        path: str,
+        *,
+        limit: int,
+        upload: Upload | None = None,
     ) -> object:
         client = self._client
         key = self.settings.api_key
@@ -332,7 +416,11 @@ class DoclingClient:
                 client.stream(
                     method,
                     self.settings.base_url.rstrip("/") + path,
-                    headers={"X-Api-Key": key.get_secret_value(), "Accept-Encoding": "identity"},
+                    headers={
+                        "X-Api-Key": key.get_secret_value(),
+                        "Accept-Encoding": "identity",
+                        "Accept-Docling-Document-Version": "1.10.0",
+                    },
                     files=files,
                     data=options,
                     follow_redirects=False,
@@ -376,15 +464,15 @@ class DoclingClient:
             "do_picture_description": "false",
             "do_pdf_heading_hierarchy": "false",
         }
-        if self.settings.inference_mode in {"cpu", "internal-standard"}:
-            options.update(
-                pipeline="standard", ocr_preset="rapidocr", do_ocr="true", do_table_structure="true"
-            )
-        else:
-            options.update(
-                pipeline="vlm",
-                vlm_pipeline_preset="images" if source_format == "img" else "default",
-            )
+        # The trusted service owns model placement, pinned options and credentials.
+        options.update(
+            pipeline="standard",
+            layout_preset="default",
+            ocr_preset="default",
+            table_structure_preset="default",
+            do_ocr="true",
+            do_table_structure="true",
+        )
         return options
 
 

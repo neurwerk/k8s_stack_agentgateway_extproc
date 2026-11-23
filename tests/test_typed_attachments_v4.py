@@ -319,6 +319,7 @@ async def test_pii_disabled_document_extraction_enforces_sources(source_engine):
     result = await handler.handle(body_request(json.dumps(original).encode(), policy=policy))
     assert result is not None and result.HasField("request_body")
     assert calls[0]["scope"] == "request"
+    assert calls[0]["destination_model"] == "test"
     assert calls[0]["text_pii_enabled"] is False
     assert calls[0]["mcp_sources"] == ["MCP_TOOL_SALESFORCE"]
 

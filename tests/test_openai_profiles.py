@@ -10,7 +10,7 @@ import httpx
 import pytest
 from pydantic import ValidationError
 
-from agentgateway_extproc.config.settings import EngineSettings
+from agentgateway_extproc.config.settings import EngineSettings, Settings
 from agentgateway_extproc.controllers.grpc_servicer import ExtProcServicer
 from agentgateway_extproc.gen import ext_proc_pb2
 from agentgateway_extproc.lib.engine.client import EngineClient
@@ -244,6 +244,168 @@ async def collect(engine_client, messages, replies, context):
 
     async for reply in ExtProcServicer(engine_client).Process(requests(), context):
         replies.append(reply)
+
+
+@pytest.mark.parametrize("kind", ["chat", "responses"])
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("count", [32, 33])
+async def test_new_response_tool_budget(admission, reasoning_engine, kind, streaming, count):
+    client, _ = reasoning_engine
+    messages = request_messages(admission, kind, stream=streaming)
+    messages.append(
+        response_headers("text/event-stream" if streaming else "application/json", policy=admission)
+    )
+    if streaming:
+        messages.extend(
+            response_body(event_bytes(kind, event), end_of_stream=False, policy=admission)
+            for event in stream_events(kind, tools=True, tool_count=count)
+        )
+        messages.append(response_body(b"", policy=None))
+    else:
+        messages.append(
+            response_body(
+                json.dumps(response_payload(kind, tools=True, tool_count=count)).encode(),
+                policy=admission,
+            )
+        )
+    replies, context = [], FakeAioContext()
+    if streaming and count == 33:
+        with pytest.raises(StreamAbortedError):
+            await collect(client, messages, replies, context)
+        assert context.code == grpc.StatusCode.INTERNAL
+        assert context.details.startswith("response processing failed closed; request_id=")
+    else:
+        await collect(client, messages, replies, context)
+    if not streaming and count == 33:
+        assert replies[-1].immediate_response.status.code == 503
+        assert "call-32" not in replies[-1].immediate_response.body
+        return
+    emitted = b"".join(
+        reply.response_body.response.body_mutation.streamed_response.body for reply in replies
+    )
+    if count == 33:
+        # Chat tools and Responses text may already have been delivered.
+        assert (b"call-31" if kind == "chat" else b"Jane Doe") in emitted
+        assert b"call-32" not in emitted
+        assert b"[DONE]" not in emitted
+        assert b"response.completed" not in emitted
+    else:
+        assert b"call-31" in emitted
+        assert replies[-1].response_body.response.body_mutation.streamed_response.end_of_stream
+
+
+@pytest.mark.parametrize("count", [64, 65])
+async def test_response_tool_budget_client_override(
+    admission, reasoning_engine, monkeypatch, count
+):
+    monkeypatch.setenv("EXTPROC_MAX_TOOL_CALLS_PER_RESPONSE", "64")
+    client, _ = reasoning_engine
+    handler = StreamHandler(client, settings=Settings())
+    for message in request_messages(admission, "chat", stream=False):
+        await handler.handle(message)
+    await handler.handle(response_headers("application/json", policy=admission))
+    message = response_body(
+        json.dumps(response_payload("chat", tools=True, tool_count=count)).encode(),
+        policy=admission,
+    )
+    if count == 65:
+        with pytest.raises(InvalidReversalError, match="model response exceeds tool call limit"):
+            await handler.handle(message)
+    else:
+        reply = await handler.handle(message)
+        assert reply is not None
+        assert b"call-63" in reply.response_body.response.body_mutation.streamed_response.body
+
+
+@pytest.mark.parametrize("kind", ["chat", "responses"])
+async def test_history_and_autonomous_followup_have_fresh_response_budget(
+    admission, reasoning_engine, kind
+):
+    client, state = reasoning_engine
+    messages = request_messages(admission, kind, stream=True)
+    path = f"/bindings/{admission['request_context']['binding_id']}/v1/" + (
+        "responses" if kind == "responses" else "chat/completions"
+    )
+    messages[0] = header_request(
+        headers(**{":path": path, "x-session-id": "autonomous-tool-session"}), policy=admission
+    )
+    payload = json.loads(messages[1].request_body.body)
+    history = []
+    # More than 32 in one historical batch, and another independent batch.
+    for batch, count in enumerate((33, 32)):
+        calls = []
+        for index in range(count):
+            arguments = json.dumps(
+                {"person": "Jane Doe" if batch == 0 and index == 32 else "ordinary"}
+            )
+            call_id = f"history-{batch}-{index}"
+            calls.append(
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": arguments},
+                }
+                if kind == "chat"
+                else {
+                    "type": "function_call",
+                    "call_id": call_id,
+                    "name": "lookup",
+                    "arguments": arguments,
+                }
+            )
+        history.extend([{"role": "assistant", "tool_calls": calls}] if kind == "chat" else calls)
+    field = "messages" if kind == "chat" else "input"
+    payload[field] = history
+    for _round in range(2):
+        handler = StreamHandler(client)
+        await handler.handle(messages[0])
+        reply = await handler.handle(body_request(json.dumps(payload).encode(), policy=admission))
+        assert reply is not None
+        forwarded = json.loads(reply.request_body.response.body_mutation.body)
+        assert "Jane Doe" not in json.dumps(forwarded)
+        assert REVERSIBLE_TOKEN in json.dumps(forwarded)
+        await handler.handle(response_headers("text/event-stream", policy=admission))
+        emitted = b""
+        for event in stream_events(kind, text="ordinary", tools=True, tool_count=32):
+            reply = await handler.handle(
+                response_body(event_bytes(kind, event), end_of_stream=False, policy=admission)
+            )
+            assert reply is not None
+            emitted += reply.response_body.response.body_mutation.streamed_response.body
+        reply = await handler.handle(response_body(b"", policy=None))
+        assert reply is not None
+        emitted += reply.response_body.response.body_mutation.streamed_response.body
+        assert reply.response_body.response.body_mutation.streamed_response.end_of_stream
+        assert b"call-31" in emitted
+        output = response_payload(kind, text="ordinary", tools=True, tool_count=32)
+        history.extend([output["choices"][0]["message"]] if kind == "chat" else output["output"])
+    assert sum(segment["text"] == "Jane Doe" for segment in state["segments"]) == 2
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_chat_tool_budget_totals_across_choices(admission, reasoning_engine, streaming):
+    client, _ = reasoning_engine
+    handler = await notice_handler(admission, client, "chat", stream=streaming)
+    if not streaming:
+        payload = response_payload("chat", tools=True, tool_count=32)
+        extra = deepcopy(response_payload("chat", tools=True)["choices"][0])
+        extra["index"] = 1
+        payload["choices"].append(extra)
+        with pytest.raises(InvalidReversalError, match="tool call limit"):
+            await handler.handle(response_body(json.dumps(payload).encode(), policy=admission))
+        return
+    events = stream_events("chat", tools=True, tool_count=32)
+    for event in events[:-3]:
+        await handler.handle(
+            response_body(event_bytes("chat", event), end_of_stream=False, policy=admission)
+        )
+    # The same tool index in a different choice is a distinct call.
+    extra = deepcopy(stream_events("chat", tools=True)[3])
+    extra["choices"][0]["index"] = 1
+    with pytest.raises(InvalidReversalError, match="tool call limit"):
+        await handler.handle(
+            response_body(event_bytes("chat", extra), end_of_stream=False, policy=admission)
+        )
 
 
 async def notice_handler(admission, engine_client, kind, *, stream):

@@ -1,8 +1,9 @@
-"""Fixed extraction explanations and bounded, content-free log metadata."""
+"""Safe extraction explanations and opt-in bounded native error diagnostics."""
 
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import re
 
@@ -40,7 +41,6 @@ EXPLANATIONS = {
     "table_dimensions_invalid": "Table dimensions must be positive integers.",
     "table_cell_limit": "The document exceeds the supported table cell count.",
     "table_cells_invalid": "Table cells are missing or exceed the table dimensions.",
-    "table_overlap": "Table cells overlap.",
     "reference_invalid": "A document reference is invalid or unresolved.",
     "reference_cycle": "Document references contain a cycle.",
     "reference_limit": "Document references exceed depth or traversal limits.",
@@ -68,6 +68,41 @@ _FLAGS = {
 _STATUSES = {"pending", "started", "success", "partial_success", "failure", "skipped"}
 
 
+def log_native_errors(errors: object, task_id: str) -> None:
+    """Log selected native fields at DEBUG; error text may contain document data."""
+    if not _logger.isEnabledFor(logging.DEBUG) or not isinstance(errors, list) or not errors:
+        return
+    entries = []
+    for error in errors[:8]:
+        if not isinstance(error, dict):
+            continue
+        entry: dict[str, str | int] = {}
+        for field in ("error_message", "category", "component_type", "module_name"):
+            value = error.get(field)
+            if isinstance(value, str):
+                limit = 2048 if field == "error_message" else 128
+                entry[field] = value[:limit] + ("...[truncated]" if len(value) > limit else "")
+        page = error.get("page_no")
+        if type(page) is int and 1 <= page <= 1000:
+            entry["page_no"] = page
+        if entry:
+            entries.append(entry)
+    _logger.debug(
+        "Docling native errors task_id_hash=%s error_count=%s errors=%s",
+        safe_metadata({"task_id": task_id}).get("task_id_hash", "unavailable"),
+        len(errors),
+        json.dumps(entries, ensure_ascii=True),
+    )
+
+
+def native_error_metadata(errors: object) -> dict[str, str | int | bool]:
+    """Describe the first native error using only recognized, content-free values."""
+    if not isinstance(errors, list) or not errors or not isinstance(errors[0], dict):
+        return {}
+    error = errors[0]
+    return safe_metadata({"category": error.get("category"), "page_no": error.get("page_no")})
+
+
 def safe_metadata(values: dict[str, object]) -> dict[str, str | int | bool]:
     """Discard arbitrary values; never retain upstream payloads or exception strings."""
     result: dict[str, str | int | bool] = {}
@@ -78,6 +113,10 @@ def safe_metadata(values: dict[str, object]) -> dict[str, str | int | bool]:
             result[key] = value
         elif key == "native_status":
             result[key] = value if isinstance(value, str) and value in _STATUSES else "unknown"
+        elif (key == "page_no" and type(value) is int and 1 <= value <= 1000) or (
+            key == "category" and isinstance(value, str) and value == "inference_failure"
+        ):
+            result[key] = value
         elif key == "task_id" and isinstance(value, str) and len(value) <= 128:
             # Correlate native jobs without trusting their identifier as content.
             result["task_id_hash"] = hashlib.sha256(value.encode()).hexdigest()[:16]
