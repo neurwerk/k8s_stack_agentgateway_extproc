@@ -449,7 +449,6 @@ class DoclingClient:
 
     def _options(self, source_format: str) -> dict[str, str]:
         options = {
-            "from_formats": "image" if source_format == "img" else source_format,
             "target_type": "inbody",
             "to_formats": "json",
             "image_export_mode": "placeholder",
@@ -464,6 +463,24 @@ class DoclingClient:
             "do_picture_description": "false",
             "do_pdf_heading_hierarchy": "false",
         }
+        backend = {"img": "image", "htm": "html", "adoc": "asciidoc", "xlsm": "xlsx"}.get(
+            source_format, source_format
+        )
+        if backend in {
+            "pdf",
+            "image",
+            "docx",
+            "xlsx",
+            "pptx",
+            "md",
+            "csv",
+            "html",
+            "asciidoc",
+            "vtt",
+        }:
+            options["from_formats"] = backend
+        # Other native backends use service detection from the preserved extension.
+        # Their extension names are not necessarily Serve InputFormat enum values.
         # The trusted service owns model placement, pinned options and credentials.
         options.update(
             pipeline="standard",

@@ -48,10 +48,24 @@ _MIMES = {
     "txt": "text/plain",
     "md": "text/markdown",
     "csv": "text/csv",
+    "asciidoc": "text/asciidoc",
+    "adoc": "text/asciidoc",
+    "html": "text/html",
+    "htm": "text/html",
+    "ics": "text/calendar",
+    "eml": "message/rfc822",
+    "mhtml": "multipart/related",
+    "rtf": "application/rtf",
+    "tex": "application/x-tex",
+    "vtt": "text/vtt",
+    "boxnote": "application/json",
+    "nxml": "application/xml",
+    "xlsm": "application/vnd.ms-excel.sheet.macroEnabled.12",
 }
 _OFFICE_PARTS = {
     "docx": "word/document.xml",
     "xlsx": "xl/workbook.xml",
+    "xlsm": "xl/workbook.xml",
     "pptx": "ppt/presentation.xml",
 }
 
@@ -463,10 +477,12 @@ def _check_office(upload: Upload) -> None:
                 raise DocumentError(413)
             _check_zip_member(archive, item)
         if not {"[Content_Types].xml", "_rels/.rels", _OFFICE_PARTS[upload.format]} <= names or any(
-            part in names for kind, part in _OFFICE_PARTS.items() if kind != upload.format
+            part in names
+            for part in set(_OFFICE_PARTS.values())
+            if part != _OFFICE_PARTS[upload.format]
         ):
             raise DocumentError(400)
-        if upload.format == "xlsx":
+        if upload.format in {"xlsx", "xlsm"}:
             _check_xlsx(archive)
 
 
